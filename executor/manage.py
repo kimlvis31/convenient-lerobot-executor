@@ -523,14 +523,18 @@ def command_preview(arguments):
     return " \\\n".join(f"    {shlex.join(group)}" for group in groups)
 
 
+def job_title(index, cfg):
+    title = styled(f"[Job {index}]", "1;36")
+    return f"{title} {cfg.get('label') or cfg['model']}"
+
+
 def show_settings(plans, show_commands):
     for index, (cfg, stages, _, _) in enumerate(plans, 1):
         if index > 1:
             print()
-        title = styled(f"[Job {index}]", "1;36")
-        print(f"{title} {cfg.get('label') or cfg['model']}")
+        print(job_title(index, cfg))
         for stage in stages:
-            print(f"  {stage_title(stage)}")
+            print("  " + stage_title(stage, cfg["model"]))
             if show_commands:
                 print(command_preview(stage.arguments))
         evaluation = cfg.get("eval")
@@ -541,9 +545,9 @@ def show_settings(plans, show_commands):
 
 def run_plans(plans, conda, verbose):
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
-        if len(plans) > 1:
-            print(f"\nJob {index}/{len(plans)} · {cfg.get('label') or cfg['model']}", flush=True)
+        print(job_title(index, cfg), flush=True)
         execute(stages, cfg, run_dir, root, conda, verbose)
+        show_job_result(stages)
 
 
 def metric(stats, key):
@@ -589,14 +593,23 @@ def evaluation_summary(output):
     return "\n".join(lines)
 
 
-def finish(plans):
-    section("Result")
-    outputs = [stage.output for _, stages, _, _ in plans
-               for stage in stages if stage.name == "eval" and stage.output is not None]
-    if outputs:
-        print("\n\n".join(evaluation_summary(output) for output in outputs))
+def result_heading(in_job):
+    if in_job:
+        print(styled("[Result]", "1;95"), flush=True)
     else:
-        print(styled(f"Completed {len(plans)} {'job' if len(plans) == 1 else 'jobs'}.", "32"))
+        section("Result")
+
+
+def show_job_result(stages):
+    result_heading(in_job=True)
+    evaluations = [stage.output for stage in stages if stage.name == "eval" and stage.output is not None]
+    if evaluations:
+        print("\n\n".join(evaluation_summary(output) for output in evaluations))
+    else:
+        print(styled("• Job completed.", "32"))
+        for stage in stages:
+            if stage.output is not None:
+                print(f"• Result path: {stage.output}")
     divider()
 
 
@@ -614,6 +627,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show the execution plan without creating files")
     parser.add_argument("--verbose", action="store_true", help="Show detailed execution logs")
     args = parser.parse_args()
+    executing = False
     try:
         plans, conda = plan(args)
         if not plans:
@@ -629,18 +643,19 @@ def main():
             print("Run canceled.")
             divider()
             return 0
-        section("Progress")
-        run_plans(plans, conda or conda_executable(args.conda), args.verbose)
-        finish(plans)
+        conda = conda or conda_executable(args.conda)
+        section("Execution")
+        executing = True
+        run_plans(plans, conda, args.verbose)
         return 0
     except (KeyboardInterrupt, EOFError):
-        section("Result")
+        result_heading(in_job=executing)
         print("Run interrupted.", file=sys.stderr, flush=True)
         divider()
         return 130
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.TimeoutExpired) as error:
-        section("Result")
+        result_heading(in_job=executing)
         print(f"Run failed ({error})", file=sys.stderr, flush=True)
         divider()
         return 1

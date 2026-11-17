@@ -130,9 +130,8 @@ def seconds(value):
     return f"{days}d {clock}" if days else clock
 
 
-def stage_title(stage):
-    environment = "LeRobot" if stage.environment == "lerobot" else stage.environment
-    return f"{STAGE_LABELS[stage.name]} · Environment {environment}"
+def stage_title(stage, model):
+    return f"{STAGE_LABELS[stage.name]} · Model {model} · Environment {stage.environment}"
 
 
 def status_line(percent, count, total, stage, eta, average=None):
@@ -564,7 +563,7 @@ def run_job(job, run_dir):
 
             if index:
                 print()
-            print(stage_title(stage), flush=True)
+            print(stage_title(stage, settings["model"]), flush=True)
             print(f"Run script: {run_dir / 'run.py'}", flush=True)
             stage_log = run_dir
             if stage.output:

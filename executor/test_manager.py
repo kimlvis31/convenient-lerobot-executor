@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan, show
-from manage import choose_policy, eval_settings, finish, model_size, normalize_paths, number, plan, run_plans, settings_jobs, show_settings, wizard
+from manage import choose_policy, eval_settings, main, model_size, normalize_paths, number, plan, settings_jobs, show_job_result, show_settings, wizard
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -105,7 +105,7 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(status["ended_at"] >= status["started_at"])
         self.assertGreater(status["seconds"], 0)
         self.assertIn(
-            f"Evaluation · Environment smolvla_env\nRun script: {run / 'run.py'}\n"
+            f"Evaluation · Model smolvla · Environment smolvla_env\nRun script: {run / 'run.py'}\n"
             f"Output directory: {adapter.eval_dir}\n[Total]",
             text.getvalue(),
         )
@@ -285,11 +285,11 @@ class ManagerTests(unittest.TestCase):
             show_settings(plans, show_commands=True)
         title, environment, preview = text.getvalue().split("\n", 2)
         self.assertEqual(title, "[Job 1] Evaluate on LIBERO")
-        self.assertEqual(environment, "  Evaluation · Environment LeRobot")
+        self.assertEqual(environment, "  Evaluation · Model smolvla · Environment lerobot")
         self.assertGreater(len(preview.splitlines()), 1)
         self.assertEqual(shlex.split(preview.replace("\\\n", "")), command)
 
-    def test_finish_summarizes_completed_evaluations(self):
+    def test_job_result_summarizes_completed_evaluations(self):
         output = self.root / "evaluation"
         output.mkdir()
         report = {"overall": {"n_success": 3, "n_episodes": 4, "eval_s": 8.8, "eval_ep_s": 2.2},
@@ -298,21 +298,21 @@ class ManagerTests(unittest.TestCase):
         (output / "eval_info.json").write_text(json.dumps(report), encoding="utf-8")
         stage = Stage("eval", "lerobot", [], (), 4, output=output)
         with contextlib.redirect_stdout(io.StringIO()) as text:
-            finish([({}, [stage], output / "executor", self.root)])
-        self.assertIn("<Result>", text.getvalue())
+            show_job_result([stage])
+        self.assertIn("[Result]", text.getvalue())
         self.assertIn("• Overall success rate: 3/4 (75.00%)", text.getvalue())
         self.assertIn("  • libero_object: 1/2 (50.00%)", text.getvalue())
         self.assertIn("  • libero_goal: 2/2 (100.00%)", text.getvalue())
         self.assertIn("Total evaluation time: 00:00:09", text.getvalue())
         self.assertIn("Average time per episode: 2.20 s", text.getvalue())
         self.assertIn(f"Result path: {output}", text.getvalue())
-        self.assertNotIn("Completed 1 job.", text.getvalue())
+        self.assertNotIn("• Job completed.", text.getvalue())
         self.assertRegex(text.getvalue(), r"\n-+\n\Z")
 
         report = {"aggregated": {"n_episodes": 2, "pc_success": 50, "eval_s": 3}}
         (output / "eval_info.json").write_text(json.dumps(report), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()) as text:
-            finish([({}, [stage], output / "executor", self.root)])
+            show_job_result([stage])
         self.assertIn("Overall success rate: 50.00%", text.getvalue())
         self.assertIn("Suite success rates: N/A", text.getvalue())
         self.assertIn("Average time per episode: 1.50 s", text.getvalue())
@@ -339,10 +339,19 @@ class ManagerTests(unittest.TestCase):
             plans.append((settings, [adapter.evaluate(False)], run, self.root))
         with patch("runner.resolve_environment", return_value=self.environment), \
              patch("runner.conda_command", side_effect=lambda c, e, argv: [sys.executable, "-u", str(self.backend), *argv]), \
-             contextlib.redirect_stdout(io.StringIO()) as output:
-            with self.assertRaises(FileNotFoundError):
-                run_plans(plans, "fake", False)
-        self.assertLess(output.getvalue().index("Job 1/3"), output.getvalue().index("Job 2/3"))
+             patch("manage.plan", return_value=(plans, "fake")), \
+             patch("sys.argv", ["manage.py", "--queue", "example.py"]), \
+             contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(output):
+            self.assertEqual(main(), 1)
+        execution = output.getvalue().split("<Execution>\n", 1)[1]
+        first_result = execution.index("[Result]")
+        second_job = execution.index("[Job 2]")
+        self.assertTrue(execution.startswith("[Job 1]"))
+        self.assertLess(first_result, execution.index("• Overall success rate:"))
+        self.assertLess(execution.index("• Overall success rate:"), second_job)
+        self.assertIn("[Result]\nRun failed", execution[second_job:])
+        self.assertNotIn("[Job 3]", execution)
         self.assertEqual(read_json(self.logs / "job-0/status.json")["status"], "completed")
         self.assertEqual(read_json(self.logs / "job-1/status.json")["status"], "failed")
         self.assertFalse((self.logs / "job-2").exists())
