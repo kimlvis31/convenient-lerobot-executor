@@ -61,7 +61,7 @@ python -B ~/convLexecutor/executor/manage.py \
 
 Preparation fetches the pinned public base weights and the files needed for one cream-cheese demonstration, then trains four action-head updates. It saves the full model at step 4 and the optimizer, weights, and random state at step 2 under `outputs/example/`. It verifies and reuses matching local files. The resume fixture refers to the installed base model on the machine where it was generated. Run the preparation command on each machine.
 
-For interactive use, run `manage.py` without `--queue` and choose **Import a job queue script**. A queue is a `JOBS` list of job dictionaries. Use `"adapter": "native"` and `"model": "smolvla"` for SmolVLA. The [example](scripts/example_script.py) explains the fields inline. Run with `--dry-run` to preview a plan.
+For interactive setup, run `manage.py` and choose **Configure a new job**. Select a model from the combined list and choose the evaluation benchmark or LIBERO suite as prompted. Press Enter to use the displayed default. To run a prepared queue, choose **Import a job queue script** or use `--queue`. The [example](scripts/example_script.py) explains the fields inline.
 
 Each job records its executed `run.py`, reusable `script.py`, timings, and console output in `executor/log/<run-name>/`. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
 

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan
-from manage import eval_settings, normalize_paths, number, plan, run_plans, settings_jobs, wizard
+from manage import choose_policy, eval_settings, normalize_paths, number, plan, run_plans, settings_jobs, wizard
 from runner import Progress, execute, load_settings, resolve_arguments
 
 
@@ -304,6 +304,15 @@ class ManagerTests(unittest.TestCase):
             cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory())
         self.assertEqual((cfg["env"], cfg["tasks"], cfg["task_ids"]), ("libero", ["libero_goal"], [7]))
         self.assertIn("Select an option [Default: 3]", menu.getvalue())
+
+    def test_policy_menu_mixes_native_and_external_models(self):
+        answers = io.StringIO("2\n")
+        with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
+            selected = choose_policy(load_adapters([]), ["act", "xvla"])
+        self.assertEqual(selected, ("tinyvla", "tinyvla"))
+        self.assertIn("1. [LeRobot Native] act", menu.getvalue())
+        self.assertIn("2. [External] TinyVLA", menu.getvalue())
+        self.assertIn("3. [LeRobot Native] xvla", menu.getvalue())
 
     def test_native_evaluation_uses_selected_benchmark(self):
         answers = io.StringIO("2\n\n1\n\n\n\nlerobot/act_pusht\n\n")

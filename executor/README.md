@@ -16,7 +16,7 @@ python -B ~/convLexecutor/executor/manage.py
 
 `--dry-run` shows the commands and Conda environments selected by the settings. Use `--lerobot-root` for older relative input paths outside the managed directories. Use `--tinyvla-root` to override the bundled TinyVLA integration.
 
-In a new job, press Enter to use the value shown in [Default: ...]. The evaluation menu lists LeRobot benchmarks and accepts an environment name manually. Select a LIBERO suite, all four standard suites, or enter a custom suite list. TinyVLA uses LIBERO. Other benchmarks may need their corresponding LeRobot environment dependencies.
+In a new job, press Enter to use the value shown in [Default: ...]. Select a model from one list with [LeRobot Native] or [External] next to its name. Native models come from the selected LeRobot environment. For plain terminal output, set NO_COLOR=1. The evaluation menu lists LeRobot benchmarks and accepts an environment name manually. Select a LIBERO suite, all four standard suites, or enter a custom suite list. TinyVLA uses LIBERO. Other benchmarks may need their corresponding LeRobot environment dependencies.
 
 ## Import a job queue
 

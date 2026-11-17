@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
@@ -14,7 +15,7 @@ from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import scan, show
-from runner import available_environments, conda_executable, execute, load_settings
+from runner import available_environments, conda_executable, execute, load_settings, native_policies
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -23,8 +24,19 @@ LOG_ROOT = PROJECT_ROOT / "executor/log"
 SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
+def styled(text, style):
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        return f"\033[{style}m{text}\033[0m"
+    return text
+
+
+def section(title):
+    print("\n" + styled(title, "1;36"))
+
+
 def ask(question, default=None, optional=False):
-    suffix = f" [Default: {default}]" if default is not None else ""
+    hint = styled(f"[Default: {default}]", "33") if default is not None else ""
+    suffix = " " + hint if hint else ""
     while True:
         value = input(f"\n{question}{suffix}: ").strip()
         if value:
@@ -59,7 +71,7 @@ def rate(question, default):
 
 def choose(question, options, default=1):
     choices = "\n".join(f"  {index}. {label}" for index, (_, label) in enumerate(options, 1))
-    prompt = f"{question}\n{choices}\nSelect an option"
+    prompt = f"{styled(question, '1;36')}\n{choices}\nSelect an option"
     return options[number(prompt, default, maximum=len(options)) - 1][0]
 
 
@@ -152,19 +164,40 @@ def tiny_train(warm, inventory, root):
     return train
 
 
-def native_train(resume, inventory):
+def choose_policy(adapters, policies):
+    native = styled("[LeRobot Native]", "36")
+    external = styled("[External]", "35")
+    if not policies:
+        print("\nCould not read the LeRobot model list. You can enter a model name manually.")
+    entries = [(("native", model), f"{native} {model}") for model in policies]
+    entries += [((key, key), f"{external} {adapter.label}") for key, adapter in adapters.items() if key != "native"]
+    entries.sort(key=lambda option: option[0][1])
+    entries.append((("native", ""), f"{native} Enter a model name manually"))
+    default = next((index for index, (value, _) in enumerate(entries, 1) if value == ("native", "smolvla")), 1)
+    backend, model = choose("Policy model", entries, default=default)
+    if not model:
+        model = ask("LeRobot policy name", "smolvla")
+    elif backend not in {"native", "tinyvla"}:
+        model = ask("Model name", model)
+    return backend, model
+
+
+def native_train(resume, inventory, model):
     if resume:
-        path = select_path("Existing run or checkpoint directory", [(p, str(p)) for p in inventory.native_resume])
+        models = {path: kind for path, kind in inventory.models}
+        options = [(path, str(path)) for path in inventory.native_resume if models.get(path, model) == model]
+        path = select_path("Existing run or checkpoint directory", options)
         checkpoint = native_checkpoint(Path(path))
         config = read_json(checkpoint / "train_config.json")
-        model = config.get("policy", {}).get("type") or ask("LeRobot policy name")
+        checkpoint_model = config.get("policy", {}).get("type")
+        if checkpoint_model and checkpoint_model != model:
+            raise ValueError(f"The checkpoint uses {checkpoint_model}, but you selected {model}.")
         old_steps = config.get("steps", 1000)
         step_path = checkpoint.parent / "training_state/training_step.json"
         if step_path.is_file():
             old_steps = max(old_steps, read_json(step_path)["step"] + 1)
         train = {"resume": str(checkpoint)}
     else:
-        model = ask("LeRobot policy name", "smolvla")
         old_steps = 1000
         options = [("", "Use a dataset repository")] + [(p, str(p)) for p, _ in inventory.datasets]
         dataset_root = select_path("Training dataset", options, optional=True)
@@ -176,7 +209,7 @@ def native_train(resume, inventory):
                  "seed": number("Random seed", 0, 0)}
     train.update(steps=number("Target training step count", old_steps),
                  save_freq=number("Checkpoint interval in steps", 100), extra=extra_flags())
-    return model, train
+    return train
 
 
 def evaluation_suites(train, tiny):
@@ -253,7 +286,7 @@ def script_paths():
     return queues
 
 
-def wizard(adapters, inventory, root):
+def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
     actions = [("new", "Configure a new job"), ("import", "Import a job queue script"), ("quit", "Exit")]
     if inventory.settings:
         actions.insert(1, ("reuse", "Reuse settings from a previous run"))
@@ -278,28 +311,26 @@ def wizard(adapters, inventory, root):
                     ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
         print(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
-    backend = choose("Policy backend", [(key, cls.label) for key, cls in adapters.items()])
+    backend, model = choose_policy(adapters, native_policies(conda, native_env, root))
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
                ("both", "Train, then evaluate")]
     if tiny:
         choices.append(("warm", "Start training with existing action-head weights"))
     operation = choose("Job type", choices)
-    cfg = {"schema": 1, "adapter": backend, "model": backend}
+    cfg = {"schema": 1, "adapter": backend, "model": model}
     if operation != "eval":
-        print("\nTraining setup")
+        section("Training setup")
         if tiny:
             print("\nTraining benchmark · LIBERO")
             cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
         else:
-            cfg["model"], cfg["train"] = native_train(operation == "resume", inventory)
-    elif not tiny:
-        cfg["model"] = ask("LeRobot policy name", "smolvla")
+            cfg["train"] = native_train(operation == "resume", inventory, model)
     evaluate = operation in ("eval", "both") or (
         operation in ("resume", "warm") and ask("Evaluate after training? (y/N)", "n").lower() == "y"
     )
     if evaluate:
-        print("\nEvaluation setup")
+        section("Evaluation setup")
         cfg["eval"] = eval_settings(cfg["model"], tiny, cfg.get("train"), inventory)
     return cfg
 
@@ -413,7 +444,9 @@ def plan(args):
         show(inventory, detected[PROJECT_ROOT], limit=None if args.inventory else 5)
         if args.inventory:
             return [], conda
-        settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT)
+        env_map = read_json(args.env_map) if args.env_map else {}
+        native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
+        settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env)
         if settings is None:
             return [], conda
 
@@ -453,7 +486,7 @@ def main():
         if not plans:
             return 0
         if not (args.settings or args.queue) or args.dry_run:
-            print("\nExecution plan")
+            section("Execution plan")
             for index, (cfg, stages, _, _) in enumerate(plans, 1):
                 if len(plans) > 1:
                     print(f"Job {index}/{len(plans)} · {cfg.get('label') or cfg['model']}")
