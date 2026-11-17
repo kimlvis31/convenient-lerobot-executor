@@ -49,6 +49,8 @@ Use `--name=value` for additional LeRobot options. For example, set a camera map
 
 ## Results and resume
 
+After evaluation, the Finish section shows overall and per-suite success rates, total evaluation time, average time per episode, and the result path.
+
 After you confirm the settings, the executor generates and runs one script per job.
 
 | Path | Contents |

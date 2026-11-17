@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import model_location, scan, show
-from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, styled
+from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, seconds, styled
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -518,6 +518,59 @@ def run_plans(plans, conda, verbose):
         execute(stages, cfg, run_dir, root, conda, verbose)
 
 
+def metric(stats, key):
+    value = stats.get(key)
+    return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+
+
+def success_rate(stats):
+    if not isinstance(stats, dict):
+        return "N/A"
+    successes, episodes = stats.get("n_success"), stats.get("n_episodes")
+    if type(successes) is int and type(episodes) is int and episodes > 0 and 0 <= successes <= episodes:
+        return f"{successes}/{episodes} ({100 * successes / episodes:.2f}%)"
+    percent = metric(stats, "pc_success")
+    return f"{percent:.2f}%" if percent is not None and percent <= 100 else "N/A"
+
+
+def evaluation_summary(output):
+    try:
+        info = read_json(output / "eval_info.json")
+    except (OSError, ValueError):
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    overall = info.get("overall") or info.get("aggregated")
+    if not isinstance(overall, dict):
+        overall = {}
+    total = metric(overall, "eval_s")
+    average = metric(overall, "eval_ep_s")
+    if average is None and total is not None and (episodes := metric(overall, "n_episodes")):
+        average = total / episodes
+    average_text = f"{average:.2f} s" if average is not None else "N/A"
+
+    lines = [f"Overall success rate: {success_rate(overall)}"]
+    groups = info.get("per_group")
+    if isinstance(groups, dict) and groups:
+        lines.append("Suite success rates:")
+        lines.extend(f"  {name}: {success_rate(stats)}" for name, stats in groups.items())
+    else:
+        lines.append("Suite success rates: N/A")
+    lines.extend((f"Total evaluation time: {seconds(total)}",
+                  f"Average time per episode: {average_text}", f"Result path: {output}"))
+    return "\n".join(lines)
+
+
+def finish(plans):
+    section("Finish")
+    outputs = [stage.output for _, stages, _, _ in plans
+               for stage in stages if stage.name == "eval" and stage.output is not None]
+    if outputs:
+        print("\n\n".join(evaluation_summary(output) for output in outputs))
+    else:
+        print(styled(f"Completed {len(plans)} {'job' if len(plans) == 1 else 'jobs'}.", "32"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate LeRobot policies and external models")
     parser.add_argument("--lerobot-root", help="Base for older relative input paths outside datasets, outputs, and externals")
@@ -559,8 +612,7 @@ def main():
             return 0
         section("Progress")
         run_plans(plans, conda or conda_executable(args.conda), args.verbose)
-        section("Finish")
-        print(styled(f"Completed {len(plans)} {'job' if len(plans) == 1 else 'jobs'}.", "32"))
+        finish(plans)
         return 0
     except (KeyboardInterrupt, EOFError):
         section("Finish")

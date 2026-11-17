@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan, show
-from manage import choose_policy, eval_settings, model_size, normalize_paths, number, plan, run_plans, settings_jobs, wizard
+from manage import choose_policy, eval_settings, finish, model_size, normalize_paths, number, plan, run_plans, settings_jobs, wizard
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -267,6 +267,33 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(read_json(training / "status.json"), read_json(evaluation / "status.json"))
         self.assertEqual(scan(self.root, self.external, self.logs).settings, [training / "script.py"])
         self.assertFalse(self.logs.exists())
+
+    def test_finish_summarizes_completed_evaluations(self):
+        output = self.root / "evaluation"
+        output.mkdir()
+        report = {"overall": {"n_success": 3, "n_episodes": 4, "eval_s": 8.8, "eval_ep_s": 2.2},
+                  "per_group": {"libero_object": {"n_success": 1, "n_episodes": 2},
+                                "libero_goal": {"n_success": 2, "n_episodes": 2}}}
+        (output / "eval_info.json").write_text(json.dumps(report), encoding="utf-8")
+        stage = Stage("eval", "lerobot", [], (), 4, output=output)
+        with contextlib.redirect_stdout(io.StringIO()) as text:
+            finish([({}, [stage], output / "executor", self.root)])
+        self.assertIn("<Finish>", text.getvalue())
+        self.assertIn("Overall success rate: 3/4 (75.00%)", text.getvalue())
+        self.assertIn("  libero_object: 1/2 (50.00%)", text.getvalue())
+        self.assertIn("  libero_goal: 2/2 (100.00%)", text.getvalue())
+        self.assertIn("Total evaluation time: 00:00:09", text.getvalue())
+        self.assertIn("Average time per episode: 2.20 s", text.getvalue())
+        self.assertIn(f"Result path: {output}", text.getvalue())
+        self.assertNotIn("Completed 1 job.", text.getvalue())
+
+        report = {"aggregated": {"n_episodes": 2, "pc_success": 50, "eval_s": 3}}
+        (output / "eval_info.json").write_text(json.dumps(report), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as text:
+            finish([({}, [stage], output / "executor", self.root)])
+        self.assertIn("Overall success rate: 50.00%", text.getvalue())
+        self.assertIn("Suite success rates: N/A", text.getvalue())
+        self.assertIn("Average time per episode: 1.50 s", text.getvalue())
 
     def test_parallel_rollouts_use_the_aggregate_episode_count(self):
         settings = sample_settings()
