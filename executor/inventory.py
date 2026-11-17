@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from adapters import read_json, weights
+from runner import styled
 
 
 @dataclass
@@ -97,16 +98,18 @@ def show(inventory, environments, limit=None):
                 else f"{path} · metadata lists {info.get('total_episodes', '?')} episodes"
                 for path, info in inventory.datasets]
     groups = (
+        ("Conda environments", sorted(environments)),
         ("Training datasets", datasets),
         ("Models for evaluation or initialization", [f"{model} · {path}" for path, model in inventory.models]),
         ("Checkpoints with training state", [str(path) for path in inventory.native_resume + inventory.tiny_resume]),
         ("Training and evaluation results", [str(path) for path in inventory.results]),
         ("Previous job settings", [str(path) for path in inventory.settings]),
     )
-    print(f"Conda environments: {', '.join(sorted(environments)) if environments else 'none detected'}")
     for name, items in groups:
-        print(f"{name} ({len(items)})")
-        for item in items[:limit]:
-            print(f"  {item}")
+        heading = styled(name, "1;36")
+        count = styled(f"[{len(items)} found]", "33")
+        print(f"\n{heading} {count}")
+        for index, item in enumerate(items[:limit], 1):
+            print(f"  {index}. {item}")
         if limit is not None and len(items) > limit:
             print("  Run with --inventory to show the full list.")

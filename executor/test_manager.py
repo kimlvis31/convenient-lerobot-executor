@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import asdict
 import io
 import json
 from pathlib import Path
@@ -8,9 +9,9 @@ import unittest
 from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
-from inventory import Inventory, scan
+from inventory import Inventory, scan, show
 from manage import choose_policy, eval_settings, normalize_paths, number, plan, run_plans, settings_jobs, wizard
-from runner import Progress, execute, load_settings, resolve_arguments
+from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, status_line
 
 
 FAKE_BACKEND = r'''
@@ -99,6 +100,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(status["status"], "completed")
         self.assertTrue(status["ended_at"] >= status["started_at"])
         self.assertGreater(status["seconds"], 0)
+        self.assertIn("[Status] Completion: 100.000 % | 2/2 Episodes |  ETA: 00:00:00", text.getvalue())
         script = run / "run.py"
         self.assertEqual(load_settings(script), settings)
         self.assertIn("smolvla_env", script.read_text(encoding="utf-8"))
@@ -113,7 +115,6 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(inventory.settings, [reusable])
         self.assertIn(adapter.eval_dir / "eval_info.json", inventory.results)
         self.assertTrue(inventory.native_resume)
-        self.assertIn("Overall 100%", text.getvalue())
         settings["train"] = {"resume": str(adapter.train_dir), "steps": 10, "save_freq": 4}
         retry = NativeAdapter(settings, "resume-run", self.root, self.external, self.envs)
         resumed = retry.train()
@@ -286,6 +287,40 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(progress.fraction(), 0.99)
         self.assertIsNone(progress.eta())
 
+    def test_inventory_lists_numbered_entries_and_item_counts(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            show(Inventory(), {"lerobot", "lerobot_tinyvla"})
+        self.assertIn("Conda environments [2 found]\n  1. lerobot\n  2. lerobot_tinyvla", output.getvalue())
+        self.assertIn("\n\nTraining datasets [0 found]", output.getvalue())
+
+    def test_estimate_from_first_positive_measurement(self):
+        stage = Stage("train", "lerobot", [], (), 8)
+        progress = Progress(stage, sample_settings(), started_at=10)
+        self.assertTrue(progress.update("step:2/8", 14))
+        self.assertEqual(progress.eta(), 12)
+        self.assertEqual(status_line(25, 2, 8, "train", progress.eta()),
+                         "[Status] Completion: 25.000 % | 2/8 Steps |  ETA: 00:00:12")
+        self.assertEqual(status_line(0, 0, None, "eval", None),
+                         "[Status] Completion: 0.000 % | 0/N/A Episodes |  ETA: N/A")
+
+    def test_reuses_a_legacy_evaluation_timing_with_a_different_checkpoint_path(self):
+        settings = {"adapter": "tinyvla", "model": "tinyvla"}
+        runtime = {"lerobot": {"python": "python"}}
+        stage = Stage("eval", "lerobot", ["--env.type=libero", "--eval.n_episodes=1",
+                                         "--policy.model_path=previous"], (), 1)
+        log = self.logs / "previous"
+        log.mkdir(parents=True)
+        (log / "status.json").write_text(json.dumps({"stages": [{
+            "name": "eval", "status": "completed", "signature": "legacy", "seconds": 28
+        }]}), encoding="utf-8")
+        job = {"settings": settings, "runtime": runtime, "stages": [asdict(stage)]}
+        (log / "run.py").write_text(f"JOB = {job!r}", encoding="utf-8")
+        stage.arguments[-1] = "--policy.model_path=next"
+        rates = history(self.logs)
+        self.assertEqual(rates[evaluation_timing_key(settings, stage, runtime)], 28)
+        stage.arguments[1] = "--eval.n_episodes=2"
+        self.assertNotIn(evaluation_timing_key(settings, stage, runtime), rates)
+
     def test_blocks_overriding_output_directory(self):
         settings = sample_settings()
         settings["train"]["extra"] = ["--output_dir=other"]
@@ -303,7 +338,8 @@ class ManagerTests(unittest.TestCase):
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory())
         self.assertEqual((cfg["env"], cfg["tasks"], cfg["task_ids"]), ("libero", ["libero_goal"], [7]))
-        self.assertIn("Select an option [Default: 3]", menu.getvalue())
+        self.assertIn("3. libero_goal [Default]", menu.getvalue())
+        self.assertNotIn("Select an option", menu.getvalue())
 
     def test_policy_menu_mixes_native_and_external_models(self):
         answers = io.StringIO("2\n")
@@ -319,7 +355,8 @@ class ManagerTests(unittest.TestCase):
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             cfg = eval_settings("act", False, None, Inventory())
         self.assertEqual((cfg["env"], cfg["tasks"]), ("pusht", ["PushT-v0"]))
-        self.assertIn("\nEvaluation benchmark\n", menu.getvalue())
+        self.assertIn("1. LIBERO [Default]", menu.getvalue())
+        self.assertIn("\nEvaluation benchmark: ", menu.getvalue())
         self.assertIn("[Default: PushT-v0]", menu.getvalue())
 
 

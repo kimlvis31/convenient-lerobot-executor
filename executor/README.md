@@ -16,7 +16,7 @@ python -B ~/convLexecutor/executor/manage.py
 
 `--dry-run` shows the commands and Conda environments selected by the settings. Use `--lerobot-root` for older relative input paths outside the managed directories. Use `--tinyvla-root` to override the bundled TinyVLA integration.
 
-In a new job, press Enter to use the value shown in [Default: ...]. Select a model from one list with [LeRobot Native] or [External] next to its name. Native models come from the selected LeRobot environment. For plain terminal output, set NO_COLOR=1. The evaluation menu lists LeRobot benchmarks and accepts an environment name manually. Select a LIBERO suite, all four standard suites, or enter a custom suite list. TinyVLA uses LIBERO. Other benchmarks may need their corresponding LeRobot environment dependencies.
+In a numbered menu, press Enter to select the row marked [Default]. In a text or numeric prompt, press Enter to use the value shown in [Default: ...]. Select a model from one list with [LeRobot Native] or [External] next to its name. Native models come from the selected LeRobot environment. For plain terminal output, set NO_COLOR=1. The evaluation menu lists LeRobot benchmarks and accepts an environment name manually. Select a LIBERO suite, all four standard suites, or enter a custom suite list. TinyVLA uses LIBERO. Other benchmarks may need their corresponding LeRobot environment dependencies.
 
 ## Import a job queue
 
@@ -60,7 +60,7 @@ After you confirm the settings, the executor generates and runs one script per j
 | `outputs/training/<run-name>/` | Checkpoints, training results, and the saved dataset split where applicable |
 | `outputs/evaluation/<run-name>/` | Evaluation results and videos saved by LeRobot |
 
-Overall progress is the average of the stage percentages. Training progress uses optimizer steps. Evaluation progress uses LeRobot's reported batches to count completed episodes. The executor estimates remaining time from measured progress. Estimating the duration of later stages requires a completed run with matching settings and environment. Remaining time is shown as unavailable until there is enough information. Preprocessing, checkpoint saving, and video encoding may take time between progress updates.
+The status line shows overall completion, the current stage's completed and total units, and the estimated time remaining in hours, minutes, and seconds. Training counts optimizer steps. Evaluation counts completed episodes from LeRobot's reported batches. The executor estimates the whole job when it has measured timings for the remaining stages, including prior compatible TinyVLA evaluation timings. Otherwise it announces the current-stage ETA when measured progress is available. ETA is shown as N/A when there is no usable estimate.
 
 - Native resume uses LeRobot's `train_config.json` and `training_state/`. Select a checkpoint or a previous run and set a target step count greater than the saved step.
 - TinyVLA resume uses the previous training directory and job settings. It restores the action head, optimizer and random state, and reuses the same training split. To initialize a new run from weights alone, choose **Start training with existing action-head weights**.

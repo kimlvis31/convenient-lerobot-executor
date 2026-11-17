@@ -5,7 +5,6 @@ import argparse
 from datetime import datetime, timezone
 import json
 import math
-import os
 from pathlib import Path
 import re
 import shlex
@@ -15,7 +14,7 @@ from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import scan, show
-from runner import available_environments, conda_executable, execute, load_settings, native_policies
+from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, styled
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -24,18 +23,12 @@ LOG_ROOT = PROJECT_ROOT / "executor/log"
 SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
-def styled(text, style):
-    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
-        return f"\033[{style}m{text}\033[0m"
-    return text
-
-
 def section(title):
     print("\n" + styled(title, "1;36"))
 
 
-def ask(question, default=None, optional=False):
-    hint = styled(f"[Default: {default}]", "33") if default is not None else ""
+def ask(question, default=None, optional=False, *, show_default=True):
+    hint = styled(f"[Default: {default}]", "33") if show_default and default is not None else ""
     suffix = " " + hint if hint else ""
     while True:
         value = input(f"\n{question}{suffix}: ").strip()
@@ -47,10 +40,10 @@ def ask(question, default=None, optional=False):
             return ""
 
 
-def number(question, default, minimum=1, maximum=None):
+def number(question, default, minimum=1, maximum=None, *, show_default=True):
     while True:
         try:
-            value = int(ask(question, default))
+            value = int(ask(question, default, show_default=show_default))
             if value >= minimum and (maximum is None or value <= maximum):
                 return value
         except ValueError:
@@ -70,9 +63,14 @@ def rate(question, default):
 
 
 def choose(question, options, default=1):
-    choices = "\n".join(f"  {index}. {label}" for index, (_, label) in enumerate(options, 1))
-    prompt = f"{styled(question, '1;36')}\n{choices}\nSelect an option"
-    return options[number(prompt, default, maximum=len(options)) - 1][0]
+    choices = []
+    for index, (_, label) in enumerate(options, 1):
+        row = f"  {index}. {label}"
+        if index == default:
+            row = styled(ANSI.sub("", row) + " [Default]", "33")
+        choices.append(row)
+    prompt = "\n".join([*choices, styled(question, "1;36")])
+    return options[number(prompt, default, maximum=len(options), show_default=False) - 1][0]
 
 
 def path_value(value):

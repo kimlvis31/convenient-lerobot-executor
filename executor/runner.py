@@ -12,6 +12,7 @@ import re
 import runpy
 import shutil
 import signal
+import sys
 import subprocess
 import time
 
@@ -103,20 +104,34 @@ def resolve_arguments(arguments, environments):
     return resolved
 
 
+def styled(text, style):
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        return f"\033[{style}m{text}\033[0m"
+    return text
+
+
 def seconds(value):
     if value is None:
-        return "unavailable"
+        return "N/A"
     mins, secs = divmod(max(0, round(value)), 60)
     hours, mins = divmod(mins, 60)
-    return f"{hours:d}:{mins:02d}:{secs:02d}"
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
+def status_line(percent, count, total, stage, eta):
+    current = count if count is not None else "N/A"
+    target = total if total is not None else "N/A"
+    units = "Episodes" if stage == "eval" else "Steps"
+    return f"[Status] Completion: {percent:.3f} % | {current}/{target} {units} |  ETA: {seconds(eta)}"
 
 
 class Progress:
-    def __init__(self, stage, settings):
+    def __init__(self, stage, settings, started_at=None):
         self.stage = stage
         self.count = stage.start
         self.total = stage.units
         self.anchor = None
+        self.started_at = started_at
         self.rate = None
         self.group = 0
         self.last_batch = None
@@ -155,6 +170,8 @@ class Progress:
         if self.anchor is None:
             if self.count is not None and count < self.count:
                 return False
+            if self.started_at is not None and self.count is not None and count > self.count and when > self.started_at:
+                self.rate = (when - self.started_at) / (count - self.count)
             self.count = count
             self.anchor = (count, when)
             return True
@@ -187,15 +204,39 @@ def stage_signature(settings, stage, runtime):
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
+def evaluation_timing_key(settings, stage, runtime):
+    if settings["adapter"] != "tinyvla" or stage.name != "eval":
+        return None
+    # TinyVLA uses the same model architecture for base and trained weights.
+    # Match the effective evaluation workload and runtime without checkpoint or output paths.
+    flags = sorted(arg for arg in stage.arguments if arg.startswith(
+        ("--env.", "--eval.", "--policy.device=", "--policy.n_action_steps=")))
+    profile = [settings["model"], stage.environment, stage.units, flags, runtime]
+    return hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
+
+
 def history(outputs):
     rates = {}
     for path in sorted(outputs.glob("*/status.json"), reverse=True)[:60]:
         try:
-            status = read_json(path)
-            for item in status["stages"]:
-                if item["status"] == "completed" and item.get("seconds", 0) > 0:
-                    rates.setdefault(item["signature"], item["seconds"])
-        except (OSError, ValueError, KeyError, TypeError):
+            completed = [(index, item) for index, item in enumerate(read_json(path)["stages"])
+                         if item["status"] == "completed" and item.get("seconds", 0) > 0]
+            for _, item in completed:
+                rates.setdefault(item["signature"], item["seconds"])
+                if item.get("timing_key"):
+                    rates.setdefault(item["timing_key"], item["seconds"])
+            old_evals = [(index, item) for index, item in completed
+                         if item["name"] == "eval" and "timing_key" not in item]
+            if old_evals:
+                nodes = ast.parse(path.with_name("run.py").read_text(encoding="utf-8")).body
+                payload = next(node.value for node in nodes if isinstance(node, ast.Assign)
+                               and any(isinstance(target, ast.Name) and target.id == "JOB" for target in node.targets))
+                job = ast.literal_eval(payload)
+                for index, item in old_evals:
+                    key = evaluation_timing_key(job["settings"], Stage(**job["stages"][index]), job["runtime"])
+                    if key:
+                        rates.setdefault(key, item["seconds"])
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError, StopIteration, IndexError):
             continue
     return rates
 
@@ -330,59 +371,77 @@ def run_job(job, run_dir):
         json.dump(status, file)
     try:
         signatures = [stage_signature(settings, stage, runtime) for stage in stages]
+        timing_keys = [evaluation_timing_key(settings, stage, runtime) for stage in stages]
         previous = history(run_dir.parent)
         status["status"] = "running"
         status["stages"] = [{"name": s.name, "status": "waiting", "signature": signature,
-                             "output": str(s.output) if s.output else None}
-                            for s, signature in zip(stages, signatures)]
+                             "timing_key": key, "output": str(s.output) if s.output else None}
+                            for s, signature, key in zip(stages, signatures, timing_keys)]
         write_json(status_path, status)
+        eta_scope = None
         for index, stage in enumerate(stages):
             saved = status["stages"][index]
             begin = time.monotonic()
-            progress = Progress(stage, settings)
-            known_future = [previous.get(key) for key in signatures[index + 1:]]
+            progress = Progress(stage, settings, begin)
+            known_future = [previous.get(signature, previous.get(key))
+                            for signature, key in zip(signatures[index + 1:], timing_keys[index + 1:])]
             saved["status"] = "running"
             saved["started_at"] = datetime.now(timezone.utc).isoformat()
             write_json(status_path, status)
             label = {"train": "Training", "eval": "Evaluation"}[stage.name]
-            print(f"\nOverall {100*index/len(stages):.0f}% · Starting {label.lower()} · Environment {stage.environment}", flush=True)
+            future_eta = sum(known_future) if None not in known_future else None
+            historical_time = previous.get(signatures[index], previous.get(timing_keys[index]))
             last_print = begin - 5
+
+            def report(now, completed=False):
+                nonlocal eta_scope
+                eta = progress.eta()
+                if completed:
+                    eta = 0
+                elif eta is None and historical_time is not None and historical_time > now - begin:
+                    eta = historical_time - (now - begin)
+                overall = eta + future_eta if eta is not None and future_eta is not None else None
+                display_eta = overall if overall is not None else (None if completed else eta)
+                if display_eta is not None:
+                    scope = "whole job" if overall is not None else label.lower()
+                    if scope != eta_scope and (scope != "whole job" or eta_scope is not None):
+                        print(f"ETA scope · {scope}", flush=True)
+                    eta_scope = scope
+                fraction = 1 if completed else progress.fraction()
+                count = stage.units if completed and stage.units is not None else progress.count
+                print(status_line(100 * (index + fraction) / len(stages), count, stage.units,
+                                  stage.name, display_eta), flush=True)
+                saved.update(units_done=count, units_total=stage.units, eta_seconds=eta,
+                             overall_eta_seconds=overall)
 
             def update(line):
                 nonlocal last_print
                 now = time.monotonic()
-                if not progress.update(line, now):
+                previous_count = progress.count
+                if not progress.update(line, now) or progress.count == previous_count:
                     return
                 if now - last_print < 2 and progress.count != stage.units:
-                    return
+                    if progress.rate is None or eta_scope is not None:
+                        return
                 last_print = now
-                eta = progress.eta()
-                overall = eta + sum(known_future) if eta is not None and None not in known_future else None
-                fraction = progress.fraction()
-                unit = "episodes" if stage.name == "eval" else "steps"
-                work = f"{progress.count}/{stage.units}" if stage.units is not None else str(progress.count)
-                percent = f" ({100*fraction:.0f}%)" if stage.units is not None else ""
-                finalizing = " · Saving results" if progress.count == stage.units else ""
-                print(f"Overall {int(100*(index+fraction)/len(stages))}% · {label} {work} {unit}{percent}"
-                      f" · Stage time remaining {seconds(eta)} · Total time remaining {seconds(overall)}{finalizing}", flush=True)
-                saved.update(units_done=progress.count, units_total=stage.units, eta_seconds=eta,
-                             overall_eta_seconds=overall)
+                report(now)
                 write_json(status_path, status)
 
+            print(f"\n{label} · Environment {stage.environment}", flush=True)
             if stage.output:
                 if stage.output.exists() or stage.output.is_symlink():
                     raise FileExistsError(f"Output path already exists ({stage.output}).")
                 stage.output.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Output directory: {stage.output}", flush=True)
+            report(begin)
+            write_json(status_path, status)
             try:
                 run_stage(stage.arguments, stage, root, run_dir / f"{stage.name}.log", update, job["verbose"])
             finally:
                 saved.update(seconds=time.monotonic()-begin, ended_at=datetime.now(timezone.utc).isoformat())
-            saved.update(status="completed", seconds=time.monotonic()-begin, units_done=stage.units,
-                         units_total=stage.units, eta_seconds=0, overall_eta_seconds=None,
-                         ended_at=datetime.now(timezone.utc).isoformat())
+            saved["status"] = "completed"
+            report(time.monotonic(), completed=True)
             write_json(status_path, status)
-            print(f"Overall {int(100*(index+1)/len(stages))}% · {label} complete", flush=True)
         status["status"] = "completed"
     except BaseException as error:
         status["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
