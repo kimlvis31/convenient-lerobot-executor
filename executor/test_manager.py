@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan, show
-from manage import choose_policy, eval_settings, normalize_paths, number, plan, run_plans, settings_jobs, wizard
-from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, status_line
+from manage import choose_policy, eval_settings, model_size, normalize_paths, number, plan, run_plans, settings_jobs, wizard
+from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
 FAKE_BACKEND = r'''
@@ -100,7 +100,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(status["status"], "completed")
         self.assertTrue(status["ended_at"] >= status["started_at"])
         self.assertGreater(status["seconds"], 0)
-        self.assertRegex(text.getvalue(), r"100\.000 % \| 2/2 Episodes \| Avg/episode: \d+\.\d{2} s \| ETA: 00:00:00")
+        self.assertRegex(text.getvalue(), r"100\.000 % \| 2/2 Episodes \| Seconds Per Episode: \d+\.\d{2} s \| Estimated Time of Completion: 00:00:00")
         script = run / "run.py"
         self.assertEqual(load_settings(script), settings)
         self.assertIn("smolvla_env", script.read_text(encoding="utf-8"))
@@ -287,7 +287,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(progress.fraction(), 0.99)
         self.assertAlmostEqual(progress.average(), 7 / 6)
         self.assertEqual(status_line(99, 6, 6, "eval", None, progress.average()),
-                         "[Status] Completion: 99.000 % | 6/6 Episodes | Avg/episode: 1.17 s | ETA: N/A")
+                         "[Status] Completion: 99.000 % | 6/6 Episodes | Seconds Per Episode: 1.17 s | Estimated Time of Completion: N/A")
         self.assertIsNone(progress.eta())
 
     def test_inventory_lists_complete_hugging_face_snapshots_without_assuming_resume_state(self):
@@ -317,9 +317,9 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(progress.update("step:2/8", 14))
         self.assertEqual(progress.eta(), 12)
         self.assertEqual(status_line(25, 2, 8, "train", progress.eta()),
-                         "[Status] Completion: 25.000 % | 2/8 Steps | ETA: 00:00:12")
+                         "[Status] Completion: 25.000 % | 2/8 Steps | Estimated Time of Completion: 00:00:12")
         self.assertEqual(status_line(0, 0, None, "eval", None),
-                         "[Status] Completion: 0.000 % | 0/N/A Episodes | Avg/episode: N/A | ETA: N/A")
+                         "[Status] Completion: 0.000 % | 0/N/A Episodes | Seconds Per Episode: N/A | Estimated Time of Completion: N/A")
 
     def test_reuses_a_legacy_evaluation_timing_with_a_different_checkpoint_path(self):
         settings = {"adapter": "tinyvla", "model": "tinyvla"}
@@ -361,20 +361,39 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("1. LIBERO (supported by TinyVLA) [Default]", menu.getvalue())
         self.assertNotIn("Select an option", menu.getvalue())
 
-    def test_policy_menu_mixes_native_and_external_models(self):
-        answers = io.StringIO("2\n")
+    def test_policy_menu_lists_native_models_before_external_models(self):
+        answers = io.StringIO("4\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
-            selected = choose_policy(load_adapters([]), ["act", "xvla"])
+            selected = choose_policy(load_adapters([]), ["xvla", "act"], Inventory())
         self.assertEqual(selected, ("tinyvla", "tinyvla"))
-        self.assertIn("1. [LeRobot Native] act", menu.getvalue())
-        self.assertIn("2. [External] TinyVLA", menu.getvalue())
-        self.assertIn("3. [LeRobot Native] xvla", menu.getvalue())
+        self.assertIn("1. [LeRobot Native] act [Default]  size unavailable", menu.getvalue())
+        self.assertIn("2. [LeRobot Native] xvla  ~900M params", menu.getvalue())
+        self.assertIn("3. [LeRobot Native] Enter a model name manually", menu.getvalue())
+        self.assertIn("4. [External] TinyVLA  700M backbone", menu.getvalue())
+
+    def test_model_size_reports_local_weights_when_reference_size_is_missing(self):
+        model = self.root / "act"
+        model.mkdir()
+        (model / "model.safetensors").write_bytes(bytes(2048))
+        self.assertEqual(model_size("act", Inventory(models=[(model, "act")])), "2.0 KiB local weights")
+
+    def test_completion_time_includes_days_when_needed(self):
+        self.assertEqual(seconds(None), "N/A")
+        self.assertEqual(seconds(86399), "23:59:59")
+        self.assertEqual(seconds(86400), "1d 00:00:00")
+        self.assertEqual(seconds(2 * 86400 + 3 * 3600 + 4 * 60 + 5), "2d 03:04:05")
 
     def test_native_evaluation_uses_selected_benchmark(self):
-        answers = io.StringIO("2\n\n1\n\n\n\nlerobot/act_pusht\n\n")
+        answers = io.StringIO("2\n\n1\n\n\n\nlerobot/act_pusht\n125\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             cfg = eval_settings("act", False, None, Inventory())
         self.assertEqual((cfg["env"], cfg["tasks"]), ("pusht", ["PushT-v0"]))
+        self.assertEqual(cfg["episode_length"], 125)
+        job = {"adapter": "native", "model": "act", "eval": cfg}
+        adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
+        self.assertIn("--env.episode_length=125", adapter.evaluate(False).arguments)
+        cfg["episode_length"] = 0
+        self.assertFalse(any(arg.startswith("--env.episode_length=") for arg in adapter.evaluate(False).arguments))
         self.assertIn("1. LIBERO [Default]", menu.getvalue())
         self.assertIn("\nEvaluation benchmark: ", menu.getvalue())
         self.assertIn("[Default: PushT-v0]", menu.getvalue())

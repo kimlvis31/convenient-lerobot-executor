@@ -13,12 +13,25 @@ import subprocess
 import sys
 from uuid import uuid4
 
-from adapters import SUITES, load_adapters, native_checkpoint, read_json
+from adapters import SUITES, load_adapters, native_checkpoint, read_json, weight_files
 from inventory import model_location, scan, show
 from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, styled
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
+# Published reference sizes. Individual checkpoints can differ.
+REFERENCE_MODEL_SIZES = {
+    "eo1": "3B reference checkpoint",
+    "evo1": "770M params",
+    "fineart_vla": "~4B reference checkpoint",
+    "lingbot_va": "~5B transformer",
+    "lingbot_vla_v2": "6B base checkpoint",
+    "multi_task_dit": "~450M params",
+    "smolvla": "450M params",
+    "tinyvla": "700M backbone",
+    "wall_oss_05": "~4B reference checkpoint",
+    "xvla": "~900M params",
+}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_ROOT = PROJECT_ROOT / "executor/log"
 SCRIPT_ROOT = PROJECT_ROOT / "scripts"
@@ -65,12 +78,14 @@ def rate(question, default):
         print("Enter a positive number.")
 
 
-def choose(question, options, default=1):
+def choose(question, options, default=1, *, details=None):
     choices = []
-    for index, (_, label) in enumerate(options, 1):
+    for index, (value, label) in enumerate(options, 1):
         row = f"  {index}. {label}"
         if index == default:
             row = styled(ANSI.sub("", row) + " [Default]", "33")
+        if details and value in details:
+            row += "  " + styled(details[value], "90")
         choices.append(row)
     prompt = "\n".join([*choices, styled(question, "1;36")])
     return options[number(prompt, default, maximum=len(options), show_default=False) - 1][0]
@@ -165,17 +180,48 @@ def tiny_train(warm, inventory, root):
     return train
 
 
-def choose_policy(adapters, policies):
-    native = styled("[LeRobot Native]", "36")
-    external = styled("[External]", "35")
+def format_model_bytes(size):
+    for divisor, unit in ((1024**3, "GiB"), (1024**2, "MiB"), (1024, "KiB")):
+        if size >= divisor:
+            return f"{size / divisor:.1f} {unit}"
+    return f"{size} B"
+
+
+def model_size(model, inventory):
+    if model in REFERENCE_MODEL_SIZES:
+        return REFERENCE_MODEL_SIZES[model]
+
+    sizes = set()
+    for path, kind in inventory.models:
+        if kind != model:
+            continue
+        try:
+            legacy = path / "pytorch_model.bin"
+            if legacy.is_file() and not any((path / name).is_file() for name in
+                                           ("model.safetensors", "model.safetensors.index.json")):
+                sizes.add(legacy.stat().st_size)
+            else:
+                sizes.add(sum(file.stat().st_size for file in weight_files(path)))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+    if not sizes:
+        return "size unavailable"
+    smallest, largest = format_model_bytes(min(sizes)), format_model_bytes(max(sizes))
+    return f"{smallest} local weights" if smallest == largest else f"{smallest}–{largest} local weights"
+
+
+def choose_policy(adapters, policies, inventory):
+    native = styled("[LeRobot Native]", "38;5;75")
+    external = styled("[External]", "38;5;208")
     if not policies:
         print("\nCould not read the LeRobot model list. You can enter a model name manually.")
-    entries = [(("native", model), f"{native} {model}") for model in policies]
-    entries += [((key, key), f"{external} {adapter.label}") for key, adapter in adapters.items() if key != "native"]
-    entries.sort(key=lambda option: option[0][1])
+    entries = [(("native", model), f"{native} {model}") for model in sorted(policies)]
     entries.append((("native", ""), f"{native} Enter a model name manually"))
+    entries += [((key, key), f"{external} {adapters[key].label}") for key in sorted(adapters) if key != "native"]
+    sizes = {value: model_size(value[1], inventory) for value, _ in entries if value[1]}
     default = next((index for index, (value, _) in enumerate(entries, 1) if value == ("native", "smolvla")), 1)
-    backend, model = choose("Policy model", entries, default=default)
+    backend, model = choose("Policy model", entries, default=default, details=sizes)
     if not model:
         model = ask("LeRobot policy name", "smolvla")
     elif backend not in {"native", "tinyvla"}:
@@ -261,9 +307,11 @@ def eval_settings(model, tiny, train, inventory):
         task = train.get("task") if tiny and train else None
         default_id = str(task[1]) if task and tasks == [task[0]] else "all"
         ids = ask("Task IDs (comma-separated, or all)", default_id) if len(tasks) == 1 else "all"
-        cfg.update(task_ids=[int(value) for value in ids.split(",")] if ids != "all" else [],
-                   episode_length=number("Max control steps per episode (0 uses the environment default)", 0, 0),
-                   control="relative" if tiny else ask("Control mode", "absolute" if model == "xvla" else "relative"),
+        cfg["task_ids"] = [int(value) for value in ids.split(",")] if ids != "all" else []
+    if env_type in {"libero", "pusht", "aloha", "metaworld"}:
+        cfg["episode_length"] = number("Episode length (maximum control steps, 0 uses benchmark default)", 0, 0)
+    if env_type == "libero":
+        cfg.update(control="relative" if tiny else ask("Control mode", "absolute" if model == "xvla" else "relative"),
                    size=256 if tiny else number("Camera image width and height", 448 if model == "evo1" else 256))
     if tiny:
         cfg["action_steps"] = number("Actions to execute per prediction", 16, 1, 16)
@@ -312,7 +360,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
                     ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
         print(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
-    backend, model = choose_policy(adapters, native_policies(conda, native_env, root))
+    backend, model = choose_policy(adapters, native_policies(conda, native_env, root), inventory)
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
                ("both", "Train, then evaluate")]

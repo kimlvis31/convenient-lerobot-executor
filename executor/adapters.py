@@ -61,17 +61,19 @@ def native_checkpoint(path):
     raise FileNotFoundError(f"LeRobot training configuration not found ({path}).")
 
 
-def weights(path):
-    require(path / "config.json")
+def weight_files(path):
     index = path / "model.safetensors.index.json"
     if index.is_file() and not (path / "model.safetensors").is_file():
         shards = set(read_json(index)["weight_map"].values())
         if not shards or any(Path(name).name != name for name in shards):
             raise ValueError(f"Invalid model weight index ({index}).")
-        for name in shards:
-            require(path / name)
-    else:
-        require(path / "model.safetensors")
+        return tuple(require(path / name) for name in sorted(shards))
+    return (require(path / "model.safetensors"),)
+
+
+def weights(path):
+    require(path / "config.json")
+    weight_files(path)
     return path
 
 
@@ -149,6 +151,11 @@ class NativeAdapter:
                 flag("eval.n_episodes", episodes), flag("eval.batch_size", batch),
                 flag("seed", cfg["seed"]), flag("output_dir", output)]
         units = None
+        length = cfg.get("episode_length", 0)
+        if type(length) is not int or length < 0:
+            raise ValueError("Episode length must be a nonnegative integer.")
+        if length:
+            args.append(flag("env.episode_length", length))
         if kind == "libero":
             if not tasks or len(set(tasks)) != len(tasks):
                 raise ValueError("Specify at least one suite and list each suite once.")
@@ -160,8 +167,6 @@ class NativeAdapter:
                 raise ValueError("Use unique, in-range task IDs from a single suite.")
             if ids:
                 args.append(flag("env.task_ids", ids))
-            if cfg.get("episode_length"):
-                args.append(flag("env.episode_length", cfg["episode_length"]))
             args += ["--env.max_parallel_tasks=1", flag("env.control_mode", cfg["control"]),
                      "--env.obs_type=pixels_agent_pos", flag("env.observation_width", cfg["size"]),
                      flag("env.observation_height", cfg["size"])]

@@ -115,7 +115,9 @@ def seconds(value):
         return "N/A"
     mins, secs = divmod(max(0, round(value)), 60)
     hours, mins = divmod(mins, 60)
-    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+    days, hours = divmod(hours, 24)
+    clock = f"{hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{days}d {clock}" if days else clock
 
 
 def status_line(percent, count, total, stage, eta, average=None):
@@ -125,10 +127,10 @@ def status_line(percent, count, total, stage, eta, average=None):
     if stage == "eval":
         parts.append(f"{current}/{target} Episodes")
         speed = f"{average:.2f} s" if average is not None else "N/A"
-        parts.append(f"Avg/episode: {speed}")
+        parts.append(f"Seconds Per Episode: {speed}")
     else:
         parts.append(f"{current}/{target} Steps")
-    return " | ".join([*parts, f"ETA: {seconds(eta)}"])
+    return " | ".join([*parts, f"Estimated Time of Completion: {seconds(eta)}"])
 
 
 class Progress:
@@ -422,7 +424,7 @@ def run_job(job, run_dir):
                 if display_eta is not None:
                     scope = "whole job" if overall is not None else label.lower()
                     if scope != eta_scope and (scope != "whole job" or eta_scope is not None):
-                        print(f"ETA scope · {scope}", flush=True)
+                        print(f"Time estimate scope · {scope}", flush=True)
                     eta_scope = scope
                 fraction = 1 if completed else progress.fraction()
                 count = stage.units if completed and stage.units is not None else progress.count
