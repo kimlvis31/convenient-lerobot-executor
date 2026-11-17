@@ -147,7 +147,16 @@ class NativeAdapter:
         episodes, batch = cfg["episodes"], cfg["batch"]
         if type(episodes) is not int or type(batch) is not int or min(episodes, batch) < 1:
             raise ValueError("Episode count and evaluation batch size must be positive integers.")
-        args = ["lerobot-eval", flag("env.type", kind), flag("env.task", ",".join(tasks)),
+        parallel = cfg.get("parallel_tasks", 1)
+        if type(parallel) is not int or parallel < 1:
+            raise ValueError("Parallel evaluation tasks must be a positive integer.")
+        if parallel > 1:
+            if self.key != "tinyvla" or kind != "libero":
+                raise ValueError("Parallel tasks are currently supported for TinyVLA LIBERO evaluation.")
+            command = ["python", "-u", str(Path(__file__).with_name("parallel_eval.py").resolve())]
+        else:
+            command = ["lerobot-eval"]
+        args = [*command, flag("env.type", kind), flag("env.task", ",".join(tasks)),
                 flag("eval.n_episodes", episodes), flag("eval.batch_size", batch),
                 flag("seed", cfg["seed"]), flag("output_dir", output)]
         units = None
@@ -167,7 +176,7 @@ class NativeAdapter:
                 raise ValueError("Use unique, in-range task IDs from a single suite.")
             if ids:
                 args.append(flag("env.task_ids", ids))
-            args += ["--env.max_parallel_tasks=1", flag("env.control_mode", cfg["control"]),
+            args += [flag("env.max_parallel_tasks", parallel), flag("env.control_mode", cfg["control"]),
                      "--env.obs_type=pixels_agent_pos", flag("env.observation_width", cfg["size"]),
                      flag("env.observation_height", cfg["size"])]
             if known_suites:

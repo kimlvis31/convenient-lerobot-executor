@@ -51,7 +51,7 @@ elif args[0] == 'lerobot-eval':
     model = Path(next(arg.split('=', 1)[1] for arg in args
                       if arg.startswith(('--policy.path=', '--policy.model_path='))))
     assert model.is_dir(), model
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=True)
     print('Stepping through eval batches: 0%|          | 0/2 [00:00<?, ?it/s]', flush=True)
     print('Stepping through eval batches: 100%|##########| 2/2 [00:00<00:00, 2it/s]', flush=True)
     if '--seed=0' in args:
@@ -253,6 +253,32 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn("prepare_examples.py", menu.getvalue())
         self.assertEqual(settings_jobs(imported), [settings, settings])
 
+    def test_combined_run_records_each_stage_in_its_result_folder(self):
+        settings = sample_settings()
+        adapter = NativeAdapter(settings, "job", self.root, self.external, self.envs)
+        training = self.root / "outputs/training/job/executor"
+        evaluation = self.root / "outputs/evaluation/job/executor"
+        with patch("runner.resolve_environment", return_value=self.environment), \
+             patch("runner.conda_command", side_effect=lambda c, e, argv: [sys.executable, "-u", str(self.backend), *argv]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            execute([adapter.train(), adapter.evaluate(True)], settings, training, self.root, "fake", False)
+        self.assertEqual({p.name for p in training.iterdir()}, {"run.py", "script.py", "status.json", "train.log"})
+        self.assertEqual({p.name for p in evaluation.iterdir()}, {"run.py", "script.py", "status.json", "eval.log"})
+        self.assertEqual(read_json(training / "status.json"), read_json(evaluation / "status.json"))
+        self.assertEqual(scan(self.root, self.external, self.logs).settings, [training / "script.py"])
+        self.assertFalse(self.logs.exists())
+
+    def test_parallel_rollouts_use_the_aggregate_episode_count(self):
+        settings = sample_settings()
+        settings["eval"]["parallel_tasks"] = 2
+        stage = Stage("eval", "lerobot", [], (), 4, eval_batches=1)
+        progress = Progress(stage, settings, started_at=0)
+        self.assertFalse(progress.update("Stepping through eval batches: 100%|#| 1/1 [00:01<00:00, 1it/s]", 1))
+        self.assertTrue(progress.update("[Eval progress] Episodes completed: 2", 2))
+        self.assertTrue(progress.update("[Eval progress] Episodes completed: 4", 3))
+        self.assertEqual(progress.count, 4)
+        self.assertEqual(progress.average(), 0.75)
+
     def test_queue_executes_in_order_and_stops_after_a_failed_job(self):
         plans = []
         for index, seed in enumerate((0, 1, 0)):
@@ -352,7 +378,7 @@ class ManagerTests(unittest.TestCase):
         prompt.assert_called_once_with("\nseed [Default: 0]: ")
 
     def test_tinyvla_evaluation_defaults_to_training_suite_and_task(self):
-        answers = io.StringIO("\n\n3\n2\n\n\n10\n\n\n")
+        answers = io.StringIO("\n\n3\n2\n\n\n\n10\n\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory())
         self.assertEqual((cfg["env"], cfg["tasks"], cfg["task_ids"]), ("libero", ["libero_goal"], [7]))

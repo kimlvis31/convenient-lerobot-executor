@@ -49,7 +49,7 @@ python -B ~/convLexecutor/executor/manage.py \
 
 직접 설정하려면 `manage.py`를 실행하고 **Configure a new job**을 선택합니다. 한 목록에서 모델을 고르고 평가 벤치마크나 LIBERO(Lifelong Learning Benchmark on Robot Manipulation, 로봇 조작 평생학습 벤치마크) 스위트를 선택합니다. Enter를 누르면 표시된 기본값이 적용됩니다. 준비된 작업 큐를 실행하려면 **Import a job queue script**를 선택합니다. [예제 설정](scripts/example_script.py)
 
-각 작업의 실제 실행 파일 `run.py`, 다시 가져올 수 있는 `script.py`, 시작·종료·소요 시간과 콘솔 로그는 `executor/log/<실행명>/`에 기록합니다. 평가 결과는 `outputs/evaluation/`, 학습 결과는 `outputs/training/`에 저장합니다. Git으로 관리하는 파일은 소스, 설정과 출처 목록입니다. 데이터, 가중치, 실행 로그와 결과는 로컬에서 생성합니다.
+각 작업의 실제 실행 파일 `run.py`, 다시 가져올 수 있는 `script.py`, 시작·종료·소요 시간과 단계별 콘솔 로그는 각 결과 폴더의 `executor/`에 기록합니다. 평가 결과는 `outputs/evaluation/`, 학습 결과는 `outputs/training/`에 저장합니다. Git으로 관리하는 파일은 소스, 설정과 출처 목록입니다. 데이터, 가중치, 실행 로그와 결과는 로컬에서 생성합니다.
 
 설치 작업을 에이전트에게 맡길 때는 [AGENTS.md](AGENTS.md)를 사용하세요.
 

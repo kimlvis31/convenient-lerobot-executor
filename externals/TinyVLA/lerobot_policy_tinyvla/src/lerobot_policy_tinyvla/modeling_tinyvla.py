@@ -26,20 +26,19 @@ class TinyVLAPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
-        self._action_queue = deque()
+        self._rollout = threading.local()
         self._lock = threading.Lock()
         self._process = None
         self._log = None
         self._channel = None
         self._worker_dir = None
         self._request_id = 0
-        self._last_task = None
         self._failed = False
         atexit.register(self.close)
 
     def reset(self):
-        self._action_queue.clear()
-        self._last_task = None
+        self._rollout.queue = deque()
+        self._rollout.instructions = None
 
     def get_optim_params(self):
         raise NotImplementedError("This adapter supports inference only.")
@@ -80,7 +79,7 @@ class TinyVLAPolicy(PreTrainedPolicy):
         worker_script = Path(self._worker_dir.name) / "worker.py"
         worker_script.write_text(generated, encoding="utf-8")
         (self._channel / "adapter.json").write_text(json.dumps({
-            "adapter_version": "0.2.0", "step7": str(step7), "step7_sha256": source_hash,
+            "adapter_version": "0.3.0", "step7": str(step7), "step7_sha256": source_hash,
             "worker_sha256": hashlib.sha256(generated.encode()).hexdigest(),
             "workspace": str(workspace), "inference_python": str(inference_python),
             "seed": self.config.seed, "n_action_steps": self.config.n_action_steps,
@@ -139,8 +138,8 @@ class TinyVLAPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch, **kwargs):
-        if not self._lock.acquire(blocking=False):
-            raise RuntimeError("Use env.max_parallel_tasks=1 with this adapter.")
+        # Task threads share one GPU worker, so each request owns the exchange files.
+        self._lock.acquire()
         try:
             state = batch["observation.state"].detach().to("cpu", dtype=torch.float32).numpy()
             size = self._batch_size(state)
@@ -178,11 +177,11 @@ class TinyVLAPolicy(PreTrainedPolicy):
             with (self._channel / "requests.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"id": self._request_id, "instructions": instructions, "batch_size": size,
                                       "seconds": response["seconds"],
-                                      "clipped_values": int((actions.abs() > 1).sum())}) + "\n")
+                                      "clipped_values": int((actions.abs() > 1).sum()), "task_thread": threading.get_ident()}) + "\n")
             return actions.clamp(-1, 1).to(self._device_anchor.device)
         except Exception:
             self._failed = True
-            self._action_queue.clear()
+            self.reset()
             self.close()
             raise
         finally:
@@ -192,13 +191,14 @@ class TinyVLAPolicy(PreTrainedPolicy):
     def select_action(self, batch, **kwargs):
         size = self._batch_size(batch["observation.state"])
         instructions = self._instructions(batch, size)
-        if instructions != self._last_task:
-            self._action_queue.clear()
-            self._last_task = instructions
-        if not self._action_queue:
+        if instructions != getattr(self._rollout, "instructions", None):
+            self._rollout.queue = deque()
+            self._rollout.instructions = instructions
+        queue = self._rollout.queue
+        if not queue:
             chunk = self.predict_action_chunk(batch)
-            self._action_queue.extend(chunk[:, :self.config.n_action_steps].unbind(dim=1))
-        return self._action_queue.popleft()
+            queue.extend(chunk[:, :self.config.n_action_steps].unbind(dim=1))
+        return queue.popleft()
 
     def close(self):
         process = self._process

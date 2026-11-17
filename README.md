@@ -63,7 +63,7 @@ Preparation fetches the pinned public base weights and the files needed for one 
 
 For interactive setup, run `manage.py` and choose **Configure a new job**. Select a model from the combined list and choose the evaluation benchmark or LIBERO suite as prompted. Press Enter to use the displayed default. To run a prepared queue, choose **Import a job queue script** or use `--queue`. The [example](scripts/example_script.py) explains the fields inline.
 
-Each job records its executed `run.py`, reusable `script.py`, timings, and console output in `executor/log/<run-name>/`. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
+Each result has an `executor/` subdirectory with its executed `run.py`, reusable `script.py`, job status, and the stage console log. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
 
 See the [executor guide](executor/README.md), [TinyVLA guide](externals/TinyVLA/README.md), and [agent setup guide](AGENTS.md) for more details.
 

@@ -16,7 +16,7 @@ python -B ~/convLexecutor/executor/manage.py
 
 `--dry-run` shows the commands and Conda environments selected by the settings. Use `--lerobot-root` for older relative input paths outside the managed directories. Use `--tinyvla-root` to override the bundled TinyVLA integration.
 
-In a numbered menu, press Enter to select the row marked [Default]. In a text or numeric prompt, press Enter to use the value shown in [Default: ...]. Select a model from one list with [LeRobot Native] or [External] next to its name. Native models come from the selected LeRobot environment and appear before external models. Size labels refer to published models or to the size of available local weight files. Local weight size depends on the checkpoint and its storage format. For plain terminal output, set NO_COLOR=1. The evaluation menu lists LeRobot benchmarks and accepts an environment name manually. Select a LIBERO suite, all four standard suites, or enter a custom suite list. TinyVLA uses LIBERO and accepts an evaluation batch size. For LIBERO, PushT, ALOHA, and Meta-World, set Episode length to the maximum control steps per episode. Enter 0 to use the benchmark default. The display separates status, questions, settings, progress, and completion. Other benchmarks may need their corresponding LeRobot environment dependencies.
+In a numbered menu, press Enter to select the row marked [Default]. In a text or numeric prompt, press Enter to use the value shown in [Default: ...]. Select a model from one list with [LeRobot Native] or [External] next to its name. Native models come from the selected LeRobot environment and appear before external models. Size labels refer to published models or to the size of available local weight files. Local weight size depends on the checkpoint and its storage format. For plain terminal output, set NO_COLOR=1. The evaluation menu lists LeRobot benchmarks and accepts an environment name manually. Select a LIBERO suite, all four standard suites, or enter a custom suite list. TinyVLA uses LIBERO and accepts an evaluation batch size and a separate number of parallel tasks. The batch size is capped at episodes per task. Parallel tasks have separate action queues and processors, and share one inference worker. For LIBERO, PushT, ALOHA, and Meta-World, set Episode length to the maximum control steps per episode. Enter 0 to use the benchmark default. The display separates status, questions, settings, progress, and completion. Other benchmarks may need their corresponding LeRobot environment dependencies.
 
 ## Import a job queue
 
@@ -53,10 +53,10 @@ After you confirm the settings, the executor generates and runs one script per j
 
 | Path | Contents |
 | --- | --- |
-| `executor/log/<run-name>/run.py` | The script that ran, including job settings, commands, and environment details |
-| `executor/log/<run-name>/script.py` | The effective settings for that job, saved as a reusable `JOBS` list |
-| `executor/log/<run-name>/status.json` | Start and end times, duration, and status for the job and its stages |
-| `executor/log/<run-name>/train.log`, `eval.log` | Console output for each stage that ran |
+| `outputs/{training,evaluation}/<run-name>/executor/run.py` | The script that ran, including job settings, commands, and environment details |
+| `outputs/{training,evaluation}/<run-name>/executor/script.py` | The effective settings for that job, saved as a reusable `JOBS` list |
+| `outputs/{training,evaluation}/<run-name>/executor/status.json` | Start and end times, duration, and status for the job and its stages |
+| `outputs/{training,evaluation}/<run-name>/executor/{train,eval}.log` | Console output for each stage that ran |
 | `outputs/training/<run-name>/` | Checkpoints, training results, and the saved dataset split where applicable |
 | `outputs/evaluation/<run-name>/` | Evaluation results and videos saved by LeRobot |
 

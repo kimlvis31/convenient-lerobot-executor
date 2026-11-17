@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from adapters import read_json, weights
-from runner import styled
+from runner import run_log_directories, styled
 
 
 @dataclass
@@ -116,9 +116,9 @@ def scan(root, external, log_root):
                     latest = path.parent.parent / "last"
                     if not latest.is_dir() or path.parent.resolve() == latest.resolve():
                         result.results.append(path / "train_config.json")
-    for script in sorted(log_root.glob("*/run.py"), reverse=True):
-        imported = script.with_name("script.py")
-        result.settings.append(imported if imported.is_file() else script)
+    for directory in run_log_directories(root, log_root):
+        imported = directory / "script.py"
+        result.settings.append(imported if imported.is_file() else directory / "run.py")
     result.settings += sorted((root / "outputs/manager").glob("*/settings.json"), reverse=True)
     return result
 

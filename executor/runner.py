@@ -23,6 +23,7 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 NATIVE_STEP = re.compile(r"\bstep:\s*(\d+(?:\.\d+)?)([KMB]?)\b(?![/\d.])", re.I)
 TINY_STEP = re.compile(r"\bstep:(\d+)/(\d+)\b")
 CHECKPOINT_STEP = re.compile(r"\bCheckpoint policy after step (\d+)\b")
+PARALLEL_EPISODES = re.compile(r"^\[Eval progress\] Episodes completed: (\d+)$")
 EVAL_BATCH = re.compile(r"Stepping through eval batches[^|]*\|[^|]*\|\s*(\d+)\s*/\s*(\d+)")
 
 
@@ -146,9 +147,13 @@ class Progress:
         self.last_batch = None
         self.episodes = settings.get("eval", {}).get("episodes", 0)
         self.batch = settings.get("eval", {}).get("batch", 1)
+        self.parallel = settings.get("eval", {}).get("parallel_tasks", 1) > 1
 
     def parse(self, line):
         if self.stage.name == "eval":
+            if self.parallel:
+                match = PARALLEL_EPISODES.fullmatch(line)
+                return int(match[1]) if match else None
             match = EVAL_BATCH.search(line)
             if not match:
                 return None
@@ -234,9 +239,21 @@ def evaluation_timing_key(settings, stage, runtime):
     return hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
 
 
-def history(outputs):
+def run_log_directories(root, legacy_log_root):
+    directories = {path.parent.name: path.parent for path in legacy_log_root.glob("*/run.py")}
+    for bucket in ("evaluation", "training"):
+        for script in (root / "outputs" / bucket).glob("*/executor/run.py"):
+            directories[script.parents[1].name] = script.parent
+    return [directories[name] for name in sorted(directories, reverse=True)]
+
+
+def history(outputs, root=None):
     rates = {}
-    for path in sorted(outputs.glob("*/status.json"), reverse=True)[:60]:
+    if root is None:
+        statuses = sorted(outputs.glob("*/status.json"), reverse=True)
+    else:
+        statuses = [directory / "status.json" for directory in run_log_directories(root, root / "executor/log")]
+    for path in statuses[:60]:
         try:
             completed = [(index, item) for index, item in enumerate(read_json(path)["stages"])
                          if item["status"] == "completed" and item.get("seconds", 0) > 0]
@@ -352,6 +369,9 @@ def execute(stages, settings, run_dir, root, conda, verbose):
         entries.append(item)
 
     job = {"root": str(root), "settings": settings, "runtime": runtime, "stages": entries, "verbose": verbose}
+    if stages[0].name == "eval" and stages[0].output and run_dir == stages[0].output / "executor":
+        stages[0].output.parent.mkdir(parents=True, exist_ok=True)
+        stages[0].output.mkdir()
     run_dir.mkdir(parents=True, exist_ok=False)
     with (run_dir / "script.py").open("x", encoding="utf-8", newline="\n") as file:
         file.write('"""Reusable settings for this job. Import with --queue or from the project scripts/ directory."""\n\n')
@@ -364,7 +384,7 @@ def execute(stages, settings, run_dir, root, conda, verbose):
         "JOB = " + pformat(job, sort_dicts=False, width=110) + "\n\n"
         'if __name__ == "__main__":\n'
         "    script = Path(__file__).resolve()\n"
-        "    sys.path.insert(0, str(script.parents[2]))\n"
+        "    sys.path.insert(0, str(Path(JOB['root']) / 'executor'))\n"
         "    from runner import run_job\n"
         "    run_job(JOB, script.parent)\n"
     )
@@ -384,6 +404,12 @@ def run_job(job, run_dir):
         stage.output = Path(stage.output) if stage.output else None
         stages.append(stage)
     status_path = run_dir / "status.json"
+    log_directories = [run_dir]
+
+    def save_status():
+        for directory in log_directories:
+            write_json(directory / "status.json", status)
+
     job_start = time.monotonic()
     status = {"status": "preparing", "started_at": datetime.now(timezone.utc).isoformat(), "stages": []}
     with status_path.open("x", encoding="utf-8") as file:
@@ -391,12 +417,12 @@ def run_job(job, run_dir):
     try:
         signatures = [stage_signature(settings, stage, runtime) for stage in stages]
         timing_keys = [evaluation_timing_key(settings, stage, runtime) for stage in stages]
-        previous = history(run_dir.parent)
+        previous = history(run_dir.parent, root)
         status["status"] = "running"
         status["stages"] = [{"name": s.name, "status": "waiting", "signature": signature,
                              "timing_key": key, "output": str(s.output) if s.output else None}
                             for s, signature, key in zip(stages, signatures, timing_keys)]
-        write_json(status_path, status)
+        save_status()
         eta_scope = None
         for index, stage in enumerate(stages):
             saved = status["stages"][index]
@@ -406,7 +432,7 @@ def run_job(job, run_dir):
                             for signature, key in zip(signatures[index + 1:], timing_keys[index + 1:])]
             saved["status"] = "running"
             saved["started_at"] = datetime.now(timezone.utc).isoformat()
-            write_json(status_path, status)
+            save_status()
             label = {"train": "Training", "eval": "Evaluation"}[stage.name]
             future_eta = sum(known_future) if None not in known_future else None
             historical_time = previous.get(signatures[index], previous.get(timing_keys[index]))
@@ -446,23 +472,36 @@ def run_job(job, run_dir):
                         return
                 last_print = now
                 report(now)
-                write_json(status_path, status)
+                save_status()
 
             print(f"\n{label} · Environment {stage.environment}", flush=True)
+            stage_log = run_dir
             if stage.output:
-                if stage.output.exists() or stage.output.is_symlink():
-                    raise FileExistsError(f"Output path already exists ({stage.output}).")
-                stage.output.parent.mkdir(parents=True, exist_ok=True)
+                if run_dir.name == "executor" and stage.name == "eval":
+                    stage_log = stage.output / "executor"
+                    if stage_log == run_dir:
+                        if stage.output.is_symlink() or set(stage.output.iterdir()) != {run_dir}:
+                            raise FileExistsError(f"Output path already contains results ({stage.output}).")
+                    else:
+                        stage.output.mkdir(parents=True)
+                        stage_log.mkdir()
+                        for filename in ("run.py", "script.py"):
+                            shutil.copyfile(run_dir / filename, stage_log / filename)
+                        log_directories.append(stage_log)
+                else:
+                    if stage.output.exists() or stage.output.is_symlink():
+                        raise FileExistsError(f"Output path already exists ({stage.output}).")
+                    stage.output.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Output directory: {stage.output}", flush=True)
             report(begin)
-            write_json(status_path, status)
+            save_status()
             try:
-                run_stage(stage.arguments, stage, root, run_dir / f"{stage.name}.log", update, job["verbose"])
+                run_stage(stage.arguments, stage, root, stage_log / f"{stage.name}.log", update, job["verbose"])
             finally:
                 saved.update(seconds=time.monotonic()-begin, ended_at=datetime.now(timezone.utc).isoformat())
             saved["status"] = "completed"
             report(time.monotonic(), completed=True)
-            write_json(status_path, status)
+            save_status()
         status["status"] = "completed"
     except BaseException as error:
         status["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
@@ -474,4 +513,4 @@ def run_job(job, run_dir):
         raise
     finally:
         status.update(ended_at=datetime.now(timezone.utc).isoformat(), seconds=time.monotonic()-job_start)
-        write_json(status_path, status)
+        save_status()

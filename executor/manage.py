@@ -133,7 +133,8 @@ def choose_model(inventory, model, optional=False):
 
 def tiny_resume(inventory):
     run = Path(select_path("Training run to resume", [(p, str(p)) for p in inventory.tiny_resume]))
-    candidates = [LOG_ROOT / run.name / name for name in ("script.py", "run.py")] + [run / "settings.json"]
+    candidates = [directory / name for directory in (run / "executor", LOG_ROOT / run.name)
+                  for name in ("script.py", "run.py")] + [run / "settings.json"]
     saved = next((path for path in candidates if path.is_file()), None)
     jobs = settings_jobs(load_settings(saved or ask("Saved settings file for this run")))
     if len(jobs) != 1:
@@ -303,6 +304,8 @@ def eval_settings(model, tiny, train, inventory):
     cfg = {"env": env_type, "tasks": tasks,
            "episodes": number("Episodes per task", 5), "batch": number("Evaluation batch size", 1),
            "seed": number("Random seed", 0, 0), "device": "cpu" if tiny else ask("Evaluation device", "cuda")}
+    if tiny:
+        cfg["parallel_tasks"] = number("Parallel evaluation tasks", 1)
     if train is None:
         cfg["policy"] = choose_model(inventory, model, optional=tiny)
     if env_type == "libero":
@@ -466,7 +469,6 @@ def plan_job(args, cfg, conda, detected):
         raise ValueError("Invalid Conda environment name.")
     cfg.update(environments=environments, plugins=plugins, lerobot_root=str(root), tinyvla_root=str(external))
     name = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{cfg['model'][:50]}_{uuid4().hex[:8]}"
-    run_dir = LOG_ROOT / name
     adapter = adapters[cfg["adapter"]](cfg, name, PROJECT_ROOT, external, environments)
     stages = []
     if "train" in cfg:
@@ -475,6 +477,9 @@ def plan_job(args, cfg, conda, detected):
         stages.append(adapter.evaluate(after_training="train" in cfg))
     for stage in stages:
         stage.env.setdefault("HF_LEROBOT_HOME", str(PROJECT_ROOT / "datasets/.hub"))
+    first = stages[0]
+    output = first.output or PROJECT_ROOT / "outputs" / ("training" if first.name == "train" else "evaluation") / name
+    run_dir = (output.parent if first.name == "train" and first.output else output) / "executor"
     return cfg, stages, run_dir, PROJECT_ROOT
 
 
@@ -539,16 +544,20 @@ def main():
         if not plans:
             return 0
         section("Settings")
-        if not (args.settings or args.queue) or args.dry_run:
-            for index, (cfg, stages, _, _) in enumerate(plans, 1):
+        show_commands = not (args.settings or args.queue) or args.dry_run
+        for index, (cfg, stages, _, _) in enumerate(plans, 1):
+            if show_commands:
                 if len(plans) > 1:
                     print(f"Job {index}/{len(plans)} · {cfg.get('label') or cfg['model']}")
                 for stage in stages:
                     print(f"{stage.name} [{stage.environment}] {shlex.join(stage.arguments)}")
-        else:
-            for cfg, stages, _, _ in plans:
+            else:
                 print(f"{cfg.get('label') or cfg['model']} · " + ", ".join(
                     f"{stage.name} [{stage.environment}]" for stage in stages))
+            evaluation = cfg.get("eval")
+            if evaluation and evaluation["batch"] > evaluation["episodes"]:
+                print(f"Effective evaluation batch size: {evaluation['episodes']} "
+                      f"({evaluation['batch']} requested, {evaluation['episodes']} episodes per task)")
         if args.dry_run:
             return 0
         if not (args.settings or args.queue) and ask(f"Run {len(plans)} job(s)? (y/N)", "n").lower() != "y":
