@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
@@ -62,12 +63,14 @@ def section(title):
     print(styled(f"<{title}>", "1;95"), flush=True)
 
 
-def ask(question, default=None, optional=False, *, choices=()):
+def ask(question, default=None, optional=False, *, choices=(), blank_before=True):
     hint = styled(f"[Default: {default}]", "33") if not choices and default is not None else ""
     suffix = " " + hint if hint else ""
     prompt = "\n".join([*choices, styled(question, "1;36") + suffix])
+    if blank_before:
+        prompt = "\n" + prompt
     while True:
-        value = input(f"\n{prompt}: ").strip()
+        value = input(f"{prompt}: ").strip()
         if not sys.stdin.isatty():
             print()
         if value:
@@ -78,10 +81,10 @@ def ask(question, default=None, optional=False, *, choices=()):
             return ""
 
 
-def number(question, default, minimum=1, maximum=None, *, choices=()):
+def number(question, default, minimum=1, maximum=None, *, choices=(), blank_before=True):
     while True:
         try:
-            value = int(ask(question, default, choices=choices))
+            value = int(ask(question, default, choices=choices, blank_before=blank_before))
             if value >= minimum and (maximum is None or value <= maximum):
                 return value
         except ValueError:
@@ -100,16 +103,23 @@ def rate(question, default):
         print("Enter a positive number.")
 
 
-def choose(question, options, default=1, *, details=None):
+def choose(question, options, default=1, *, details=None, blank_before=True):
     choices = []
-    for index, (value, label) in enumerate(options, 1):
-        row = f"  {index}. {label}"
+    labels = [ANSI.sub("", label) for _, label in options]
+    detail_column = max((len(label) for (value, _), label in zip(options, labels)
+                         if details and value in details), default=0)
+    number_width = len(str(len(options))) if details else 1
+    for index, ((value, label), plain_label) in enumerate(zip(options, labels), 1):
+        row = f"  {index:>{number_width}}. {label}"
         if index == default:
-            row = styled(ANSI.sub("", row) + " [Default]", "33")
+            row = styled(ANSI.sub("", row), "33")
         if details and value in details:
-            row += "  " + styled(details[value], "90")
+            row += " " * (detail_column - len(plain_label) + 3) + styled(details[value], "90")
+        if index == default:
+            row += styled(" [Default]", "33")
         choices.append(row)
-    return options[number(question, default, maximum=len(options), choices=choices) - 1][0]
+    position = number(question, default, maximum=len(options), choices=choices, blank_before=blank_before)
+    return options[position - 1][0]
 
 
 def path_value(value):
@@ -125,7 +135,7 @@ def policy_value(value):
 def extra_flags():
     while True:
         try:
-            return shlex.split(ask("Additional LeRobot options (optional)", optional=True))
+            return shlex.split(ask("Additional LeRobot Options (optional)", optional=True))
         except ValueError:
             print("Check the quotation marks in the options.")
 
@@ -139,23 +149,23 @@ def select_path(question, options, default=None, optional=False, convert=path_va
 
 
 def choose_dataset(inventory, default=None, optional=False):
-    return select_path("Training dataset directory", [(p, str(p)) for p, _ in inventory.datasets], default, optional)
+    return select_path("Training Dataset Directory", [(p, str(p)) for p, _ in inventory.datasets], default, optional)
 
 
 def choose_model(inventory, model, optional=False):
     options = [(p, model_location(inventory, p)) for p, kind in inventory.models if kind == model]
     if optional:
         options.insert(0, ("", "Use the base model" if model == "tinyvla" else "Initialize a new model"))
-    return select_path("Model path or repository name" if model != "tinyvla" else "Model directory", options,
+    return select_path("Model Path or Repository Name" if model != "tinyvla" else "Model Directory", options,
                        optional=optional, convert=path_value if model == "tinyvla" else policy_value)
 
 
 def tiny_resume(inventory):
-    run = Path(select_path("Training run to resume", [(p, str(p)) for p in inventory.tiny_resume]))
+    run = Path(select_path("Training Run to Resume", [(p, str(p)) for p in inventory.tiny_resume]))
     candidates = [directory / name for directory in (run / "executor", LOG_ROOT / run.name)
                   for name in ("script.py", "run.py")] + [run / "settings.json"]
     saved = next((path for path in candidates if path.is_file()), None)
-    jobs = settings_jobs(load_settings(saved or ask("Saved settings file for this run")))
+    jobs = settings_jobs(load_settings(saved or ask("Saved Settings File for This Run")))
     if len(jobs) != 1:
         raise ValueError("Select settings for exactly one training run.")
     previous = jobs[0]
@@ -177,7 +187,7 @@ def tiny_train(warm, inventory, root):
     if warm:
         runs = [(p.parent.parent, str(p.parent.parent)) for p, kind in inventory.models if kind == "tinyvla"
                 and (p / "action_head.safetensors").is_file() and (p.parent.parent / "selection.json").is_file()]
-        run = Path(select_path("Existing TinyVLA training run", runs))
+        run = Path(select_path("Existing TinyVLA Training Run", runs))
         train.update(warm_start=str(run / "train/pretrained_model"), selection=str(run / "selection.json"))
         default_dataset = str(run / "dataset") if (run / "dataset").is_dir() else None
         spec = read_json(Path(train["selection"]))
@@ -190,15 +200,15 @@ def tiny_train(warm, inventory, root):
             raise ValueError("The existing run must cover one task or all 40 tasks.")
     else:
         default_dataset = None
-        suite = choose("Training suite", [(name, name) for name in SUITES] + [("all", "All 40 tasks across four suites")])
+        suite = choose("Training Suite", [(name, name) for name in SUITES] + [("all", "All 40 tasks across four suites")])
         if suite != "all":
             train["task"] = [suite, number("Task ID", 1, 0, 9)]
         train["base_model"] = choose_model(inventory, "tinyvla", optional=True)
-        train["selection"] = path_value(ask("Training split file to reuse (optional)", optional=True))
+        train["selection"] = path_value(ask("Training Split File to Reuse (optional)", optional=True))
     train["dataset_root"] = choose_dataset(inventory, default_dataset or str(root / "datasets/libero"))
-    train.update(updates=number("Training steps per task", 20), batch=number("Training batch size", 16),
-                 lr=rate("Learning rate", 0.0001), seed=number("Random seed", 0, 0),
-                 save_freq=number("Checkpoint interval in steps", 100))
+    train.update(updates=number("Training Steps per Task", 20), batch=number("Training Batch Size", 16),
+                 lr=rate("Learning Rate", 0.0001), seed=number("Random Seed", 0, 0),
+                 save_freq=number("Checkpoint Interval in Steps", 100))
     return train
 
 
@@ -212,8 +222,10 @@ def model_size(model):
 
 
 def choose_policy(adapters, policies):
-    native = styled("[LeRobot Native]", "38;5;75")
-    external = styled("[External]", "38;5;208")
+    native_tag = "[LeRobot Native]"
+    external_tag = "[External]"
+    native = styled(native_tag, "38;5;75")
+    external = styled(external_tag, "38;5;208") + " " * (len(native_tag) - len(external_tag))
     if not policies:
         print("\nCould not read the LeRobot model list. You can enter a model name manually.")
     entries = [(("native", model), f"{native} {model}") for model in sorted(policies)]
@@ -221,11 +233,11 @@ def choose_policy(adapters, policies):
     entries += [((key, key), f"{external} {adapters[key].label}") for key in sorted(adapters) if key != "native"]
     sizes = {value: model_size(value[1]) for value, _ in entries if value[1]}
     default = next((index for index, (value, _) in enumerate(entries, 1) if value == ("native", "smolvla")), 1)
-    backend, model = choose("Policy model", entries, default=default, details=sizes)
+    backend, model = choose("Policy Model", entries, default=default, details=sizes)
     if not model:
-        model = ask("LeRobot policy name", "smolvla")
+        model = ask("LeRobot Policy Name", "smolvla")
     elif backend not in {"native", "tinyvla"}:
-        model = ask("Model name", model)
+        model = ask("Model Name", model)
     return backend, model
 
 
@@ -234,7 +246,7 @@ def native_train(resume, inventory, model):
         models = {path: kind for path, kind in inventory.models}
         options = [(path, model_location(inventory, path)) for path in inventory.native_resume
                    if models.get(path, model) == model]
-        path = select_path("Existing run or checkpoint directory", options)
+        path = select_path("Existing Run or Checkpoint Directory", options)
         checkpoint = native_checkpoint(Path(path))
         config = read_json(checkpoint / "train_config.json")
         checkpoint_model = config.get("policy", {}).get("type")
@@ -248,15 +260,15 @@ def native_train(resume, inventory, model):
     else:
         old_steps = 1000
         options = [("", "Use a dataset repository")] + [(p, str(p)) for p, _ in inventory.datasets]
-        dataset_root = select_path("Training dataset", options, optional=True)
+        dataset_root = select_path("Training Dataset", options, optional=True)
         info = next((info for p, info in inventory.datasets if str(p) == dataset_root), {})
-        train = {"dataset": ask("Dataset repository name", info.get("repo_id")),
+        train = {"dataset": ask("Dataset Repository Name", info.get("repo_id")),
                  "dataset_root": dataset_root,
                  "pretrained": choose_model(inventory, model, optional=True),
-                 "batch": number("Training batch size", 8), "device": ask("Training device", "cuda"),
-                 "seed": number("Random seed", 0, 0)}
-    train.update(steps=number("Target training step count", old_steps),
-                 save_freq=number("Checkpoint interval in steps", 100), extra=extra_flags())
+                 "batch": number("Training Batch Size", 8), "device": ask("Training Device", "cuda"),
+                 "seed": number("Random Seed", 0, 0)}
+    train.update(steps=number("Target Training Step Count", old_steps),
+                 save_freq=number("Checkpoint Interval in Steps", 100), extra=extra_flags())
     return train
 
 
@@ -268,20 +280,20 @@ def evaluation_suites(train, tiny):
         ("manual", "Enter suite names manually"),
     ]
     default = SUITES.index(defaults[0]) + 1 if len(defaults) == 1 else len(SUITES) + 1
-    choice = choose("Evaluation suite", options, default=default)
+    choice = choose("Evaluation Suite", options, default=default)
     if choice == "all":
         return list(SUITES)
     if choice == "manual":
-        names = ask("Evaluation suites (comma-separated)", ",".join(defaults))
+        names = ask("Evaluation Suites (comma-separated)", ",".join(defaults))
         return [name.strip() for name in names.split(",") if name.strip()]
     return [choice]
 
 
 def eval_settings(model, tiny, train, inventory):
     if tiny:
-        env_type = choose("Evaluation benchmark", [("libero", "LIBERO (supported by TinyVLA)")])
+        env_type = choose("Evaluation Benchmark", [("libero", "LIBERO (supported by TinyVLA)")])
     else:
-        env_type = choose("Evaluation benchmark", [
+        env_type = choose("Evaluation Benchmark", [
             ("libero", "LIBERO"),
             ("pusht", "PushT"),
             ("aloha", "ALOHA"),
@@ -289,20 +301,20 @@ def eval_settings(model, tiny, train, inventory):
             ("manual", "Enter a LeRobot environment type"),
         ])
         if env_type == "manual":
-            env_type = ask("LeRobot environment type")
+            env_type = ask("LeRobot Environment Type")
 
     if env_type == "libero":
         tasks = evaluation_suites(train, tiny)
     else:
         default_task = {"pusht": "PushT-v0", "aloha": "AlohaInsertion-v0", "metaworld": "medium"}.get(env_type)
-        tasks = [task.strip() for task in ask("Evaluation tasks (comma-separated)", default_task).split(",")
+        tasks = [task.strip() for task in ask("Evaluation Tasks (comma-separated)", default_task).split(",")
                  if task.strip()]
 
     cfg = {"env": env_type, "tasks": tasks,
-           "episodes": number("Episodes per task", 5), "batch": number("Evaluation batch size", 1),
-           "seed": number("Random seed", 0, 0), "device": "cpu" if tiny else ask("Evaluation device", "cuda")}
+           "episodes": number("Episodes per Task", 5), "batch": number("Evaluation Batch Size", 1),
+           "seed": number("Random Seed", 0, 0), "device": "cpu" if tiny else ask("Evaluation Device", "cuda")}
     if tiny:
-        cfg["parallel_tasks"] = number("Parallel evaluation tasks", 1)
+        cfg["parallel_tasks"] = number("Parallel Evaluation Tasks", 1)
     if train is None:
         cfg["policy"] = choose_model(inventory, model, optional=tiny)
     if env_type == "libero":
@@ -311,12 +323,12 @@ def eval_settings(model, tiny, train, inventory):
         ids = ask("Task IDs (comma-separated, or all)", default_id) if len(tasks) == 1 else "all"
         cfg["task_ids"] = [int(value) for value in ids.split(",")] if ids != "all" else []
     if env_type in {"libero", "pusht", "aloha", "metaworld"}:
-        cfg["episode_length"] = number("Episode length (maximum control steps, 0 uses benchmark default)", 0, 0)
+        cfg["episode_length"] = number("Episode Length (maximum control steps, 0 uses benchmark default)", 0, 0)
     if env_type == "libero":
-        cfg.update(control="relative" if tiny else ask("Control mode", "absolute" if model == "xvla" else "relative"),
-                   size=256 if tiny else number("Camera image width and height", 448 if model == "evo1" else 256))
+        cfg.update(control="relative" if tiny else ask("Control Mode", "absolute" if model == "xvla" else "relative"),
+                   size=256 if tiny else number("Camera Image Width and Height", 448 if model == "evo1" else 256))
     if tiny:
-        cfg["action_steps"] = number("Actions to execute per prediction", 16, 1, 16)
+        cfg["action_steps"] = number("Actions to Execute per Prediction", 16, 1, 16)
     cfg["extra"] = extra_flags()
     return cfg
 
@@ -337,51 +349,139 @@ def script_paths():
     return queues
 
 
-def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
-    actions = [("new", "Configure a new job"), ("import", "Import a job queue script"), ("quit", "Exit")]
-    if inventory.settings:
-        actions.insert(1, ("reuse", "Reuse settings from a previous run"))
-    if inventory.results:
-        actions.insert(-1, ("results", "View existing results"))
+def run_in_use(run):
+    try:
+        status = read_json(run / "executor/status.json")
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return not isinstance(status, dict) or status.get("status") not in ("completed", "failed", "interrupted")
+
+
+def delete_result_runs(root, category):
+    label = {"evaluation": "Evaluation", "training": "Training"}[category]
+    folder = root.resolve() / "outputs" / category
+    if folder.resolve() != folder:
+        raise ValueError(f"Refusing to clean a redirected result folder ({folder}).")
+    if not folder.is_dir():
+        print(f"No {label} Run Folders Found.")
+        return False
+
+    selected = []
+    protected = 0
+    for run in sorted(folder.iterdir()):
+        if run.name.startswith(".") or not run.is_dir():
+            continue
+        if run.resolve() != run or run_in_use(run):
+            protected += 1
+            continue
+        selected.append((run, run.stat()))
+
+    if protected:
+        print(f"Protected Run Folders: {protected} (active, unreadable, or redirected).")
+    if not selected:
+        print(f"No {label} Run Folders Available to Delete.")
+        return False
+    print(f"Result Folder: {folder}")
+    if category == "training":
+        print("This Also Deletes Checkpoints Stored in the Selected Run Folders.")
+    count = len(selected)
+    unit = "Run Folder" if count == 1 else "Run Folders"
+    if ask(f"Permanently Delete {count} {label} {unit}? (Y/N)", "N").upper() != "Y":
+        print("Deletion Canceled.")
+        return False
+
+    deleted = 0
+    for run, original in selected:
+        try:
+            if (folder.resolve() != folder or run.resolve() != run or not os.path.samestat(run.stat(), original)
+                    or run_in_use(run)):
+                print(f"Skipped Changed Run Folder: {run}")
+                continue
+            shutil.rmtree(run)
+            deleted += 1
+        except OSError as error:
+            print(f"Could Not Delete {run} ({error}).", file=sys.stderr)
+    print(f"Deleted {deleted} of {count} {label} {unit}.")
+    return deleted > 0
+
+
+def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
+           external=None, environments=(), allow_delete=True):
     while True:
-        action = choose("What would you like to do?", actions)
+        actions = [("new", "Configure a new job")]
+        if inventory.settings:
+            actions.append(("reuse", "Reuse settings from a previous run"))
+        actions.append(("import", "Import a job queue script"))
+        if inventory.results:
+            actions.append(("results", "View existing results"))
+        if allow_delete:
+            actions.extend((("evaluation", "Delete All Evaluation Results"),
+                            ("training", "Delete All Training Results")))
+        actions.append(("quit", "Exit"))
+        action = choose("What Would You Like to Do?", actions, blank_before=False)
         if action == "quit":
             return None
         if action == "reuse":
-            path = select_path("Settings file", [(p, str(p)) for p in inventory.settings])
+            path = select_path("Settings File", [(p, str(p)) for p in inventory.settings])
             return load_settings(path)
         if action == "import":
             scripts = script_paths()
-            path = select_path("Job queue script", [(p, p.name) for p in scripts])
+            path = select_path("Job Queue Script", [(p, p.name) for p in scripts])
             return load_settings(path)
         if action == "new":
-            break
-        path = select_path("Result file", [(p, str(p)) for p in inventory.results])
+            policies = native_policies(conda, native_env, root)
+            return configure_jobs(adapters, inventory, root, policies, environments)
+        if action in {"evaluation", "training"}:
+            if delete_result_runs(root, action):
+                inventory = scan(root, external or root / "externals/TinyVLA", root / "executor/log")
+                section("Status")
+                show(inventory, environments, limit=5)
+                section("Questions")
+            continue
+        path = select_path("Result File", [(p, str(p)) for p in inventory.results])
         result = read_json(path)
         summary = result.get("overall") or {key: result[key] for key in
                     ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
         print(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
-    backend, model = choose_policy(adapters, native_policies(conda, native_env, root))
+
+def configure_jobs(adapters, inventory, root, policies, environments):
+    jobs = []
+    while True:
+        print(styled(f"[Job {len(jobs) + 1}]", "1;36"), flush=True)
+        jobs.append(configure_job(adapters, inventory, root, policies))
+        if ask("Add Another Job? (Y/N)", "N").upper() != "Y":
+            return {"schema": 1, "jobs": jobs}
+        if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+            print("\x1b[2J\x1b[H", end="", flush=True)
+            section("Status")
+            show(inventory, environments, limit=5)
+        section("Questions")
+
+
+def configure_job(adapters, inventory, root, policies):
+    backend, model = choose_policy(adapters, policies)
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
                ("both", "Train, then evaluate")]
     if tiny:
         choices.append(("warm", "Start training with existing action-head weights"))
-    operation = choose("Job type", choices)
+    operation = choose("Job Type", choices)
     cfg = {"schema": 1, "adapter": backend, "model": model}
     if operation != "eval":
-        print("\n" + styled("Training setup", "1;36"))
+        print("\n" + styled("Training Setup", "1;36"))
         if tiny:
             print("\nTraining benchmark · LIBERO")
             cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
         else:
             cfg["train"] = native_train(operation == "resume", inventory, model)
     evaluate = operation in ("eval", "both") or (
-        operation in ("resume", "warm") and ask("Evaluate after training? (Y/N)", "N").upper() == "Y"
+        operation in ("resume", "warm") and ask("Evaluate After Training? (Y/N)", "N").upper() == "Y"
     )
     if evaluate:
-        print("\n" + styled("Evaluation setup", "1;36"))
+        print("\n" + styled("Evaluation Setup", "1;36"))
         cfg["eval"] = eval_settings(cfg["model"], tiny, cfg.get("train"), inventory)
     return cfg
 
@@ -501,7 +601,8 @@ def plan(args):
         env_map = read_json(args.env_map) if args.env_map else {}
         native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
         section("Questions")
-        settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env)
+        settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env,
+                          external=external, environments=detected[PROJECT_ROOT], allow_delete=not args.dry_run)
         if settings is None:
             return [], conda
 
@@ -550,6 +651,8 @@ def job_subheading(title):
 
 def run_plans(plans, conda, verbose):
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
+        if index > 1:
+            print()
         print(job_title(index, cfg), flush=True)
         job_subheading("Status")
         execute(stages, cfg, run_dir, root, conda, verbose)

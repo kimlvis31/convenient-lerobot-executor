@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan, show
-from manage import choose_policy, eval_settings, main, model_size, normalize_paths, number, plan, settings_jobs, show_job_result, show_settings, wizard
+from manage import choose_policy, delete_result_runs, eval_settings, main, model_size, normalize_paths, number, plan, settings_jobs, show_job_result, show_settings, wizard
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -262,6 +262,56 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn("prepare_examples.py", menu.getvalue())
         self.assertEqual(settings_jobs(imported), [settings, settings])
 
+    def test_interactive_questions_queue_retains_previous_job_settings(self):
+        jobs = [
+            {**sample_settings(), "label": "first"},
+            {**sample_settings(), "label": "second"},
+        ]
+        with patch("sys.stdin", io.StringIO("1\nY\nN\n")), \
+             patch("manage.native_policies", return_value=["smolvla"]), \
+             patch("manage.configure_job", side_effect=jobs), \
+             contextlib.redirect_stdout(io.StringIO()) as menu:
+            settings = wizard(load_adapters([]), Inventory(), self.root)
+        self.assertTrue(menu.getvalue().startswith("  1. Configure a new job"))
+        self.assertIn("What Would You Like to Do?", menu.getvalue())
+        self.assertIn("[Job 1]", menu.getvalue())
+        self.assertIn("<Questions>\n[Job 2]\n", menu.getvalue())
+        self.assertEqual(menu.getvalue().count("Add Another Job? (Y/N) [Default: N]"), 2)
+        self.assertEqual(settings_jobs(settings), [{"schema": 1, **job} for job in jobs])
+
+    def test_wizard_deletes_only_confirmed_result_run_folders(self):
+        paths = {
+            name: self.root / relative for name, relative in {
+                "evaluation": "outputs/evaluation/completed",
+                "active": "outputs/evaluation/running",
+                "training": "outputs/training/completed",
+                "example": "outputs/example",
+                "dataset": "datasets/example",
+            }.items()
+        }
+        for path in paths.values():
+            (path / "executor").mkdir(parents=True)
+            (path / "executor/status.json").write_text('{"status": "completed"}', encoding="utf-8")
+        (paths["active"] / "executor/status.json").write_text('{"status": "running"}', encoding="utf-8")
+        marker = paths["evaluation"].parent / ".gitkeep"
+        marker.touch()
+        with patch("sys.stdin", io.StringIO("3\n\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            self.assertIsNone(wizard(load_adapters([]), Inventory(), self.root))
+        self.assertIn("Delete All Evaluation Results", menu.getvalue())
+        self.assertIn("Delete All Training Results", menu.getvalue())
+        self.assertIn("Deletion Canceled.", menu.getvalue())
+        self.assertTrue(paths["evaluation"].is_dir())
+        with patch("sys.stdin", io.StringIO("3\nY\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            self.assertIsNone(wizard(load_adapters([]), Inventory(), self.root))
+        self.assertIn("Deleted 1 of 1 Evaluation Run Folder.", menu.getvalue())
+        self.assertFalse(paths["evaluation"].exists())
+        self.assertTrue(all(paths[name].is_dir() for name in ("active", "training", "example", "dataset")))
+        self.assertTrue(marker.is_file())
+        with patch("sys.stdin", io.StringIO("Y\n")), contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(delete_result_runs(self.root, "training"))
+        self.assertFalse(paths["training"].exists())
+        self.assertTrue(paths["example"].is_dir())
+
     def test_combined_run_records_each_stage_in_its_result_folder(self):
         settings = sample_settings()
         adapter = NativeAdapter(settings, "job", self.root, self.external, self.envs)
@@ -392,7 +442,7 @@ class ManagerTests(unittest.TestCase):
     def test_inventory_lists_numbered_entries_and_item_counts(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             show(Inventory(), {"lerobot", "lerobot_tinyvla"})
-        self.assertIn("Conda Environments [2 found]\n  1. lerobot\n  2. lerobot_tinyvla", output.getvalue())
+        self.assertTrue(output.getvalue().startswith("Conda Environments [2 found]\n  1. lerobot\n  2. lerobot_tinyvla"))
         self.assertIn("\n\nTraining Datasets [0 found]", output.getvalue())
 
     def test_estimate_from_first_positive_measurement(self):
@@ -450,10 +500,16 @@ class ManagerTests(unittest.TestCase):
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             selected = choose_policy(load_adapters([]), ["xvla", "act"])
         self.assertEqual(selected, ("tinyvla", "tinyvla"))
-        self.assertIn("1. [LeRobot Native] act [Default]  [51.7 M]", menu.getvalue())
-        self.assertIn("2. [LeRobot Native] xvla  [879.7 M]", menu.getvalue())
-        self.assertIn("3. [LeRobot Native] Enter a model name manually", menu.getvalue())
-        self.assertIn("4. [External] TinyVLA  [740.4 M]", menu.getvalue())
+        rows = [line.strip() for line in menu.getvalue().splitlines() if "Native]" in line or "External]" in line]
+        self.assertTrue(rows[0].startswith("1. [LeRobot Native] act"))
+        self.assertTrue(rows[0].endswith("[51.7 M] [Default]"))
+        self.assertTrue(rows[1].endswith("[879.7 M]"))
+        self.assertIn("3. [LeRobot Native] Enter a model name manually", rows[2])
+        self.assertIn("TinyVLA   [740.4 M]", rows[3])
+        self.assertEqual(rows[0].index("act"), rows[3].index("TinyVLA"))
+        self.assertEqual(rows[0].index("[51.7 M]"), rows[1].index("[879.7 M]"))
+        self.assertEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
+        self.assertIn("Policy Model:", menu.getvalue())
 
     def test_model_size_uses_parameter_units_or_na(self):
         self.assertEqual(model_size("diffusion"), "[262.7 M]")
@@ -479,7 +535,7 @@ class ManagerTests(unittest.TestCase):
         cfg["episode_length"] = 0
         self.assertFalse(any(arg.startswith("--env.episode_length=") for arg in adapter.evaluate(False).arguments))
         self.assertIn("1. LIBERO [Default]", menu.getvalue())
-        self.assertIn("\nEvaluation benchmark: ", menu.getvalue())
+        self.assertIn("\nEvaluation Benchmark: ", menu.getvalue())
         self.assertIn("[Default: PushT-v0]", menu.getvalue())
 
 

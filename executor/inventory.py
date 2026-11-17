@@ -135,10 +135,12 @@ def show(inventory, environments, limit=None):
         ("Training and Evaluation Results", [str(path) for path in inventory.results]),
         ("Previous Job Settings", [str(path) for path in inventory.settings]),
     )
-    for name, items in groups:
+    for group_index, (name, items) in enumerate(groups):
+        if group_index:
+            print()
         heading = styled(name, "1;36")
         count = styled(f"[{len(items)} found]", "33")
-        print(f"\n{heading} {count}")
+        print(f"{heading} {count}")
         for index, item in enumerate(items[:limit], 1):
             print(f"  {index}. {item}")
         if limit is not None and len(items) > limit:
