@@ -3,6 +3,7 @@ from dataclasses import asdict
 import io
 import json
 import shlex
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -11,9 +12,11 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json, training_flags
 from inventory import Inventory, scan, show
-from manage import (ask, choose_policy, configure_training_scope, delete_result_runs, eval_settings,
+from manage import (BenchmarkEnvironments, ask, choose_evaluation_environment, choose_policy,
+                    choose, configure_policy_options, configure_training_scope, delete_result_runs, eval_settings,
                     install_benchmark_menu, main, model_size, normalize_paths, number, plan,
                     settings_jobs, show_job_result, show_settings, wizard)
+from questions import QuestionDisplay, QuestionHistory
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -515,19 +518,38 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.train()
 
+    def test_interactive_retry_erases_only_current_question_and_previous_error(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        stdin, terminal = Terminal(), Terminal()
+        with patch("sys.stdin", stdin), patch.dict("os.environ", {"TERM": "xterm"}), \
+             patch("builtins.input", side_effect=["kept", "8", "9", "1"]):
+            display = QuestionDisplay(terminal, lambda title: print(f"<{title}>"))
+            with contextlib.redirect_stdout(display):
+                def configure():
+                    return ask("Earlier", optional=True), choose("Job Type", [("train", "Start training")])
+
+                self.assertEqual(QuestionHistory(display).run(configure), ("kept", "train"))
+        output = terminal.getvalue()
+        self.assertEqual(output.count("Earlier"), 1)
+        self.assertIn("\x1b[4F\x1b[J", output)
+        self.assertIn("\x1b[5F\x1b[J", output)
+        self.assertNotIn("\x1b[6F\x1b[J", output)
+
     def test_accepts_zero_seed_default(self):
         with patch("builtins.input", return_value="") as prompt:
             self.assertEqual(number("seed", 0, 0), 0)
         prompt.assert_called_once_with("\nseed [Default: 0]: ")
 
     def test_tinyvla_evaluation_defaults_to_training_suite_and_task(self):
-        answers = io.StringIO("\n\n3\n2\n\n\n\n10\n\n\n")
+        answers = io.StringIO("\n3\n2\n\n\n\n10\n\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
-            cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory())
+            cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory(), "libero")
         self.assertEqual((cfg["env"], cfg["tasks"], cfg["task_ids"]), ("libero", ["libero_goal"], [7]))
         self.assertEqual(cfg["batch"], 2)
         self.assertIn("3. libero_goal [Default]", menu.getvalue())
-        self.assertIn("1. LIBERO (supported by TinyVLA) [Default]", menu.getvalue())
         self.assertNotIn("Select an option", menu.getvalue())
 
     def test_policy_menu_lists_native_models_before_external_models(self):
@@ -546,43 +568,76 @@ class ManagerTests(unittest.TestCase):
         self.assertNotEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
         self.assertIn("Policy Model:", menu.getvalue())
 
-    def test_benchmark_menu_installs_in_selected_environment_and_refreshes_catalog(self):
-        catalogs = {"lerobot": {"benchmarks": {"libero": True, "pusht": False}}}
+    def test_benchmark_installs_in_preferred_environment_and_refreshes_catalog(self):
+        environments = BenchmarkEnvironments("conda", self.root, "preferred", {"preferred"})
+        environments.catalogs = {"preferred": {"benchmarks": {"libero": True, "pusht": False}}}
         refreshed = {"benchmarks": {"libero": True, "pusht": True}}
-        with patch("sys.stdin", io.StringIO("\n\n\nY\n")), \
-             patch("manage.subprocess.run") as subprocess, \
+        with patch("sys.stdin", io.StringIO("2\n")), patch("manage.subprocess.run") as process, \
              patch("manage.environment_catalog", return_value=refreshed), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
-            subprocess.return_value.returncode = 0
-            message = install_benchmark_menu("conda", self.root, {"lerobot"}, "lerobot", catalogs)
-        command = subprocess.call_args.args[0]
-        self.assertEqual(command[:5], ["conda", "run", "--no-capture-output", "-n", "lerobot"])
+            process.return_value.returncode = 0
+            message = install_benchmark_menu(environments)
+        command = process.call_args.args[0]
+        self.assertEqual(command[:5], ["conda", "run", "--no-capture-output", "-n", "preferred"])
         self.assertEqual(command[-2:], ["--install", "pusht"])
         self.assertIn("PushT <Not Installed>", menu.getvalue())
-        self.assertEqual(message, "Installed pusht in lerobot.")
-        self.assertTrue(catalogs["lerobot"]["benchmarks"]["pusht"])
+        self.assertNotIn("[Default]", menu.getvalue())
+        self.assertEqual(message, "Installed pusht in preferred.")
+        self.assertTrue(environments.catalog("preferred")["benchmarks"]["pusht"])
 
-    def test_benchmark_can_be_installed_and_selected_in_a_cloned_environment(self):
-        environments = {"lerobot"}
-        catalogs = {"lerobot": {"benchmarks": {"pusht": False}}}
+    def test_benchmark_clones_automatically_on_dependency_conflict(self):
+        environments = BenchmarkEnvironments("conda", self.root, "preferred", {"preferred", "preferred_pusht"})
+        environments.catalogs = {"preferred": {"benchmarks": {"pusht": False}},
+                                 "preferred_pusht": {}}
         refreshed = {"benchmarks": {"pusht": True}}
-        with patch("sys.stdin", io.StringIO("\n\n2\n\nY\n")), \
-             patch("manage.subprocess.run") as subprocess, \
+        results = [subprocess.CompletedProcess([], code, stdout="") for code in (3, 0, 0)]
+        with patch("sys.stdin", io.StringIO("1\n")), \
+             patch("manage.subprocess.run", side_effect=results) as process, \
+             patch("manage.available_environments", return_value=set()), \
              patch("manage.environment_catalog", return_value=refreshed), \
              contextlib.redirect_stdout(io.StringIO()):
-            subprocess.return_value.returncode = 0
-            message = install_benchmark_menu("conda", self.root, environments, "lerobot", catalogs)
-        clone, install = [call.args[0] for call in subprocess.call_args_list]
-        self.assertEqual(clone, ["conda", "create", "--yes", "--name", "lerobot_pusht", "--clone", "lerobot"])
-        self.assertIn("lerobot_pusht", install)
-        self.assertEqual(install[-3:], ["--install", "pusht", "--isolated"])
-        self.assertIn("lerobot_pusht", environments)
-        self.assertEqual(message, "Installed pusht in lerobot_pusht.")
+            message = install_benchmark_menu(environments)
+        first, clone, retry = [call.args[0] for call in process.call_args_list]
+        self.assertIn("preferred", first)
+        self.assertEqual(clone, ["conda", "create", "--yes", "--name", "preferred_pusht_2", "--clone", "preferred"])
+        self.assertIn("preferred_pusht_2", retry)
+        self.assertEqual(retry[-3:], ["--install", "pusht", "--isolated"])
+        self.assertIn("preferred_pusht_2", environments.names)
+        self.assertEqual(message, "Installed pusht in preferred_pusht_2.")
         job = sample_settings()
-        job["eval"]["environment"] = "lerobot_pusht"
+        job["eval"]["environment"] = "preferred_pusht_2"
         adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
-        self.assertEqual(adapter.evaluate(after_training=True).environment, "lerobot_pusht")
+        self.assertEqual(adapter.evaluate(after_training=True).environment, "preferred_pusht_2")
         self.assertEqual(adapter.train().environment, "smolvla_env")
+
+    def test_benchmark_selection_uses_runtime_capabilities_instead_of_environment_names(self):
+        environments = BenchmarkEnvironments("conda", self.root, "preferred", {"sim_a", "sim_b", "inference"})
+        catalogs = {
+            "preferred": {"benchmarks": {"libero": True, "pusht": False}, "policies": {"act": True}},
+            "sim_a": {"benchmarks": {"pusht": True}, "policies": {"act": False}},
+            "sim_b": {"benchmarks": {"pusht": True}, "policies": {"act": True}},
+            "inference": {},
+        }
+        with patch("manage.environment_catalog", side_effect=lambda _, name, root: catalogs[name]) as probe, \
+             patch("sys.stdin", io.StringIO("2\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            self.assertEqual(choose_evaluation_environment(environments, "preferred", "act", False), ("pusht", "sim_b"))
+        self.assertIn("PushT [sim_b]", menu.getvalue())
+        self.assertEqual(probe.call_count, 4)
+        with patch("manage.subprocess.run") as process, patch("sys.stdin", io.StringIO("2\n")), \
+             contextlib.redirect_stdout(io.StringIO()) as menu:
+            self.assertEqual(install_benchmark_menu(environments), "pusht is already installed in sim_a.")
+        self.assertIn("PushT [sim_a, sim_b]", menu.getvalue())
+        self.assertNotIn("inference", menu.getvalue())
+        self.assertNotIn("[Default]", menu.getvalue())
+        process.assert_not_called()
+
+    def test_model_training_options_are_typed_and_preserve_unselected_defaults(self):
+        train = {}
+        options = {"optimizer_lr": {"default": 0.0001}, "scheduler_decay_steps": {"default": 30000}}
+        with patch("sys.stdin", io.StringIO("2\nwrong\n0.0003\n1\n")), contextlib.redirect_stdout(io.StringIO()):
+            configure_policy_options(train, options)
+        self.assertEqual(train, {"policy_options": {"optimizer_lr": 0.0003}})
+        self.assertEqual(training_flags(train, "act"), ["--policy.optimizer_lr=0.0003"])
 
     def test_training_scope_and_lora_map_to_native_flags(self):
         catalog = {"training": {"smolvla": ["freeze_vision_encoder"]},
@@ -617,9 +672,9 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(seconds(2 * 86400 + 3 * 3600 + 4 * 60 + 5), "2d 03:04:05")
 
     def test_native_evaluation_uses_selected_benchmark(self):
-        answers = io.StringIO("2\n\n1\n\n\n\nlerobot/act_pusht\n125\n\n")
+        answers = io.StringIO("\n1\n\n\n\nlerobot/act_pusht\n125\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
-            cfg = eval_settings("act", False, None, Inventory())
+            cfg = eval_settings("act", False, None, Inventory(), "pusht")
         self.assertEqual((cfg["env"], cfg["tasks"]), ("pusht", ["PushT-v0"]))
         self.assertEqual(cfg["episode_length"], 125)
         job = {"adapter": "native", "model": "act", "eval": cfg}
@@ -627,8 +682,6 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("--env.episode_length=125", adapter.evaluate(False).arguments)
         cfg["episode_length"] = 0
         self.assertFalse(any(arg.startswith("--env.episode_length=") for arg in adapter.evaluate(False).arguments))
-        self.assertIn("1. LIBERO [Default]", menu.getvalue())
-        self.assertIn("\nEvaluation Benchmark: ", menu.getvalue())
         self.assertIn("[Default: PushT-v0]", menu.getvalue())
 
 

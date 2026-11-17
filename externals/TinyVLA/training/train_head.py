@@ -1,4 +1,4 @@
-"""Train the existing TinyVLA action head on exported demonstrations."""
+"""Train the TinyVLA action head with optional language-attention LoRA."""
 import argparse
 import ast
 from collections import defaultdict
@@ -17,6 +17,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from lerobot_data import action_chunk
+
+
+ACTION_HEAD_PREFIXES = ("embed_out.", "proj_to_action.")
+LEGACY_HEAD_TRAINER_SHA256 = "ec4f75af28105e09a704d113b2ac06c6f694925972a9efd0aac66cd4d3b57d04"
 
 
 def loader_program(source):
@@ -174,8 +178,16 @@ def train(args, manifest, episodes, read_batch):
         "batch_size": args.batch_size, "lr": args.lr, "seed": args.seed,
         "steps": steps, "updates_per_task": args.updates_per_task,
     }
-    if resumed and resumed["metadata"] != metadata:
-        raise ValueError("Resume requires the same dataset, model snapshot, trainer, and training configuration.")
+    if args.lora_rank < 0 or args.lora_alpha < 1 or not 0 <= args.lora_dropout < 1:
+        raise ValueError("Use a nonnegative LoRA rank, positive alpha, and dropout in [0, 1).")
+    if args.lora_rank:
+        metadata["lora"] = {"rank": args.lora_rank, "alpha": args.lora_alpha, "dropout": args.lora_dropout}
+    if resumed:
+        saved_metadata = dict(resumed["metadata"])
+        if not args.lora_rank and saved_metadata.get("trainer_sha256") == LEGACY_HEAD_TRAINER_SHA256:
+            saved_metadata["trainer_sha256"] = metadata["trainer_sha256"]
+        if saved_metadata != metadata:
+            raise ValueError("Resume requires the same dataset, model snapshot, trainer, and training configuration.")
     scope = {"__name__": "tinyvla_training_loader", "__file__": str(source_path)}
     exec(compile(loader_program(source), str(source_path), "exec"), scope)
     scope["arguments"] = lambda: SimpleNamespace(
@@ -190,22 +202,43 @@ def train(args, manifest, episodes, read_batch):
         raise RuntimeError("Expected float32 diffusion coefficients.")
     model.requires_grad_(False)
     model.eval()
+    adapter = None
+    targets = []
+    if args.lora_rank:
+        from peft import LoraConfig, get_peft_model
+
+        targets = [name for name, module in model.named_modules()
+                   if isinstance(module, torch.nn.Linear) and name.startswith("gpt_neox.layers.")
+                   and name.endswith(".attention.query_key_value")]
+        if not targets:
+            raise ValueError("Language-attention LoRA requires the TinyVLA GPT-NeoX backbone.")
+        adapter = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha,
+                                                 lora_dropout=args.lora_dropout, target_modules=targets))
+        model.eval()
+        for name in targets:
+            layer = model.get_submodule(name)
+            layer.lora_A.float().train()
+            layer.lora_B.float().train()
+            layer.lora_dropout.train()
     for name in ("embed_out", "proj_to_action"):
         module = getattr(model, name)
         module.float().requires_grad_(True)
         module.train()
     named = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
-    if not named or any(not name.startswith(("embed_out.", "proj_to_action.")) for name, _ in named):
-        raise RuntimeError("Only action-head parameters may be trained.")
+    head = [(name, parameter) for name, parameter in named if name.startswith(ACTION_HEAD_PREFIXES)]
+    allowed = ACTION_HEAD_PREFIXES + tuple(f"{target}.lora_{part}." for target in targets for part in ("A", "B"))
+    if not head or any(not name.startswith(allowed) for name, _ in named):
+        raise RuntimeError("Unexpected trainable parameters outside the action head and selected language adapters.")
     if checkpoint_source or resumed:
         saved_head = resumed["head"] if resumed else load_file(str(checkpoint_source / "action_head.safetensors"))
-        if set(saved_head) != {name for name, _ in named}:
-            raise ValueError("The saved action head does not match the trainable parameters.")
+        expected = named if resumed else head
+        if set(saved_head) != {name for name, _ in expected}:
+            raise ValueError("The saved tensors do not match the configured training scope.")
         with torch.no_grad():
-            for name, parameter in named:
+            for name, parameter in expected:
                 tensor = saved_head[name]
                 if tensor.shape != parameter.shape or not torch.isfinite(tensor).all():
-                    raise ValueError(f"Invalid saved action-head tensor: {name}")
+                    raise ValueError(f"Invalid saved training tensor: {name}")
                 parameter.copy_(tensor)
         if not resumed:
             print(f"Continuing from {checkpoint_source} with a new optimizer.", flush=True)
@@ -328,24 +361,33 @@ def train(args, manifest, episodes, read_batch):
     if args.updates_per_task is not None and set(task_steps.values()) != {args.updates_per_task}:
         raise RuntimeError("Unexpected number of completed updates per task.")
     changed = [name for name, p in named if not torch.equal(initial[name], p.detach().flatten()[:32].float().cpu())]
-    if not changed or not all(bool(torch.isfinite(p).all()) for p in params):
-        raise RuntimeError("Expected finite and changed head weights before saving.")
+    if not any(name.startswith(ACTION_HEAD_PREFIXES) for name in changed) or not all(
+        bool(torch.isfinite(p).all()) for p in params
+    ):
+        raise RuntimeError("Expected finite and changed action-head weights before saving.")
+    if adapter is not None and not any(".lora_" in name for name in changed):
+        raise RuntimeError("Expected updated language adapter weights before saving.")
     final_checkpoint = output / "pretrained_model"
     checkpoint = output / ".pretrained_model.tmp"
     checkpoint.mkdir()
     # Keep a small recoverable head checkpoint even if full-model serialization fails.
-    save_file({name: p.detach().cpu().contiguous() for name, p in named}, str(checkpoint / "action_head.safetensors"))
+    save_file({name: p.detach().cpu().contiguous() for name, p in head}, str(checkpoint / "action_head.safetensors"))
+    if adapter is not None:
+        with torch.no_grad():
+            model = adapter.merge_and_unload()
     model.save_pretrained(checkpoint, safe_serialization=True, max_shard_size="10GB")
     tokenizer.save_pretrained(checkpoint)
     ctx["processor"].save_pretrained(checkpoint)
     with safe_open(str(checkpoint / "model.safetensors"), framework="pt", device="cpu") as saved:
-        for name, param in named:
+        for name, param in head:
             if not torch.equal(saved.get_tensor(name), param.detach().cpu()):
                 raise RuntimeError(f"Saved action-head tensor differs: {name}")
     checkpoint.rename(final_checkpoint)
     repo = workspace / "sources/TinyVLA"
     report = {
         "status": "TINYVLA_HEAD_TRAINING_SAVED", "steps": steps,
+        "training_scope": "head_and_language_lora" if adapter is not None else "action_head",
+        "lora": metadata.get("lora"),
         "batch_size": args.batch_size, "processed_samples": steps * args.batch_size,
         "unique_sample_starts": len(used), "learning_rate": args.lr, "seed": args.seed,
         "training_steps_by_instruction": task_steps,
@@ -383,5 +425,8 @@ if __name__ == "__main__":
     parser.add_argument("--save-freq", type=int, default=100)
     parser.add_argument("--keep-intermediate-checkpoints", action="store_true",
                         help="Keep a step-numbered copy of each saved state before the final step.")
+    parser.add_argument("--lora-rank", type=int, default=0, help="0 trains the action head only.")
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     run(parser.parse_args())

@@ -63,6 +63,10 @@ Preparation fetches the pinned public base weights and the files needed for one 
 
 For interactive setup, run `manage.py` and choose **Configure a new job**. Select a model from the combined list and choose the evaluation benchmark or LIBERO suite as prompted. Press Enter to use the displayed default. To run a prepared queue, choose **Import a job queue script** or use `--queue`. The [example](scripts/example_script.py) explains the fields inline.
 
+**Install a benchmark** lists environments with a matching installation extra in the detected LeRobot versions. Interactive evaluation reuses a Conda environment containing both the policy runtime and benchmark. When the benchmark is missing, convLexecutor tries the preferred compatible environment while keeping its installed dependencies pinned. A dependency resolution conflict triggers a separate benchmark environment. Additional registered environments marked **Manual Setup** have their own simulator setup. Installed LeRobot environment plugins are also discoverable.
+
+The policy list uses dim text for missing runtime dependencies or local checkpoints. Weight availability is checked by policy type. Choose a checkpoint trained for the selected benchmark. Native training shows supported scope, LoRA (Low-Rank Adaptation), and training options from the selected LeRobot version. TinyVLA can train the action head or combine it with language-attention LoRA. Omitting the LoRA settings selects action-head training. Exact resume restores the prior settings and optimizer state.
+
 Each result has an `executor/` subdirectory with its executed `run.py`, reusable `script.py`, job status, and the stage console log. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
 
 See the [executor guide](executor/README.md), [TinyVLA guide](externals/TinyVLA/README.md), and [agent setup guide](AGENTS.md) for more details.

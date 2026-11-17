@@ -26,6 +26,18 @@ TRAINING_SWITCHES = {
     "tune_vlln": "Train Vision-Language Normalization",
 }
 PEFT_POLICIES = frozenset({"smolvla", "pi0", "pi05", "lingbot_vla_v2", "flux3"})
+SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {"train_mode_vlm", "lora_rank", "lora_alpha", "lora_dropout"}
+
+
+def is_policy_training_option(name):
+    if name in SCOPE_OPTIONS or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+        return False
+    return name.startswith(("optimizer_", "scheduler_", "loss_", "freeze_", "tune_", "train_", "ema_")) or (
+        name.endswith(("_dropout", "_loss_weight")) or name in {
+            "dropout", "kl_weight", "use_ema", "gradient_checkpointing",
+            "use_gradient_checkpointing", "weight_decay", "max_grad_norm",
+        }
+    )
 
 
 @dataclass
@@ -95,9 +107,10 @@ def weights(path):
 def training_flags(config, model):
     scope = config.get("policy_training", {})
     lora = config.get("lora")
-    if not isinstance(scope, dict):
-        raise ValueError("policy_training must be a dictionary.")
-    if config.get("resume") and (scope or lora is not None):
+    options = config.get("policy_options", {})
+    if not isinstance(scope, dict) or not isinstance(options, dict):
+        raise ValueError("policy_training and policy_options must be dictionaries.")
+    if config.get("resume") and (scope or options or lora is not None):
         raise ValueError("Resumed jobs use the checkpoint's saved training settings.")
 
     args = []
@@ -109,6 +122,13 @@ def training_flags(config, model):
             valid = valid or name == "lora_dropout" and type(value) in (float, int) and 0 <= value <= 1
         if not valid:
             raise ValueError(f"Invalid policy training option ({name}).")
+        args.append(flag(f"policy.{name}", value))
+
+    for name, value in options.items():
+        if (not isinstance(name, str) or not is_policy_training_option(name)
+                or type(value) not in (bool, int, float, str)
+                or type(value) is float and not math.isfinite(value)):
+            raise ValueError(f"Invalid policy option ({name}).")
         args.append(flag(f"policy.{name}", value))
 
     if lora is None:
@@ -275,8 +295,16 @@ class TinyVLAAdapter(NativeAdapter):
     def train(self):
         cfg = self.settings["train"]
         output = self.train_dir / "train"
-        if cfg.get("policy_training") or cfg.get("lora") is not None:
-            raise ValueError("The TinyVLA trainer supports action-head training.")
+        if cfg.get("policy_training") or cfg.get("policy_options"):
+            raise ValueError("TinyVLA supports action-head training with optional language-attention LoRA.")
+        lora = cfg.get("lora")
+        if lora is not None:
+            if not isinstance(lora, dict) or set(lora) - {"rank", "alpha", "dropout"}:
+                raise ValueError("TinyVLA LoRA accepts rank, alpha, and dropout.")
+            rank, alpha, dropout = lora.get("rank", 16), lora.get("alpha", 16), lora.get("dropout", 0.0)
+            if (type(rank) is not int or rank < 1 or type(alpha) is not int or alpha < 1
+                    or type(dropout) not in (int, float) or not 0 <= dropout < 1):
+                raise ValueError("Use positive TinyVLA LoRA rank and alpha, and dropout in [0, 1).")
         workspace = self.external
         require(workspace / "runtime/tinyvla_loader.py")
         loader = workspace / "runtime/tinyvla_loader.py"
@@ -311,6 +339,8 @@ class TinyVLAAdapter(NativeAdapter):
                 "--updates-per-task", str(cfg["updates"]), "--save-freq", str(cfg["save_freq"]), *origin]
         if task:
             args.extend(("--libero-task", task[0], str(task[1])))
+        if lora is not None:
+            args.extend(("--lora-rank", str(rank), "--lora-alpha", str(alpha), "--lora-dropout", str(dropout)))
         return Stage("train", self.infer_env, args, (output / "training_result.json",
                      output / "pretrained_model/action_head.safetensors", output / "pretrained_model/model.safetensors",
                      output / "checkpoints/training_state.pt"), cfg["updates"] * (1 if task else 40),

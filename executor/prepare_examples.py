@@ -116,7 +116,10 @@ files = sorted([*model.glob("*.safetensors"), *model.glob("*.json")])
 expected_files = [[p.name, p.stat().st_size, p.stat().st_mtime_ns] for p in files]
 valid = (checkpoint["step"] == 2 and checkpoint["optimizer"]["state"] and
          metadata["model_source"] == str(model) and metadata["model_files"] == expected_files and
-         metadata["trainer_sha256"] == hashlib.sha256(trainer.read_bytes()).hexdigest() and
+         "lora" not in metadata and metadata["trainer_sha256"] in (
+             hashlib.sha256(trainer.read_bytes()).hexdigest(),
+             "ec4f75af28105e09a704d113b2ac06c6f694925972a9efd0aac66cd4d3b57d04",
+         ) and
          metadata["loader_sha256"] == hashlib.sha256(loader.read_text(encoding="utf-8").encode()).hexdigest() and
          metadata["updates_per_task"] == 4)
 if not valid:

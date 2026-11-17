@@ -6,6 +6,10 @@
 # shown in the inventory. Set eval.device to "cuda" or "cpu". Match the
 # checkpoint's environment, camera size, and control mode.
 # parallel_tasks and action_steps below are TinyVLA evaluation options.
+# Optional TinyVLA training setting: "lora": {"rank": 16, "alpha": 16, "dropout": 0.0}.
+# This adds language-attention LoRA to the action head. Exact resume keeps the original settings.
+# Native train settings can include policy_options (for example, {"optimizer_lr": 0.0001}).
+# Queue evaluations can set eval.environment to select a specific compatible Conda environment.
 # A job can contain train, eval, or both. With both present, evaluation uses
 # the checkpoint produced by that job's training stage.
 # The dataset and checkpoints below are example assets under the convLexecutor root.

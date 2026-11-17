@@ -24,6 +24,8 @@ class QuestionDisplay:
         self.rows = 0
         self.column = 0
         self.boundary = 0
+        self.prompt_start = 0
+        self.retrying = False
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
@@ -54,6 +56,9 @@ class QuestionDisplay:
     def read(self, prompt):
         if not self.terminal:
             return input(prompt)
+        if not self.retrying:
+            self.prompt_start = self.rows
+        self.retrying = False
         print(prompt, end="", flush=True)
         value = input()
         self._record(value + "\n")
@@ -72,7 +77,13 @@ class QuestionDisplay:
         self.rows = start
         self.column = 0
 
+    def reject(self, message):
+        self.clear(start=self.prompt_start)
+        print(message, flush=True)
+        self.retrying = True
+
     def show(self, job_number=None):
+        self.retrying = False
         self.clear()
         self.section("Questions")
         if job_number is not None:
@@ -117,7 +128,11 @@ class QuestionHistory:
         return mark
 
 
-def retry_question():
+def retry_question(message, *, accepted=True):
     history = active_history.get()
-    if history is not None:
+    if accepted and history is not None:
         history.rewind()
+    if isinstance(sys.stdout, QuestionDisplay) and sys.stdout.terminal:
+        sys.stdout.reject(message)
+    else:
+        print(message)

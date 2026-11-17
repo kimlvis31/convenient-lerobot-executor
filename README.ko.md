@@ -49,6 +49,10 @@ python -B ~/convLexecutor/executor/manage.py \
 
 직접 설정하려면 `manage.py`를 실행하고 **Configure a new job**을 선택합니다. 한 목록에서 모델을 고르고 평가 벤치마크나 LIBERO(Lifelong Learning Benchmark on Robot Manipulation, 로봇 조작 평생학습 벤치마크) 스위트를 선택합니다. Enter를 누르면 표시된 기본값이 적용됩니다. 준비된 작업 큐를 실행하려면 **Import a job queue script**를 선택합니다. [예제 설정](scripts/example_script.py)
 
+**Install a benchmark**에서 현재 설치된 LeRobot 버전이 자동 설치를 지원하는 벤치마크와 설치된 환경을 확인할 수 있습니다. 대화형 평가는 모델 실행에 필요한 패키지와 벤치마크가 같이 설치된 Conda 환경을 재사용합니다. 벤치마크가 없으면 기존 패키지 버전을 유지한 채 설치를 시도하고, 의존성 충돌이 나면 별도 환경을 만듭니다. **Manual Setup**으로 표시된 벤치마크는 각 시뮬레이터의 설치 안내를 따릅니다. 설치된 LeRobot 환경 플러그인도 목록에서 조회합니다.
+
+모델 실행에 필요한 패키지나 로컬 체크포인트가 없으면 목록에 흐리게 표시됩니다. 평가에는 선택한 벤치마크에 맞는 체크포인트를 사용합니다. LeRobot 모델은 현재 버전의 정책 설정이 지원하는 학습 범위와 LoRA(Low-Rank Adaptation, 저랭크 적응), 학습 옵션을 보여줍니다. TinyVLA는 행동 헤드만 학습하거나 행동 헤드와 언어 어텐션에 LoRA(Low-Rank Adaptation, 저랭크 적응)를 함께 적용할 수 있습니다. 정확한 재개는 기존 설정과 옵티마이저 상태를 복원합니다.
+
 각 작업의 실제 실행 파일 `run.py`, 다시 가져올 수 있는 `script.py`, 시작·종료·소요 시간과 단계별 콘솔 로그는 각 결과 폴더의 `executor/`에 기록합니다. 평가 결과는 `outputs/evaluation/`, 학습 결과는 `outputs/training/`에 저장합니다. Git으로 관리하는 파일은 소스, 설정과 출처 목록입니다. 데이터, 가중치, 실행 로그와 결과는 로컬에서 생성합니다.
 
 설치 작업을 에이전트에게 맡길 때는 [AGENTS.md](AGENTS.md)를 사용하세요.

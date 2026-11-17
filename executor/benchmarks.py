@@ -8,8 +8,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from typing import Literal, get_args, get_origin, get_type_hints
 
-from adapters import PEFT_POLICIES, TRAINING_SWITCHES
+from adapters import PEFT_POLICIES, TRAINING_SWITCHES, is_policy_training_option
 
 
 BENCHMARKS = (
@@ -18,6 +19,10 @@ BENCHMARKS = (
     ("aloha", "ALOHA"),
     ("metaworld", "Meta-World"),
 )
+BENCHMARK_DEPENDENCY_CONFLICT = 3
+BENCHMARK_MODULES = {
+    "libero": "libero", "pusht": "gym_pusht", "aloha": "gym_aloha", "metaworld": "metaworld",
+}
 POLICY_EXTRAS = {"pi0": "pi", "pi05": "pi", "pi0_fast": "pi", "wall_x": "wallx"}
 
 
@@ -70,33 +75,80 @@ def installed(requirement, versions):
     return version is not None and requirement.specifier.contains(version, prereleases=True)
 
 
-def benchmark_extras(distribution):
-    return set(distribution.metadata.get_all("Provides-Extra") or ()) & {name for name, _ in BENCHMARKS}
+def benchmark_extras(distribution, env_types):
+    from packaging.utils import canonicalize_name
+
+    extras = {canonicalize_name(name) for name in distribution.metadata.get_all("Provides-Extra") or ()}
+    return {name: canonicalize_name(name) for name in env_types if canonicalize_name(name) in extras}
+
+
+def local_benchmark_ready(name, requirements, versions):
+    module = BENCHMARK_MODULES.get(name)
+    return all(installed(req, versions) for req in requirements) and (
+        module is None or util.find_spec(module) is not None
+    )
 
 
 def supported_here(name):
     return name != "libero" or sys.platform == "linux"
 
 
+def policy_training_options(config):
+    if not is_dataclass(config):
+        return {}
+    try:
+        hints = get_type_hints(config)
+    except (NameError, TypeError):
+        hints = {}
+    result = {}
+    for item in fields(config):
+        if not is_policy_training_option(item.name):
+            continue
+        hint = hints.get(item.name, item.type)
+        default = item.default
+        if get_origin(hint) is Literal and type(default) in (bool, int, float, str):
+            values = [value for value in get_args(hint) if type(value) is type(default)]
+            if values:
+                result[item.name] = {"default": default, "choices": values}
+        elif type(default) in (bool, int, float) or type(default) is str and hint in (str, "str"):
+            result[item.name] = {"default": default}
+    return result
+
+
 def environment_catalog():
     from packaging.utils import canonicalize_name
 
+    distribution = metadata.distribution("lerobot")
     from lerobot.configs import PreTrainedConfig
     from lerobot.envs.configs import EnvConfig
+    from lerobot.policies.factory import get_policy_class
     import lerobot.policies
     from lerobot.utils.import_utils import register_third_party_plugins
 
     register_third_party_plugins()
-    distribution = metadata.distribution("lerobot")
     extras = set(distribution.metadata.get_all("Provides-Extra") or ())
     versions = installed_versions()
-    policies, trainable = {}, {}
+    policies, trainable, options, issues = {}, {}, {}, {}
     for name, config in PreTrainedConfig.get_known_choices().items():
         if config.__module__.startswith("lerobot.policies."):
             extra = POLICY_EXTRAS.get(name, canonicalize_name(name))
-            policies[name] = extra not in extras or all(
-                installed(req, versions) for req in optional_requirements(distribution, extra)
-            )
+            missing = sorted({req.name for req in optional_requirements(distribution, extra)
+                              if not installed(req, versions)}) if extra in extras else []
+            if name == "flux3" and "natten" not in versions:
+                missing.append("natten")
+            if missing:
+                issues[name] = f"Missing: {', '.join(missing)}"
+            else:
+                try:
+                    get_policy_class(name)
+                except ModuleNotFoundError as error:
+                    issues[name] = f"Missing: {error.name}" if error.name else "Runtime Import Failed"
+                except Exception:
+                    issues[name] = "Runtime Import Failed"
+            policies[name] = name not in issues
+            editable = policy_training_options(config)
+            if editable:
+                options[name] = editable
             if is_dataclass(config):
                 names = {item.name for item in fields(config)}
                 switches = [key for key in TRAINING_SWITCHES if key in names]
@@ -105,16 +157,20 @@ def environment_catalog():
                 if switches:
                     trainable[name] = switches
 
-    benchmarks = {name: supported_here(name) and all(
-        installed(req, versions) for req in optional_requirements(distribution, name)
-    ) for name in benchmark_extras(distribution)}
+    env_types = EnvConfig.get_known_choices()
+    installable = benchmark_extras(distribution, env_types)
+    benchmarks = {name: local_benchmark_ready(name, optional_requirements(distribution, extra), versions)
+                  for name, extra in installable.items() if supported_here(name)}
     # LeRobot imports installed third-party environment modules before parsing --env.type.
-    plugins = sorted(name for name, config in EnvConfig.get_known_choices().items()
-                     if config.__module__.startswith("lerobot_env_"))
-    return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins,
+    plugins = sorted(name for name, config in env_types.items() if config.__module__.startswith("lerobot_env_"))
+    manual = sorted(name for name, config in env_types.items()
+                    if config.__module__.startswith("lerobot.envs.") and name not in installable
+                    and name != "gym_manipulator")
+    return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
             "peft_ready": "peft" in versions,
-            "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable}
+            "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable,
+            "policy_issues": issues, "training_options": options}
 
 
 def install_benchmark(name, *, plugin=False, isolated=False):
@@ -129,11 +185,14 @@ def install_benchmark(name, *, plugin=False, isolated=False):
             raise ValueError("Use a LeRobot environment plugin package named lerobot-env-*.")
         requirements = [requirement]
     else:
-        if name not in benchmark_extras(distribution):
+        from lerobot.envs.configs import EnvConfig
+
+        extra = benchmark_extras(distribution, EnvConfig.get_known_choices()).get(name)
+        if extra is None:
             raise ValueError(f"LeRobot {distribution.version} does not provide the {name} benchmark extra.")
         if not supported_here(name):
             raise ValueError("LIBERO requires Linux.")
-        requirements = optional_requirements(distribution, name)
+        requirements = optional_requirements(distribution, extra)
     needed = [str(req) for req in requirements if not installed(req, versions)]
     if not needed:
         print("Benchmark requirements are already installed.")
@@ -144,9 +203,16 @@ def install_benchmark(name, *, plugin=False, isolated=False):
         core = {"lerobot", "numpy", "torch", "torchvision", "torchcodec", "transformers"}
         pins = ((name, version) for name, version in sorted(versions.items()) if not isolated or name in core)
         constraints.write_text("".join(f"{name}=={version}\n" for name, version in pins), encoding="utf-8")
-        subprocess.run([sys.executable, "-m", "pip", "install", "--no-input", "--no-user",
-                        "--disable-pip-version-check", "--progress-bar", "off",
-                        "--constraint", str(constraints), *needed], check=True)
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-input", "--no-user",
+             "--disable-pip-version-check", "--progress-bar", "off", "--constraint", str(constraints), *needed],
+            text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode:
+            return BENCHMARK_DEPENDENCY_CONFLICT if "ResolutionImpossible" in result.stdout else 1
+    return 0
 
 
 def main():
@@ -161,7 +227,7 @@ def main():
         if args.catalog:
             print("MANAGER_CATALOG " + json.dumps(environment_catalog()))
         else:
-            install_benchmark(args.plugin or args.install, plugin=args.plugin is not None, isolated=args.isolated)
+            return install_benchmark(args.plugin or args.install, plugin=args.plugin is not None, isolated=args.isolated) or 0
     except (ImportError, ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"Benchmark setup failed ({error}).", file=sys.stderr)
         return 1
