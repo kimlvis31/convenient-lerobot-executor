@@ -13,7 +13,7 @@ import sys
 from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
-from inventory import scan, show
+from inventory import model_location, scan, show
 from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, styled
 
 
@@ -24,7 +24,8 @@ SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
 def section(title):
-    print("\n" + styled(title, "1;36"))
+    print("\n" + styled("-" * 60, "36"))
+    print(styled(title, "1;36"))
 
 
 def ask(question, default=None, optional=False, *, show_default=True):
@@ -104,7 +105,7 @@ def choose_dataset(inventory, default=None, optional=False):
 
 
 def choose_model(inventory, model, optional=False):
-    options = [(p, str(p)) for p, kind in inventory.models if kind == model]
+    options = [(p, model_location(inventory, p)) for p, kind in inventory.models if kind == model]
     if optional:
         options.insert(0, ("", "Use the base model" if model == "tinyvla" else "Initialize a new model"))
     return select_path("Model path or repository name" if model != "tinyvla" else "Model directory", options,
@@ -183,7 +184,8 @@ def choose_policy(adapters, policies):
 def native_train(resume, inventory, model):
     if resume:
         models = {path: kind for path, kind in inventory.models}
-        options = [(path, str(path)) for path in inventory.native_resume if models.get(path, model) == model]
+        options = [(path, model_location(inventory, path)) for path in inventory.native_resume
+                   if models.get(path, model) == model]
         path = select_path("Existing run or checkpoint directory", options)
         checkpoint = native_checkpoint(Path(path))
         config = read_json(checkpoint / "train_config.json")
@@ -229,8 +231,7 @@ def evaluation_suites(train, tiny):
 
 def eval_settings(model, tiny, train, inventory):
     if tiny:
-        env_type = "libero"
-        print("\nEvaluation benchmark · LIBERO")
+        env_type = choose("Evaluation benchmark", [("libero", "LIBERO (supported by TinyVLA)")])
     else:
         env_type = choose("Evaluation benchmark", [
             ("libero", "LIBERO"),
@@ -250,7 +251,7 @@ def eval_settings(model, tiny, train, inventory):
                  if task.strip()]
 
     cfg = {"env": env_type, "tasks": tasks,
-           "episodes": number("Episodes per task", 5), "batch": 1 if tiny else number("Evaluation batch size", 1),
+           "episodes": number("Episodes per task", 5), "batch": number("Evaluation batch size", 1),
            "seed": number("Random seed", 0, 0), "device": "cpu" if tiny else ask("Evaluation device", "cuda")}
     if train is None:
         cfg["policy"] = choose_model(inventory, model, optional=tiny)
@@ -318,7 +319,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
     operation = choose("Job type", choices)
     cfg = {"schema": 1, "adapter": backend, "model": model}
     if operation != "eval":
-        section("Training setup")
+        print("\n" + styled("Training setup", "1;36"))
         if tiny:
             print("\nTraining benchmark · LIBERO")
             cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
@@ -328,7 +329,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
         operation in ("resume", "warm") and ask("Evaluate after training? (y/N)", "n").lower() == "y"
     )
     if evaluate:
-        section("Evaluation setup")
+        print("\n" + styled("Evaluation setup", "1;36"))
         cfg["eval"] = eval_settings(cfg["model"], tiny, cfg.get("train"), inventory)
     return cfg
 
@@ -439,11 +440,13 @@ def plan(args):
         _, external = paths_for(args, settings or {})
         detected[PROJECT_ROOT] = available_environments(conda, PROJECT_ROOT)
         inventory = scan(PROJECT_ROOT, external, LOG_ROOT)
+        section("Status")
         show(inventory, detected[PROJECT_ROOT], limit=None if args.inventory else 5)
         if args.inventory:
             return [], conda
         env_map = read_json(args.env_map) if args.env_map else {}
         native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
+        section("Questions")
         settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env)
         if settings is None:
             return [], conda
@@ -483,25 +486,35 @@ def main():
         plans, conda = plan(args)
         if not plans:
             return 0
+        section("Settings")
         if not (args.settings or args.queue) or args.dry_run:
-            section("Execution plan")
             for index, (cfg, stages, _, _) in enumerate(plans, 1):
                 if len(plans) > 1:
                     print(f"Job {index}/{len(plans)} · {cfg.get('label') or cfg['model']}")
                 for stage in stages:
                     print(f"{stage.name} [{stage.environment}] {shlex.join(stage.arguments)}")
+        else:
+            for cfg, stages, _, _ in plans:
+                print(f"{cfg.get('label') or cfg['model']} · " + ", ".join(
+                    f"{stage.name} [{stage.environment}]" for stage in stages))
         if args.dry_run:
             return 0
         if not (args.settings or args.queue) and ask(f"Run {len(plans)} job(s)? (y/N)", "n").lower() != "y":
+            section("Finish")
             print("Run canceled.")
             return 0
+        section("Progress")
         run_plans(plans, conda or conda_executable(args.conda), args.verbose)
+        section("Finish")
+        print(styled(f"Completed {len(plans)} {'job' if len(plans) == 1 else 'jobs'}.", "32"))
         return 0
     except (KeyboardInterrupt, EOFError):
+        section("Finish")
         print("Run interrupted.", file=sys.stderr)
         return 130
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.TimeoutExpired) as error:
+        section("Finish")
         print(f"Run failed ({error})", file=sys.stderr)
         return 1
 

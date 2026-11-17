@@ -100,7 +100,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(status["status"], "completed")
         self.assertTrue(status["ended_at"] >= status["started_at"])
         self.assertGreater(status["seconds"], 0)
-        self.assertIn("[Status] Completion: 100.000 % | 2/2 Episodes |  ETA: 00:00:00", text.getvalue())
+        self.assertRegex(text.getvalue(), r"100\.000 % \| 2/2 Episodes \| Avg/episode: \d+\.\d{2} s \| ETA: 00:00:00")
         script = run / "run.py"
         self.assertEqual(load_settings(script), settings)
         self.assertIn("smolvla_env", script.read_text(encoding="utf-8"))
@@ -285,7 +285,25 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(progress.update(bar.format(2), 7))
         self.assertEqual(progress.count, 6)
         self.assertEqual(progress.fraction(), 0.99)
+        self.assertAlmostEqual(progress.average(), 7 / 6)
+        self.assertEqual(status_line(99, 6, 6, "eval", None, progress.average()),
+                         "[Status] Completion: 99.000 % | 6/6 Episodes | Avg/episode: 1.17 s | ETA: N/A")
         self.assertIsNone(progress.eta())
+
+    def test_inventory_lists_complete_hugging_face_snapshots_without_assuming_resume_state(self):
+        hub = self.root / "hub"
+        repo = hub / "models--lerobot--smolvla-test/snapshots"
+        snapshot = repo / "abc12345"
+        incomplete = repo / "def67890"
+        for path in (snapshot, incomplete):
+            path.mkdir(parents=True)
+            (path / "config.json").write_text('{"type": "smolvla"}', encoding="utf-8")
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+        with patch.dict("os.environ", {"HF_HUB_CACHE": str(hub)}):
+            inventory = scan(self.root, self.external, self.logs)
+        self.assertEqual(inventory.models, [(snapshot, "smolvla")])
+        self.assertFalse(inventory.native_resume)
+        self.assertEqual(inventory.cached_models[snapshot], "lerobot/smolvla-test @ abc12345")
 
     def test_inventory_lists_numbered_entries_and_item_counts(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -299,9 +317,9 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(progress.update("step:2/8", 14))
         self.assertEqual(progress.eta(), 12)
         self.assertEqual(status_line(25, 2, 8, "train", progress.eta()),
-                         "[Status] Completion: 25.000 % | 2/8 Steps |  ETA: 00:00:12")
+                         "[Status] Completion: 25.000 % | 2/8 Steps | ETA: 00:00:12")
         self.assertEqual(status_line(0, 0, None, "eval", None),
-                         "[Status] Completion: 0.000 % | 0/N/A Episodes |  ETA: N/A")
+                         "[Status] Completion: 0.000 % | 0/N/A Episodes | Avg/episode: N/A | ETA: N/A")
 
     def test_reuses_a_legacy_evaluation_timing_with_a_different_checkpoint_path(self):
         settings = {"adapter": "tinyvla", "model": "tinyvla"}
@@ -334,11 +352,13 @@ class ManagerTests(unittest.TestCase):
         prompt.assert_called_once_with("\nseed [Default: 0]: ")
 
     def test_tinyvla_evaluation_defaults_to_training_suite_and_task(self):
-        answers = io.StringIO("\n1\n\n\n10\n\n\n")
+        answers = io.StringIO("\n\n3\n2\n\n\n10\n\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory())
         self.assertEqual((cfg["env"], cfg["tasks"], cfg["task_ids"]), ("libero", ["libero_goal"], [7]))
+        self.assertEqual(cfg["batch"], 2)
         self.assertIn("3. libero_goal [Default]", menu.getvalue())
+        self.assertIn("1. LIBERO (supported by TinyVLA) [Default]", menu.getvalue())
         self.assertNotIn("Select an option", menu.getvalue())
 
     def test_policy_menu_mixes_native_and_external_models(self):

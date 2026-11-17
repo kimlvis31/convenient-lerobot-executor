@@ -118,11 +118,17 @@ def seconds(value):
     return f"{hours:02d}:{mins:02d}:{secs:02d}"
 
 
-def status_line(percent, count, total, stage, eta):
+def status_line(percent, count, total, stage, eta, average=None):
     current = count if count is not None else "N/A"
     target = total if total is not None else "N/A"
-    units = "Episodes" if stage == "eval" else "Steps"
-    return f"[Status] Completion: {percent:.3f} % | {current}/{target} {units} |  ETA: {seconds(eta)}"
+    parts = [f"[Status] Completion: {percent:.3f} %"]
+    if stage == "eval":
+        parts.append(f"{current}/{target} Episodes")
+        speed = f"{average:.2f} s" if average is not None else "N/A"
+        parts.append(f"Avg/episode: {speed}")
+    else:
+        parts.append(f"{current}/{target} Steps")
+    return " | ".join([*parts, f"ETA: {seconds(eta)}"])
 
 
 class Progress:
@@ -131,6 +137,7 @@ class Progress:
         self.count = stage.start
         self.total = stage.units
         self.anchor = None
+        self.baseline = None
         self.started_at = started_at
         self.rate = None
         self.group = 0
@@ -171,7 +178,10 @@ class Progress:
             if self.count is not None and count < self.count:
                 return False
             if self.started_at is not None and self.count is not None and count > self.count and when > self.started_at:
+                self.baseline = (self.count, self.started_at)
                 self.rate = (when - self.started_at) / (count - self.count)
+            else:
+                self.baseline = (count, when)
             self.count = count
             self.anchor = (count, when)
             return True
@@ -184,6 +194,13 @@ class Progress:
             self.rate = speed if self.rate is None else 0.65 * self.rate + 0.35 * speed
         self.anchor = (count, when)
         return True
+
+    def average(self):
+        if self.baseline is None:
+            return None
+        start_count, started = self.baseline
+        count, finished = self.anchor
+        return (finished - started) / (count - start_count) if count > start_count else None
 
     def fraction(self):
         if self.total is None or self.count is None:
@@ -410,9 +427,11 @@ def run_job(job, run_dir):
                 fraction = 1 if completed else progress.fraction()
                 count = stage.units if completed and stage.units is not None else progress.count
                 print(status_line(100 * (index + fraction) / len(stages), count, stage.units,
-                                  stage.name, display_eta), flush=True)
+                                  stage.name, display_eta, progress.average()), flush=True)
                 saved.update(units_done=count, units_total=stage.units, eta_seconds=eta,
                              overall_eta_seconds=overall)
+                if stage.name == "eval":
+                    saved["average_seconds_per_episode"] = progress.average()
 
             def update(line):
                 nonlocal last_print

@@ -361,7 +361,7 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
             loss = (loss * ~is_pad.unsqueeze(-1)).mean()
             return {'loss': loss}
         else:  # inference time
-            B = 1
+            B = hidden_states.shape[0]
             Tp = self.num_queries
             action_dim = self.action_dim
 

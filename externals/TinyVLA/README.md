@@ -29,7 +29,7 @@ The default model directory, `models/Llava-Pythia-700M/`, needs the original `mo
 - `train/pretrained_model/` holds the full model and action-head weights. When `action_head.safetensors` is present, the evaluation worker verifies that the saved action-head tensors were loaded.
 - `train/checkpoints/training_state.pt` stores the action head, optimizer state, step count, and random state. The trainer replaces this file at each configured save interval. Resume requires the same training settings, selection, base weights, and runtime environment.
 - An older run's `train/pretrained_model/` and `selection.json` can initialize a new run with a fresh optimizer.
-- The evaluation adapter expects two images, eight state values, seven action values, and chunks of up to 16 actions. Use evaluation batch size 1, one task at a time, 256-pixel images, and relative control. The adapter preserves the original camera processing, action bounds, and gripper sign.
+- The evaluation adapter expects two images, eight state values, seven action values, and chunks of up to 16 actions. Use one task at a time, 256-pixel images, and relative control. The worker evaluates observation batches on the graphics device. Batch capacity depends on available device memory. The adapter preserves the original camera processing, action bounds, and gripper sign.
 
 The executor passes `--policy.model_path` and `--policy.worker_log_dir`. The original `--policy.step7_script` option remains supported. Each evaluation saves worker logs in `eval/worker_logs/` under its output directory. The adapter removes the worker code from its temporary directory at shutdown. Job script retention is handled by the executor.
 

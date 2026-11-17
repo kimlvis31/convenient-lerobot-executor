@@ -63,35 +63,47 @@ TAIL = r'''
                 external = data['external'].copy()
                 wrist = data['wrist'].copy()
                 state_values = data['state'].copy()
-            if state_values.shape != (1, 8) or not np.isfinite(state_values).all():
-                raise ValueError('Expected one finite eight-value robot state.')
-            images = []
+            instructions = request['instructions']
+            size = len(instructions)
+            if not size or state_values.shape != (size, 8) or not np.isfinite(state_values).all():
+                raise ValueError('Expected one finite eight-value robot state per batch element.')
+            camera_tensors = []
             for array in (external, wrist):
-                if array.dtype != np.uint8 or array.ndim != 3 or array.shape[-1] != 3:
-                    raise ValueError('Expected a channel-last uint8 camera image.')
-                images.append(Image.fromarray(array))
-            image_batch = process_images(images, processor, cfg)
-            if not isinstance(image_batch, torch.Tensor) or image_batch.shape[0] != 2:
-                raise ValueError('Expected two processed camera images.')
-            image_batch = image_batch.to(device='cuda', dtype=torch.bfloat16)
+                if array.dtype != np.uint8 or array.ndim != 4 or array.shape[0] != size or array.shape[-1] != 3:
+                    raise ValueError('Expected one channel-last uint8 camera image per batch element.')
+                processed = process_images([Image.fromarray(frame) for frame in array], processor, cfg)
+                if not isinstance(processed, torch.Tensor) or processed.shape[0] != size:
+                    raise ValueError('Expected one processed image per batch element.')
+                camera_tensors.append(processed.to(device='cuda', dtype=torch.bfloat16))
             states = torch.from_numpy(state_values).to(device='cuda', dtype=torch.bfloat16)
             image_marker = DEFAULT_IMAGE_TOKEN
             if getattr(cfg, 'mm_use_im_start_end', False):
                 image_marker = DEFAULT_IM_START_TOKEN + image_marker + DEFAULT_IM_END_TOKEN
-            conv = conv_templates['pythia'].copy()
-            conv.append_message(conv.roles[0], image_marker + '\n' + request['instruction'])
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt() + ' <|endoftext|>'
-            input_ids = tokenizer_image_token(
-                prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
-            ).unsqueeze(0).to('cuda')
+            # The action head pools the token sequence, so batch equal lengths without padding.
+            groups = {}
+            for index, instruction in enumerate(instructions):
+                conv = conv_templates['pythia'].copy()
+                conv.append_message(conv.roles[0], image_marker + '\n' + instruction)
+                conv.append_message(conv.roles[1], None)
+                prompt = conv.get_prompt() + ' <|endoftext|>'
+                tokens = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+                groups.setdefault(len(tokens), []).append((index, tokens))
+
+            actions = torch.empty((size, 16, 7), dtype=torch.float32, device='cpu')
             with torch.inference_mode():
-                actions = model(
-                    input_ids=input_ids, attention_mask=input_ids.ne(tokenizer.pad_token_id),
-                    images=image_batch[:1], images_r=image_batch[1:2], states=states, eval=True,
-                )
-            torch.cuda.synchronize()
-            if tuple(actions.shape) != (1, 16, 7) or not torch.isfinite(actions).all().item():
+                for group in groups.values():
+                    indices, tokens = zip(*group)
+                    indices = list(indices)
+                    input_ids = torch.stack(tokens).to('cuda')
+                    batch_actions = model(
+                        input_ids=input_ids, attention_mask=input_ids.ne(tokenizer.pad_token_id),
+                        images=camera_tensors[0][indices], images_r=camera_tensors[1][indices],
+                        states=states[indices], eval=True,
+                    )
+                    if tuple(batch_actions.shape) != (len(indices), 16, 7):
+                        raise RuntimeError(f'TinyVLA returned invalid action shape: {batch_actions.shape}')
+                    actions[indices] = batch_actions.float().cpu()
+            if not torch.isfinite(actions).all().item():
                 raise RuntimeError('TinyVLA returned invalid actions.')
             response = {'id': last_id, 'ok': True, 'actions': actions.float().cpu().tolist(),
                         'seconds': time.perf_counter() - started}

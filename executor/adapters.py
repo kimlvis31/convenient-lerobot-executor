@@ -240,8 +240,8 @@ class TinyVLAAdapter(NativeAdapter):
 
     def eval_policy(self, after_training):
         cfg = self.settings["eval"]
-        if cfg["env"] != "libero" or cfg["batch"] != 1 or cfg["control"] != "relative" or cfg["size"] != 256:
-            raise ValueError("TinyVLA evaluation requires LIBERO, batch size 1, relative control, and 256-pixel images.")
+        if cfg["env"] != "libero" or cfg["control"] != "relative" or cfg["size"] != 256:
+            raise ValueError("TinyVLA evaluation requires LIBERO, relative control, and 256-pixel images.")
         loader = require(self.external / "runtime/tinyvla_loader.py")
         model = self.train_dir / "train/pretrained_model" if after_training else (
             Path(cfg["policy"]).expanduser().resolve() if cfg.get("policy") else self.base_model)

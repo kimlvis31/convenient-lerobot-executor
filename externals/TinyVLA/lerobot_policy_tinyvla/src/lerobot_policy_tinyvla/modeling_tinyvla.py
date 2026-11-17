@@ -80,13 +80,13 @@ class TinyVLAPolicy(PreTrainedPolicy):
         worker_script = Path(self._worker_dir.name) / "worker.py"
         worker_script.write_text(generated, encoding="utf-8")
         (self._channel / "adapter.json").write_text(json.dumps({
-            "adapter_version": "0.1.0", "step7": str(step7), "step7_sha256": source_hash,
+            "adapter_version": "0.2.0", "step7": str(step7), "step7_sha256": source_hash,
             "worker_sha256": hashlib.sha256(generated.encode()).hexdigest(),
             "workspace": str(workspace), "inference_python": str(inference_python),
             "seed": self.config.seed, "n_action_steps": self.config.n_action_steps,
             "image_pipeline": "LeRobot LIBERO rotation once; CHW float to HWC uint8; TinyVLA processor once",
             "state_scaling": "identity", "action_scaling": "identity then clamp [-1,1]",
-            "gripper_sign_change": False, "supported_batch_size": 1,
+            "gripper_sign_change": False, "supports_batched_inference": True,
         }, indent=2), encoding="utf-8")
         self._log = (self._channel / "worker.log").open("w", encoding="utf-8")
         command = [
@@ -111,42 +111,51 @@ class TinyVLAPolicy(PreTrainedPolicy):
         logging.warning("TINYVLA_READY: %s", self._channel)
 
     @staticmethod
-    def _instruction(batch):
+    def _instructions(batch, size):
         value = batch.get("task")
-        if isinstance(value, (list, tuple)) and len(value) == 1:
-            value = value[0]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("Expected one nonempty task instruction.")
-        return value
+        if isinstance(value, str):
+            value = (value,) * size
+        if not isinstance(value, (list, tuple)) or len(value) != size or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            raise ValueError("Expected one nonempty task instruction per batch element.")
+        return tuple(value)
 
     @staticmethod
-    def _camera(batch, key):
+    def _batch_size(state):
+        if state.ndim != 2 or not state.shape[0] or state.shape[1] != 8:
+            raise ValueError(f"Expected state shape (batch, 8), got {state.shape}.")
+        return state.shape[0]
+
+    @staticmethod
+    def _camera(batch, key, size):
         image = batch[key].detach().to("cpu")
-        if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
-            raise ValueError(f"Expected batch-one channel-first camera: {key}, {image.shape}")
+        if image.ndim != 4 or image.shape[0] != size or image.shape[1] != 3:
+            raise ValueError(f"Expected {size} channel-first images: {key}, {image.shape}")
         if not torch.isfinite(image).all() or image.min() < 0 or image.max() > 1:
             raise ValueError(f"Expected finite image values in [0,1]: {key}")
         # No rotation here: LeRobot's LIBERO environment processor already did it.
-        return (image[0].permute(1, 2, 0) * 255).round().to(torch.uint8).numpy()
+        return (image.permute(0, 2, 3, 1) * 255).round().to(torch.uint8).numpy()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch, **kwargs):
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Use env.max_parallel_tasks=1 with this adapter.")
         try:
-            instruction = self._instruction(batch)
             state = batch["observation.state"].detach().to("cpu", dtype=torch.float32).numpy()
-            if state.shape != (1, 8) or not np.isfinite(state).all():
-                raise ValueError("Use eval.batch_size=1; expected state shape (1,8).")
-            external = self._camera(batch, "observation.images.image")
-            wrist = self._camera(batch, "observation.images.image2")
+            size = self._batch_size(state)
+            instructions = self._instructions(batch, size)
+            if not np.isfinite(state).all():
+                raise ValueError("Robot state must contain only finite values.")
+            external = self._camera(batch, "observation.images.image", size)
+            wrist = self._camera(batch, "observation.images.image2", size)
             self._ensure_worker()
             self._request_id += 1
             temporary = self._channel / "input.tmp.npz"
             np.savez(temporary, external=external, wrist=wrist, state=state)
             temporary.replace(self._channel / "input.npz")
             temporary = self._channel / "request.tmp"
-            temporary.write_text(json.dumps({"id": self._request_id, "instruction": instruction}),
+            temporary.write_text(json.dumps({"id": self._request_id, "instructions": instructions}),
                                  encoding="utf-8")
             temporary.replace(self._channel / "request.json")
             started = time.monotonic()
@@ -164,10 +173,10 @@ class TinyVLAPolicy(PreTrainedPolicy):
                     raise TimeoutError(f"TinyVLA inference timed out. See {self._channel / 'worker.log'}")
                 time.sleep(0.01)
             actions = torch.tensor(response["actions"], dtype=torch.float32)
-            if tuple(actions.shape) != (1, 16, 7) or not torch.isfinite(actions).all():
+            if tuple(actions.shape) != (size, 16, 7) or not torch.isfinite(actions).all():
                 raise RuntimeError("TinyVLA returned invalid actions.")
             with (self._channel / "requests.jsonl").open("a", encoding="utf-8") as log:
-                log.write(json.dumps({"id": self._request_id, "instruction": instruction,
+                log.write(json.dumps({"id": self._request_id, "instructions": instructions, "batch_size": size,
                                       "seconds": response["seconds"],
                                       "clipped_values": int((actions.abs() > 1).sum())}) + "\n")
             return actions.clamp(-1, 1).to(self._device_anchor.device)
@@ -181,16 +190,15 @@ class TinyVLAPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch, **kwargs):
-        if tuple(batch["observation.state"].shape) != (1, 8):
-            raise ValueError("Use eval.batch_size=1; expected state shape (1,8).")
-        instruction = self._instruction(batch)
-        if instruction != self._last_task:
+        size = self._batch_size(batch["observation.state"])
+        instructions = self._instructions(batch, size)
+        if instructions != self._last_task:
             self._action_queue.clear()
-            self._last_task = instruction
+            self._last_task = instructions
         if not self._action_queue:
             chunk = self.predict_action_chunk(batch)
-            self._action_queue.extend(chunk[0, :self.config.n_action_steps])
-        return self._action_queue.popleft().unsqueeze(0)
+            self._action_queue.extend(chunk[:, :self.config.n_action_steps].unbind(dim=1))
+        return self._action_queue.popleft()
 
     def close(self):
         process = self._process

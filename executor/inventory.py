@@ -1,6 +1,7 @@
 """Find local inputs and results without loading models or datasets."""
 
 from dataclasses import dataclass, field
+from itertools import chain
 import os
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from runner import styled
 class Inventory:
     datasets: list[tuple[Path, dict]] = field(default_factory=list)
     models: list[tuple[Path, str]] = field(default_factory=list)
+    cached_models: dict[Path, str] = field(default_factory=dict)
     native_resume: list[Path] = field(default_factory=list)
     tiny_resume: list[Path] = field(default_factory=list)
     results: list[Path] = field(default_factory=list)
@@ -33,6 +35,21 @@ def walk(root):
         yield Path(directory), set(filenames)
 
 
+def cached_snapshots():
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    hf_home = Path(os.environ.get("HF_HOME") or cache_home / "huggingface")
+    hub = Path(os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE") or hf_home / "hub")
+    for snapshot in sorted(hub.expanduser().glob("models--*/snapshots/*")):
+        if snapshot.is_dir():
+            repo_id = snapshot.parents[1].name.removeprefix("models--").replace("--", "/")
+            yield snapshot, f"{repo_id} @ {snapshot.name[:8]}"
+
+
+def model_location(inventory, path):
+    origin = inventory.cached_models.get(path)
+    return f"[Hugging Face cache] {origin} · {path}" if origin else str(path)
+
+
 def scan(root, external, log_root):
     result = Inventory()
     dataset_roots = (root / "datasets", root / "datasets/.hub")
@@ -51,12 +68,14 @@ def scan(root, external, log_root):
                 seen.add(dataset)
 
     checkpoints = set()
-    for base in (root / "outputs", external / "models"):
+    local_models = ((root / "outputs", None), (external / "models", None))
+    for base, origin in chain(local_models, cached_snapshots()):
         for path, names in walk(base):
-            for filename in sorted({"eval_info.json", "training_result.json"} & names):
-                if metadata(path / filename):
-                    result.results.append(path / filename)
-            if "training_state.pt" in names and (path.parent.parent / "selection.json").is_file():
+            if origin is None:
+                for filename in sorted({"eval_info.json", "training_result.json"} & names):
+                    if metadata(path / filename):
+                        result.results.append(path / filename)
+            if origin is None and "training_state.pt" in names and (path.parent.parent / "selection.json").is_file():
                 try:
                     if (path / "training_state.pt").stat().st_size:
                         result.tiny_resume.append(path.parent.parent)
@@ -68,7 +87,12 @@ def scan(root, external, log_root):
             policy = train.get("policy")
             kind = policy.get("type") if isinstance(policy, dict) else None
             model = "tinyvla" if tiny else kind or config.get("type")
-            if not isinstance(model, str) or path.resolve() in checkpoints:
+            if not isinstance(model, str):
+                continue
+            resolved = path.resolve()
+            if resolved in checkpoints:
+                continue
+            if origin and tiny and not {"preprocessor_config.json", "tokenizer.json"} <= names:
                 continue
             try:
                 if tiny or {"model.safetensors", "model.safetensors.index.json"} & names:
@@ -77,15 +101,21 @@ def scan(root, external, log_root):
                     continue
             except (OSError, ValueError, KeyError, TypeError):
                 continue
-            checkpoints.add(path.resolve())
-            result.models.append((path.resolve(), model))
+            checkpoints.add(resolved)
+            result.models.append((resolved, model))
+            if origin:
+                result.cached_models[resolved] = origin
             if not tiny and train:
-                state = metadata(path.parent / "training_state/training_step.json")
+                state_dir = path.parent / "training_state"
+                state = metadata(state_dir / "training_step.json")
                 if type(state.get("step")) is int and state["step"] >= 0:
-                    result.native_resume.append(path.resolve())
-                latest = path.parent.parent / "last"
-                if not latest.is_dir() or path.parent.resolve() == latest.resolve():
-                    result.results.append(path / "train_config.json")
+                    required = ("rng_state.safetensors", "optimizer_state.safetensors", "optimizer_param_groups.json")
+                    if origin is None or all((state_dir / name).is_file() for name in required):
+                        result.native_resume.append(resolved)
+                if origin is None:
+                    latest = path.parent.parent / "last"
+                    if not latest.is_dir() or path.parent.resolve() == latest.resolve():
+                        result.results.append(path / "train_config.json")
     for script in sorted(log_root.glob("*/run.py"), reverse=True):
         imported = script.with_name("script.py")
         result.settings.append(imported if imported.is_file() else script)
@@ -100,8 +130,8 @@ def show(inventory, environments, limit=None):
     groups = (
         ("Conda environments", sorted(environments)),
         ("Training datasets", datasets),
-        ("Models for evaluation or initialization", [f"{model} · {path}" for path, model in inventory.models]),
-        ("Checkpoints with training state", [str(path) for path in inventory.native_resume + inventory.tiny_resume]),
+        ("Models for evaluation or initialization", [f"{model} · {model_location(inventory, path)}" for path, model in inventory.models]),
+        ("Checkpoints with training state", [model_location(inventory, path) for path in inventory.native_resume + inventory.tiny_resume]),
         ("Training and evaluation results", [str(path) for path in inventory.results]),
         ("Previous job settings", [str(path) for path in inventory.settings]),
     )
