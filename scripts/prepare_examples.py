@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the public TinyVLA exercise assets next to an existing LeRobot checkout."""
+"""Prepare the public TinyVLA exercise assets in the convLexecutor checkout."""
 
 import argparse
 import hashlib
@@ -203,7 +203,6 @@ def prepare_checkpoints(root, checkpoint_root, dataset, selection, workspace, ba
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lerobot-root", default="~/lerobot", help="Existing LeRobot working directory")
     parser.add_argument("--conda", help="Path to the Conda executable")
     parser.add_argument("--native-env", default="lerobot")
     parser.add_argument("--model-env", help="TinyVLA Conda environment name")
@@ -211,9 +210,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
-        root = Path(args.lerobot_root).expanduser().resolve(strict=True)
-        if not root.is_dir():
-            raise NotADirectoryError(root)
+        root = REPO
         dataset = root / "datasets/example/libero"
         checkpoint_root = (args.checkpoint_root or root / "outputs/example").expanduser().resolve()
         selection = read_json(MANIFEST_DIR / "selection.json")

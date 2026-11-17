@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 
 
-DEFAULT_WORKSPACE = "~/lerobot/externals/TinyVLA"
+DEFAULT_WORKSPACE = "~/convLexecutor/externals/TinyVLA"
 
 
 @PreTrainedConfig.register_subclass("tinyvla")

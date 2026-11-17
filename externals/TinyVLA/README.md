@@ -38,8 +38,8 @@ The executor passes `--policy.model_path` and `--policy.worker_log_dir`. The ori
 The following command runs one episode for task 1 in `libero_object`. To verify a trained checkpoint, set `--policy.model_path` to its `pretrained_model/` directory.
 
 ```bash
-mkdir -p "$HOME/lerobot/outputs/eval"
-run_dir=$(mktemp -d "$HOME/lerobot/outputs/eval/tinyvla_check_XXXXXX")
+mkdir -p "$HOME/convLexecutor/outputs/evaluation"
+run_dir=$(mktemp -d "$HOME/convLexecutor/outputs/evaluation/tinyvla_check_XXXXXX")
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl conda run --no-capture-output -n lerobot lerobot-eval \
   --policy.type=tinyvla --policy.device=cpu --policy.n_action_steps=16 \
   --policy.workspace="$HOME/convLexecutor/externals/TinyVLA" \

@@ -7,8 +7,11 @@ build/
 .env
 
 /executor/log/
-/outputs/
-/datasets/example/libero/
+/datasets/*
+!/datasets/example/
+/datasets/example/*
+!/datasets/example/assets.json
+!/datasets/example/selection.json
 /externals/TinyVLA/models/Llava-Pythia-700M/tokenizer.json
 *.log
 *.safetensors

@@ -84,7 +84,7 @@ class NativeAdapter:
         self.run_name = run_name
         self.root = root
         self.train_dir = root / "outputs/training" / run_name
-        self.eval_dir = root / "outputs/eval" / run_name
+        self.eval_dir = root / "outputs/evaluation" / run_name
         self.external = external
         self.environments = environments
 

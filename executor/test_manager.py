@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan
-from manage import number, plan, run_plans, settings_jobs, wizard
+from manage import normalize_paths, number, plan, run_plans, settings_jobs, wizard
 from runner import Progress, execute, load_settings, resolve_arguments
 
 
@@ -209,25 +209,47 @@ class ManagerTests(unittest.TestCase):
         settings_path.write_text(json.dumps(settings))
         args = Namespace(settings=settings_path, queue=None, lerobot_root=str(self.root), tinyvla_root=str(self.external),
                          conda="fake", inventory=False, plugin=None, env_map=None)
-        with patch("manage.available_environments", return_value={"lerobot", "lerobot_tinyvla"}):
+        project = self.root / "convLexecutor"
+        with patch("manage.PROJECT_ROOT", project), \
+             patch("manage.available_environments", return_value={"lerobot", "lerobot_tinyvla"}):
             jobs, _ = plan(args)
-        (configured, stages, _, _), = jobs
+        (configured, stages, _, working_directory), = jobs
+        self.assertEqual(working_directory, project)
+        self.assertEqual(stages[0].output.parent, project / "outputs/evaluation")
+        self.assertEqual(stages[0].env["HF_LEROBOT_HOME"], str(project / "datasets/.hub"))
         self.assertEqual(configured["tinyvla_root"], str(self.external))
         self.assertEqual(configured["environments"]["tinyvla"], "lerobot_tinyvla")
         self.assertIn("--policy.inference_python=@python:lerobot_tinyvla", stages[0].arguments)
 
+    def test_project_paths_are_independent_of_a_lerobot_checkout(self):
+        project = self.root / "convLexecutor"
+        lerobot_base = self.root / "lerobot"
+        data = {"adapter": "tinyvla", "train": {"dataset_root": "datasets/example/libero",
+                 "base_model": "externals/TinyVLA/models/base",
+                 "resume": "outputs/example/state.pt",
+                 "selection": str(lerobot_base / "legacy-split.json")},
+                 "eval": {"policy": "outputs/example/model"}}
+        with patch("manage.PROJECT_ROOT", project):
+            resolved = normalize_paths(data, lerobot_base)
+        for name in ("dataset_root", "base_model", "resume"):
+            self.assertEqual(Path(resolved["train"][name]), project / data["train"][name])
+        self.assertEqual(resolved["train"]["selection"], data["train"]["selection"])
+        self.assertEqual(Path(resolved["eval"]["policy"]), project / data["eval"]["policy"])
+
     def test_interactive_import_lists_scripts_and_uses_literal_jobs(self):
-        directory = self.root / "executor/scripts"
+        directory = self.root / "scripts"
         directory.mkdir(parents=True)
         fixture = directory / "evaluate.py"
         settings = sample_settings()
         fixture.write_text(f"JOBS = {[settings, settings]!r}\nraise RuntimeError('must not be executed')\n", encoding="utf-8")
         (directory / "notes.txt").touch()
+        (directory / "prepare_examples.py").write_text("SETTINGS = {'steps': 4}\n", encoding="utf-8")
         with patch("manage.SCRIPT_ROOT", directory), patch("builtins.input", side_effect=["2", "1"]), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
             imported = wizard(load_adapters([]), Inventory(), self.root)
         self.assertIn("evaluate.py", menu.getvalue())
         self.assertNotIn("notes.txt", menu.getvalue())
+        self.assertNotIn("prepare_examples.py", menu.getvalue())
         self.assertEqual(settings_jobs(imported), [settings, settings])
 
     def test_queue_executes_in_order_and_stops_after_a_failed_job(self):

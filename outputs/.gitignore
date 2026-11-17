@@ -1,0 +1,9 @@
+/*
+!/.gitignore
+!/example/
+!/training/
+!/evaluation/
+/example/*
+/training/*
+/evaluation/*
+!/*/.gitkeep

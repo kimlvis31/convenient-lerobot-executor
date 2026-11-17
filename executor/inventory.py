@@ -34,8 +34,7 @@ def walk(root):
 
 def scan(root, external, log_root):
     result = Inventory()
-    hub_home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
-    dataset_roots = (root / "datasets", Path(os.environ.get("HF_LEROBOT_HOME", hub_home / "lerobot")).expanduser())
+    dataset_roots = (root / "datasets", root / "datasets/.hub")
     seen = set()
     for base in dataset_roots:
         for path, names in walk(base):

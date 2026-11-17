@@ -18,8 +18,9 @@ from runner import available_environments, conda_executable, execute, load_setti
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
-LOG_ROOT = Path(__file__).resolve().parent / "log"
-SCRIPT_ROOT = LOG_ROOT.parent / "scripts"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOG_ROOT = PROJECT_ROOT / "executor/log"
+SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
 def ask(question, default=None, optional=False):
@@ -203,8 +204,17 @@ def eval_settings(model, tiny, train, inventory):
 def script_paths():
     if not SCRIPT_ROOT.is_dir():
         return []
-    return sorted(path for path in SCRIPT_ROOT.iterdir() if path.is_file() and
-                  not path.name.startswith((".", "_")) and path.suffix in {".py", ".json"})
+    queues = []
+    for path in sorted(SCRIPT_ROOT.iterdir()):
+        if not path.is_file() or path.name.startswith((".", "_")) or path.suffix not in {".py", ".json"}:
+            continue
+        try:
+            jobs = settings_jobs(load_settings(path))
+        except (OSError, SyntaxError, ValueError, KeyError, TypeError):
+            continue
+        if all({"adapter", "model"} <= job.keys() and {"train", "eval"} & job.keys() for job in jobs):
+            queues.append(path)
+    return queues
 
 
 def wizard(adapters, inventory, root):
@@ -256,18 +266,21 @@ def wizard(adapters, inventory, root):
 
 
 def paths_for(args, cfg):
-    root = Path(args.lerobot_root or cfg.get("lerobot_root") or "~/lerobot").expanduser().resolve()
+    root = Path(args.lerobot_root or cfg.get("lerobot_root") or PROJECT_ROOT).expanduser().resolve()
     if not root.is_dir():
-        raise FileNotFoundError(f"LeRobot directory not found ({root}).")
-    bundled = Path(__file__).resolve().parent.parent / "externals/TinyVLA"
-    candidates = [bundled, *(root / "externals" / name for name in ("TinyVLA", "tinyVLA", "tinyvla"))]
-    external_option = args.tinyvla_root or cfg.get("tinyvla_root")
-    configured = Path(external_option).expanduser().resolve() if external_option else None
-    if args.tinyvla_root or (configured and configured.is_dir()):
-        external = configured
-    else:
-        external = next((path for path in candidates if path.is_dir()), root / "externals/TinyVLA")
-    return root, external
+        if args.lerobot_root:
+            raise FileNotFoundError(f"Input base directory not found ({root}).")
+        root = PROJECT_ROOT
+    bundled = PROJECT_ROOT / "externals/TinyVLA"
+    if args.tinyvla_root:
+        return root, Path(args.tinyvla_root).expanduser().resolve()
+    saved = cfg.get("tinyvla_root")
+    if saved:
+        configured = Path(saved).expanduser().resolve()
+        legacy = configured.parent == root / "externals" and configured.name.lower() == "tinyvla"
+        if configured.is_dir() and not legacy:
+            return root, configured
+    return root, bundled
 
 
 def settings_jobs(settings):
@@ -284,11 +297,15 @@ def settings_jobs(settings):
 
 def normalize_paths(cfg, root):
     def local(value):
-        return str((root / Path(value).expanduser()).resolve())
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return str(path.resolve())
+        project_path = path.parts[:1] in {("datasets",), ("outputs",), ("externals",)}
+        return str(((PROJECT_ROOT if project_path else root) / path).resolve())
 
     def reference(value):
-        path = Path(value).expanduser()
-        return local(value) if path.is_absolute() or value.startswith(".") or (root / path).is_dir() else value
+        resolved = local(value)
+        return resolved if Path(value).expanduser().is_absolute() or value.startswith(".") or Path(resolved).is_dir() else value
 
     cfg = dict(cfg)
     if "train" in cfg:
@@ -317,9 +334,9 @@ def plan_job(args, cfg, conda, detected):
     environments = {**DEFAULT_ENVIRONMENTS, **cfg.get("environments", {})}
     if args.env_map:
         environments.update(read_json(args.env_map))
-    if root not in detected:
-        detected[root] = available_environments(conda, root)
-    installed = detected[root]
+    if PROJECT_ROOT not in detected:
+        detected[PROJECT_ROOT] = available_environments(conda, PROJECT_ROOT)
+    installed = detected[PROJECT_ROOT]
     if (installed and environments["tinyvla"] == "tinyvla_infer" and
             "tinyvla_infer" not in installed and "lerobot_tinyvla" in installed):
         environments["tinyvla"] = "lerobot_tinyvla"
@@ -329,13 +346,15 @@ def plan_job(args, cfg, conda, detected):
     cfg.update(environments=environments, plugins=plugins, lerobot_root=str(root), tinyvla_root=str(external))
     name = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{cfg['model'][:50]}_{uuid4().hex[:8]}"
     run_dir = LOG_ROOT / name
-    adapter = adapters[cfg["adapter"]](cfg, name, root, external, environments)
+    adapter = adapters[cfg["adapter"]](cfg, name, PROJECT_ROOT, external, environments)
     stages = []
     if "train" in cfg:
         stages.append(adapter.train())
     if "eval" in cfg:
         stages.append(adapter.evaluate(after_training="train" in cfg))
-    return cfg, stages, run_dir, root
+    for stage in stages:
+        stage.env.setdefault("HF_LEROBOT_HOME", str(PROJECT_ROOT / "datasets/.hub"))
+    return cfg, stages, run_dir, PROJECT_ROOT
 
 
 def plan(args):
@@ -349,13 +368,13 @@ def plan(args):
         conda = None
     detected = {}
     if args.inventory or settings is None:
-        root, external = paths_for(args, settings or {})
-        detected[root] = available_environments(conda, root)
-        inventory = scan(root, external, LOG_ROOT)
-        show(inventory, detected[root], limit=None if args.inventory else 5)
+        _, external = paths_for(args, settings or {})
+        detected[PROJECT_ROOT] = available_environments(conda, PROJECT_ROOT)
+        inventory = scan(PROJECT_ROOT, external, LOG_ROOT)
+        show(inventory, detected[PROJECT_ROOT], limit=None if args.inventory else 5)
         if args.inventory:
             return [], conda
-        settings = wizard(load_adapters(args.plugin or []), inventory, root)
+        settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT)
         if settings is None:
             return [], conda
 
@@ -378,7 +397,7 @@ def run_plans(plans, conda, verbose):
 
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate LeRobot policies and external models")
-    parser.add_argument("--lerobot-root", help="LeRobot working directory (default: ~/lerobot)")
+    parser.add_argument("--lerobot-root", help="Base for older relative input paths outside datasets, outputs, and externals")
     parser.add_argument("--tinyvla-root", help="TinyVLA deployment directory")
     parser.add_argument("--conda", help="Path to the Conda executable")
     parser.add_argument("--env-map", type=Path, help="File mapping model names to Conda environments")

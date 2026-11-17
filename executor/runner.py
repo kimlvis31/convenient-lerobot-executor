@@ -268,7 +268,7 @@ def execute(stages, settings, run_dir, root, conda, verbose):
     job = {"root": str(root), "settings": settings, "runtime": runtime, "stages": entries, "verbose": verbose}
     run_dir.mkdir(parents=True, exist_ok=False)
     with (run_dir / "script.py").open("x", encoding="utf-8", newline="\n") as file:
-        file.write('"""Reusable settings for this job. Import with --queue or from executor/scripts/."""\n\n')
+        file.write('"""Reusable settings for this job. Import with --queue or from the project scripts/ directory."""\n\n')
         file.write("JOBS = " + pformat([settings], sort_dicts=False, width=110) + "\n")
     script = run_dir / "run.py"
     source = (

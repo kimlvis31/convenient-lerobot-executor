@@ -6,7 +6,7 @@
 # device to "cuda" or "cpu". For another native policy, use its model name.
 # A job can contain train, eval, or both. With both present, evaluation uses
 # the checkpoint produced by that job's training stage.
-# The dataset and checkpoints below are example assets under the LeRobot root.
+# The dataset and checkpoints below are example assets under the convLexecutor root.
 JOBS = [
     {
         "label": "Base model, task 1",  # Name shown in the queue.

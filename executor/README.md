@@ -4,7 +4,7 @@ On startup, the executor lists local training datasets, model weights, checkpoin
 
 ## Getting started
 
-Follow the [setup guide](../README.md) to install the executor alongside LeRobot. Use a terminal with Python 3.10 or later and Conda.
+Follow the [setup guide](../README.md) to install LeRobot in a Conda environment and run the executor from the project checkout. Use a terminal with Python 3.10 or later and Conda.
 
 ```bash
 python -B ~/convLexecutor/executor/manage.py --inventory
@@ -12,22 +12,22 @@ python -B ~/convLexecutor/executor/manage.py --dry-run
 python -B ~/convLexecutor/executor/manage.py
 ```
 
-`--inventory` shows the full list. The executor looks for training datasets in `datasets/` and the local LeRobot cache, checkpoints and results in `outputs/`, and TinyVLA base weights in `externals/TinyVLA/models/`. The inventory checks for the required local files.
+`--inventory` shows the full list. The executor looks for training datasets in `datasets/` and its local LeRobot dataset cache, checkpoints and results in `outputs/`, and TinyVLA base weights in `externals/TinyVLA/models/`. The inventory checks for the required local files.
 
-`--dry-run` shows the commands and Conda environments selected by the settings. Use `--lerobot-root` to specify a working directory other than `~/lerobot` and `--tinyvla-root` to override the bundled TinyVLA integration.
+`--dry-run` shows the commands and Conda environments selected by the settings. Use `--lerobot-root` for older relative input paths outside the managed directories. Use `--tinyvla-root` to override the bundled TinyVLA integration.
 
 ## Import a job queue
 
-Select **Import a job queue script** to list the `.py` and `.json` files in `executor/scripts/`. In [example_script.py](scripts/example_script.py), `JOBS` is an ordered list of job dictionaries. The interactive prompts fill the same fields. Specify `adapter`, `model`, and at least one of `train` or `eval` for each job. Include both stages in a single dictionary to evaluate the checkpoint produced by training.
+Select **Import a job queue script** to list job queue and settings files in the project `scripts/` directory. In [example_script.py](../scripts/example_script.py), `JOBS` is an ordered list of job dictionaries. The interactive prompts fill the same fields. Specify `adapter`, `model`, and at least one of `train` or `eval` for each job. Include both stages in a single dictionary to evaluate the checkpoint produced by training.
 
-The example contains five TinyVLA jobs: base evaluation, checkpoint evaluation, reset training from the base model, continuation from saved weights with a new optimizer, and exact resume from step 2. The preparation script writes the demonstration and its split under `~/lerobot/datasets/example/libero/`, and the checkpoints under `~/lerobot/outputs/example/`. Copy or remove individual dictionaries to select the scenarios you want to run.
+The example contains five TinyVLA jobs: base evaluation, checkpoint evaluation, reset training from the base model, continuation from saved weights with a new optimizer, and exact resume from step 2. The preparation script writes the demonstration and its split under `datasets/example/libero/`, and the checkpoints under `outputs/example/`. Copy or remove individual dictionaries to select the scenarios you want to run.
 
 ```bash
-python -B ~/convLexecutor/executor/manage.py --queue ~/convLexecutor/executor/scripts/example_script.py --dry-run
-python -B ~/convLexecutor/executor/manage.py --queue ~/convLexecutor/executor/scripts/example_script.py
+python -B ~/convLexecutor/executor/manage.py --queue ~/convLexecutor/scripts/example_script.py --dry-run
+python -B ~/convLexecutor/executor/manage.py --queue ~/convLexecutor/scripts/example_script.py
 ```
 
-The executor reads literal settings from the file and runs jobs in order. If a job fails, the queue stops and the executor retains the scripts and logs of jobs that started. For one job, use a `SETTINGS` dictionary or `--settings`. Relative dataset and checkpoint paths are resolved from the LeRobot working directory.
+The executor reads literal settings from the file and runs jobs in order. If a job fails, the queue stops and the executor retains the scripts and logs of jobs that started. For one job, use a `SETTINGS` dictionary or `--settings`. Relative dataset and checkpoint paths are resolved from the convLexecutor checkout.
 
 ## Model and environment selection
 
@@ -56,13 +56,13 @@ After you confirm the settings, the executor generates and runs one script per j
 | `executor/log/<run-name>/status.json` | Start and end times, duration, and status for the job and its stages |
 | `executor/log/<run-name>/train.log`, `eval.log` | Console output for each stage that ran |
 | `outputs/training/<run-name>/` | Checkpoints, training results, and the saved dataset split where applicable |
-| `outputs/eval/<run-name>/` | Evaluation results and videos saved by LeRobot |
+| `outputs/evaluation/<run-name>/` | Evaluation results and videos saved by LeRobot |
 
 Overall progress is the average of the stage percentages. Training progress uses optimizer steps. Evaluation progress uses LeRobot's reported batches to count completed episodes. The executor estimates remaining time from measured progress. Estimating the duration of later stages requires a completed run with matching settings and environment. Remaining time is shown as unavailable until there is enough information. Preprocessing, checkpoint saving, and video encoding may take time between progress updates.
 
 - Native resume uses LeRobot's `train_config.json` and `training_state/`. Select a checkpoint or a previous run and set a target step count greater than the saved step.
 - TinyVLA resume uses the previous training directory and job settings. It restores the action head, optimizer and random state, and reuses the same training split. To initialize a new run from weights alone, choose **Start training with existing action-head weights**.
-- **Reuse settings from a previous run** and `--queue /path/to/script.py` create a new job using saved settings. You can also copy `script.py` into `executor/scripts/` under a new name. Previous `run.py` and `settings.json` files are supported. To evaluate an existing model, select evaluation and specify its `pretrained_model` directory.
+- **Reuse settings from a previous run** and `--queue /path/to/script.py` create a new job using saved settings. You can also copy `script.py` into `scripts/` under a new name. Previous `run.py` and `settings.json` files are supported. To evaluate an existing model, select evaluation and specify its `pretrained_model` directory.
 
 ## Add another adapter
 
