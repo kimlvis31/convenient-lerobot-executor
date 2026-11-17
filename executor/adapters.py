@@ -9,6 +9,23 @@ import re
 
 
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+TRAINING_SWITCHES = {
+    "train_expert_only": "Train Action Expert Only",
+    "freeze_vision_encoder": "Freeze Vision Encoder",
+    "freeze_vision_backbone": "Freeze Vision Backbone",
+    "freeze_language_encoder": "Freeze Language Encoder",
+    "freeze_llm_backbone": "Freeze Language Backbone",
+    "freeze_embedding": "Freeze Embeddings",
+    "freeze_vlm_embedding": "Freeze Vision-Language Embeddings",
+    "freeze_video_expert": "Freeze Video Expert",
+    "freeze_qwen": "Freeze Qwen",
+    "tune_llm": "Train Language Model",
+    "tune_visual": "Train Vision Model",
+    "tune_projector": "Train Projector",
+    "tune_diffusion_model": "Train Diffusion Model",
+    "tune_vlln": "Train Vision-Language Normalization",
+}
+PEFT_POLICIES = frozenset({"smolvla", "pi0", "pi05", "lingbot_vla_v2", "flux3"})
 
 
 @dataclass
@@ -75,6 +92,49 @@ def weights(path):
     return path
 
 
+def training_flags(config, model):
+    scope = config.get("policy_training", {})
+    lora = config.get("lora")
+    if not isinstance(scope, dict):
+        raise ValueError("policy_training must be a dictionary.")
+    if config.get("resume") and (scope or lora is not None):
+        raise ValueError("Resumed jobs use the checkpoint's saved training settings.")
+
+    args = []
+    for name, value in scope.items():
+        valid = name in TRAINING_SWITCHES and type(value) is bool
+        if model == "molmoact2":
+            valid = valid or name == "train_mode_vlm" and value in ("fft", "lora", "freeze")
+            valid = valid or name in {"lora_rank", "lora_alpha"} and type(value) is int and value > 0
+            valid = valid or name == "lora_dropout" and type(value) in (float, int) and 0 <= value <= 1
+        if not valid:
+            raise ValueError(f"Invalid policy training option ({name}).")
+        args.append(flag(f"policy.{name}", value))
+
+    if lora is None:
+        return args
+    if (not isinstance(lora, dict) or model not in PEFT_POLICIES
+            or not config.get("pretrained") or scope):
+        raise ValueError("LoRA requires a supported policy and a pretrained checkpoint, with its default scope.")
+    if unknown := lora.keys() - {"rank", "alpha", "target_modules", "full_training_modules"}:
+        raise ValueError(f"Unknown LoRA options: {', '.join(sorted(unknown))}.")
+    args.append(flag("peft.method_type", "LORA"))
+    for key, target in (("rank", "r"), ("alpha", "lora_alpha")):
+        value = lora.get(key, 16)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"LoRA {key} must be a positive integer.")
+        args.append(flag(f"peft.{target}", value))
+    for key in ("target_modules", "full_training_modules"):
+        if key not in lora:
+            continue
+        value = lora[key]
+        module_list = isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
+        if not module_list and not (key == "target_modules" and isinstance(value, str) and value.strip()):
+            raise ValueError(f"Invalid LoRA {key}.")
+        args.append(flag(f"peft.{key}", value))
+    return args
+
+
 class NativeAdapter:
     key = "native"
     label = "Native LeRobot policy"
@@ -123,6 +183,7 @@ class NativeAdapter:
                 args.append(flag("dataset.root", cfg["dataset_root"]))
             policy_key = "policy.path" if cfg.get("pretrained") else "policy.type"
             args.append(flag(policy_key, cfg.get("pretrained") or self.settings["model"]))
+        args += training_flags(cfg, self.settings["model"])
         args += [flag("output_dir", output), flag("job_name", self.run_name), flag("steps", steps),
                  flag("log_freq", min(track_frequency(steps), cfg["save_freq"])),
                  flag("save_freq", cfg["save_freq"]), "--save_checkpoint=true", "--policy.push_to_hub=false"]
@@ -211,6 +272,8 @@ class TinyVLAAdapter(NativeAdapter):
     def train(self):
         cfg = self.settings["train"]
         output = self.train_dir / "train"
+        if cfg.get("policy_training") or cfg.get("lora") is not None:
+            raise ValueError("The TinyVLA trainer supports action-head training.")
         workspace = self.external
         require(workspace / "runtime/tinyvla_loader.py")
         loader = workspace / "runtime/tinyvla_loader.py"

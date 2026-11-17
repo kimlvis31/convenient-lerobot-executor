@@ -22,6 +22,10 @@ Use **Add Another Job?** after configuring a job to build a queue interactively.
 
 The first menu includes **Delete all evaluation results** and **Delete all training results**. Each action shows its target folder and requires confirmation. Cleanup selects run directories inside `outputs/evaluation/` or `outputs/training/`, including their logs and training checkpoints. It skips active runs and redirected folders. Example assets live in `outputs/example/` and datasets live in `datasets/`.
 
+Use **Install a benchmark** to choose a Conda environment and install the available LeRobot extras for LIBERO, PushT, ALOHA, or Meta-World. For another compatible environment, choose **Install a LeRobot environment plugin** and enter its lerobot-env-* package requirement. A registered environment appears in the evaluation menu for that Conda environment. The installer reads dependencies from the installed LeRobot version and pins existing package versions during installation. The policy and benchmark lists mark missing optional dependencies with <Not Installed>. A policy's package status is separate from its checkpoint availability.
+
+For new native training, **Training Scope** shows the component controls exposed by the selected policy. Supported policies can configure LoRA rank, scale, target modules, and fully trained modules when starting from pretrained weights. MolmoAct2 exposes its own vision-language training mode and LoRA parameters. Resume uses the checkpoint's training configuration. The bundled TinyVLA trainer updates its action head.
+
 ## Import a job queue
 
 Select **Import a job queue script** to list job queue and settings files in the project `scripts/` directory. In [example_script.py](../scripts/example_script.py), `JOBS` is an ordered list of job dictionaries. The interactive prompts fill the same fields. Specify `adapter`, `model`, and at least one of `train` or `eval` for each job. Include both stages in a single dictionary to evaluate the checkpoint produced by training.

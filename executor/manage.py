@@ -16,10 +16,12 @@ import sys
 from textwrap import indent
 from uuid import uuid4
 
-from adapters import SUITES, load_adapters, native_checkpoint, read_json
+from adapters import SUITES, TRAINING_SWITCHES, load_adapters, native_checkpoint, read_json
+from benchmarks import BENCHMARKS
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
-from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, seconds, stage_title, styled
+from runner import (ANSI, available_environments, conda_command, conda_executable, environment_catalog,
+                    execute, load_settings, seconds, stage_title, styled)
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -67,11 +69,6 @@ def section(title):
 
 def ask(question, default=None, optional=False, *, choices=(), blank_before=True):
     history = active_history.get()
-    if history is not None and history.position < len(history.answers):
-        answer = history.answers[history.position]
-        history.position += 1
-        return answer
-
     hint = styled(f"[Default: {default}]", "33") if not choices and default is not None else ""
     suffix = " " + hint if hint else ""
     if history is not None:
@@ -82,8 +79,20 @@ def ask(question, default=None, optional=False, *, choices=(), blank_before=True
     prompt = "\n".join([*choices, styled(question, "1;36") + suffix])
     if blank_before:
         prompt = "\n" + prompt
+    if history is not None:
+        position = history.position
+        if position < len(history.answers):
+            answer = history.answers[position]
+            history.position += 1
+            if not history.replaying:
+                history.marks[position] = history.display.rows
+                print(f"{prompt}: {answer}", flush=True)
+            return answer
+        history.replaying = False
+
     read = sys.stdout.read if isinstance(sys.stdout, QuestionDisplay) else input
     while True:
+        mark = history.display.rows if history is not None else None
         value = read(f"{prompt}: ").strip()
         if not sys.stdin.isatty():
             print()
@@ -93,6 +102,7 @@ def ask(question, default=None, optional=False, *, choices=(), blank_before=True
             answer = value if value else default if default is not None else ""
             if history is not None:
                 history.answers.append(answer)
+                history.marks.append(mark)
                 history.position += 1
             return answer
 
@@ -121,18 +131,25 @@ def rate(question, default):
         print("Enter a positive number.")
 
 
-def choose(question, options, default=1, *, details=None, blank_before=True):
+def choose(question, options, default=1, *, details=None, groups=None, unavailable=(), blank_before=True):
     choices = []
     labels = [ANSI.sub("", label) for _, label in options]
-    detail_column = max((len(label) for (value, _), label in zip(options, labels)
-                         if details and value in details), default=0)
+    columns = {}
+    if details:
+        for (value, _), label in zip(options, labels):
+            if value in details:
+                group = groups.get(value) if groups else None
+                columns[group] = max(columns.get(group, 0), len(label))
     number_width = len(str(len(options))) if details else 1
     for index, ((value, label), plain_label) in enumerate(zip(options, labels), 1):
         row = f"  {index:>{number_width}}. {label}"
         if index == default:
             row = styled(ANSI.sub("", row), "33")
         if details and value in details:
-            row += " " * (detail_column - len(plain_label) + 3) + styled(details[value], "90")
+            group = groups.get(value) if groups else None
+            row += " " * (columns[group] - len(plain_label) + 3) + styled(details[value], "90")
+        if value in unavailable:
+            row = styled(ANSI.sub("", row) + " <Not Installed>", "2;90")
         if index == default:
             row += styled(" [Default]", "33")
         choices.append(row)
@@ -240,19 +257,22 @@ def model_size(model):
     return f"[{amount} {unit}]"
 
 
-def choose_policy(adapters, policies):
+def choose_policy(adapters, policies, unavailable=()):
     native_tag = "[LeRobot Native]"
     external_tag = "[External]"
     native = styled(native_tag, "38;5;75")
-    external = styled(external_tag, "38;5;208") + " " * (len(native_tag) - len(external_tag))
+    external = styled(external_tag, "38;5;208")
     if not policies:
         print("\nCould not read the LeRobot model list. You can enter a model name manually.")
     entries = [(("native", model), f"{native} {model}") for model in sorted(policies)]
     entries.append((("native", ""), f"{native} Enter a model name manually"))
     entries += [((key, key), f"{external} {adapters[key].label}") for key in sorted(adapters) if key != "native"]
     sizes = {value: model_size(value[1]) for value, _ in entries if value[1]}
-    default = next((index for index, (value, _) in enumerate(entries, 1) if value == ("native", "smolvla")), 1)
-    backend, model = choose("Policy Model", entries, default=default, details=sizes)
+    groups = {value: "native" if value[0] == "native" else "external" for value, _ in entries}
+    enabled = [index for index, (value, _) in enumerate(entries, 1) if value not in unavailable]
+    default = next((index for index in enabled if entries[index - 1][0] == ("native", "smolvla")), enabled[0])
+    backend, model = choose("Policy Model", entries, default=default, details=sizes,
+                            groups=groups, unavailable=unavailable)
     if not model:
         model = ask("LeRobot Policy Name", "smolvla")
     elif backend not in {"native", "tinyvla"}:
@@ -260,8 +280,60 @@ def choose_policy(adapters, policies):
     return backend, model
 
 
-def native_train(resume, inventory, model):
+def configure_training_scope(train, model, catalog):
+    fields = catalog.get("training", {}).get(model, ())
+    methods = [("default", "Use policy or checkpoint defaults")]
+    if fields:
+        methods.append(("parts", "Choose trainable components"))
+    if train.get("pretrained") and model in catalog.get("peft_policies", ()):
+        methods.append(("lora", "Train LoRA adapters"))
+    if len(methods) == 1:
+        print("Training Scope · Policy or checkpoint defaults")
+        return
+    missing = {"lora"} if not catalog.get("peft_ready") else set()
+    mode = choose("Training Scope", methods, unavailable=missing)
+    if mode == "parts":
+        scope = {}
+        for field in fields:
+            if field == "train_mode_vlm":
+                vlm_mode = choose("Vision-Language Training Mode", [
+                    ("default", "Keep the policy or checkpoint setting"),
+                    ("fft", "Train the vision-language model"),
+                    ("freeze", "Freeze the vision-language model"),
+                    ("lora", "Train vision-language LoRA adapters"),
+                ])
+                if vlm_mode != "default":
+                    scope[field] = vlm_mode
+                if vlm_mode == "lora":
+                    scope["lora_rank"] = number("LoRA Rank", 64)
+                    scope["lora_alpha"] = number("LoRA Alpha", 16)
+                    scope["lora_dropout"] = number("LoRA Dropout Percent", 5, 0, 100) / 100
+                continue
+            value = choose(TRAINING_SWITCHES[field], [
+                (None, "Keep the policy or checkpoint setting"), (True, "Yes"), (False, "No"),
+            ])
+            if value is not None:
+                scope[field] = value
+        if scope:
+            train["policy_training"] = scope
+    if mode == "lora":
+        if "lora" in missing:
+            print("Install the LeRobot peft extra in the model's Conda environment before running.")
+        lora = {"rank": number("LoRA Rank", 16), "alpha": number("LoRA Alpha", 16)}
+        targets = ask("LoRA Target Modules (regular expression, blank uses model defaults)", optional=True)
+        if targets:
+            lora["target_modules"] = targets
+        full = ask("Fully Train Modules (comma-separated, none, or blank for defaults)", optional=True)
+        if full:
+            lora["full_training_modules"] = [] if full.casefold() == "none" else [
+                name.strip() for name in full.split(",") if name.strip()
+            ]
+        train["lora"] = lora
+
+
+def native_train(resume, inventory, model, catalog=None):
     if resume:
+        print("Training Scope · Restore checkpoint settings")
         models = {path: kind for path, kind in inventory.models}
         options = [(path, model_location(inventory, path)) for path in inventory.native_resume
                    if models.get(path, model) == model]
@@ -286,6 +358,7 @@ def native_train(resume, inventory, model):
                  "pretrained": choose_model(inventory, model, optional=True),
                  "batch": number("Training Batch Size", 8), "device": ask("Training Device", "cuda"),
                  "seed": number("Random Seed", 0, 0)}
+        configure_training_scope(train, model, catalog or {})
     train.update(steps=number("Target Training Step Count", old_steps),
                  save_freq=number("Checkpoint Interval in Steps", 100), extra=extra_flags())
     return train
@@ -308,19 +381,20 @@ def evaluation_suites(train, tiny):
     return [choice]
 
 
-def eval_settings(model, tiny, train, inventory):
-    if tiny:
-        env_type = choose("Evaluation Benchmark", [("libero", "LIBERO (supported by TinyVLA)")])
-    else:
-        env_type = choose("Evaluation Benchmark", [
-            ("libero", "LIBERO"),
-            ("pusht", "PushT"),
-            ("aloha", "ALOHA"),
-            ("metaworld", "Meta-World"),
-            ("manual", "Enter a LeRobot environment type"),
-        ])
-        if env_type == "manual":
-            env_type = ask("LeRobot Environment Type")
+def eval_settings(model, tiny, train, inventory, catalog=None):
+    catalog = catalog or {}
+    unavailable = {kind for kind, ready in catalog.get("benchmarks", {}).items() if not ready}
+    options = [("libero", "LIBERO (supported by TinyVLA)")] if tiny else list(BENCHMARKS)
+    if not tiny:
+        known = {kind for kind, _ in options}
+        options.extend((kind, kind) for kind in catalog.get("plugins", ()) if kind not in known)
+        options.append(("manual", "Enter a LeRobot environment type"))
+    default = next((index for index, (kind, _) in enumerate(options, 1) if kind not in unavailable), 1)
+    env_type = choose("Evaluation Benchmark", options, default=default, unavailable=unavailable)
+    if env_type == "manual":
+        env_type = ask("LeRobot Environment Type")
+    if env_type in unavailable:
+        print("Use Install a benchmark in the first menu to prepare this environment before running.")
 
     if env_type == "libero":
         tasks = evaluation_suites(train, tiny)
@@ -426,10 +500,68 @@ def delete_result_runs(root, category, *, notice=print):
     return deleted > 0
 
 
+def install_benchmark_menu(conda, root, environments, native_env, catalogs):
+    choices = [(name, name) for name in sorted(environments)]
+    default = next((index for index, (name, _) in enumerate(choices, 1) if name == native_env), 1)
+    target = choose("Conda Environment", choices, default=default)
+    if target not in catalogs:
+        catalogs[target] = environment_catalog(conda, target, root)
+    catalog = catalogs[target]
+    if not catalog:
+        return f"Could not inspect LeRobot in {target}. Select an environment with LeRobot installed."
+    installed = catalog.get("benchmarks", {})
+    missing = {kind for kind, ready in installed.items() if not ready}
+    options = [(kind, label) for kind, label in BENCHMARKS if kind in installed]
+    options.append(("plugin", "Install a LeRobot environment plugin"))
+    default = next((index for index, (kind, _) in enumerate(options, 1) if kind in missing), 1)
+    selection = choose("Benchmark to Install", options, default=default, unavailable=missing)
+    if installed.get(selection):
+        return f"{selection} is already installed in {target}."
+    argument = ask("LeRobot Environment Plugin Package") if selection == "plugin" else selection
+    if ask(f"Install {argument} in {target}? (Y/N)", "N").upper() != "Y":
+        return "Benchmark Installation Canceled."
+
+    installer = Path(__file__).with_name("benchmarks.py")
+    option = "--plugin" if selection == "plugin" else "--install"
+    print(f"Installing {argument} in {target}…", flush=True)
+    result = subprocess.run(conda_command(conda, target, ["python", "-B", str(installer), option, argument]),
+                            cwd=root, text=True, encoding="utf-8", errors="replace",
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    refreshed = environment_catalog(conda, target, root)
+    catalogs[target] = refreshed
+    if result.returncode:
+        return result.stdout.strip() or f"Could not install {argument} in {target}."
+    if selection == "plugin":
+        new_types = sorted(set(refreshed.get("plugins", ())) - set(catalog.get("plugins", ())))
+        if new_types:
+            return f"Installed {argument} in {target}. Available environments: {', '.join(new_types)}."
+        return f"Package ready in {target}. Use the environment type registered by the plugin."
+    if not refreshed.get("benchmarks", {}).get(selection):
+        return f"Installation finished in {target}, but {selection} could not be verified."
+    return f"Installed {argument} in {target}."
+
+
+def show_inventory(display, inventory, environments):
+    display.clear(start=0)
+    section("Status")
+    show(inventory, environments, limit=5)
+    display.mark()
+
+
 def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
-           external=None, environments=(), allow_delete=True):
+           external=None, environments=(), env_map=None, allow_changes=True):
     display = QuestionDisplay(sys.stdout, section)
+    mapping = env_map or {}
+    catalogs = {}
+
+    def catalog_for(model=None):
+        env = mapping.get(model, native_env)
+        if env not in catalogs:
+            catalogs[env] = environment_catalog(conda, env, root)
+        return catalogs[env]
+
     with redirect_stdout(display):
+        show_inventory(display, inventory, environments)
         while True:
             display.show()
             actions = [("new", "Configure a new job")]
@@ -438,9 +570,11 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             actions.append(("import", "Import a job queue script"))
             if inventory.results:
                 actions.append(("results", "View existing results"))
-            if allow_delete:
+            if allow_changes:
                 actions.extend((("evaluation", "Delete all evaluation results"),
                                 ("training", "Delete all training results")))
+                if conda and environments:
+                    actions.append(("install", "Install a benchmark"))
             actions.append(("quit", "Exit"))
             action = choose("What Would You Like to Do?", actions, blank_before=False)
             if action == "quit":
@@ -449,8 +583,22 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             history = QuestionHistory(display)
             try:
                 if action == "new":
-                    policies = native_policies(conda, native_env, root)
-                    return configure_jobs(adapters, inventory, root, policies, display)
+                    catalog = catalog_for()
+                    policies = catalog.get("policies", {})
+                    unavailable = {
+                        ("native", model) for model, ready in policies.items()
+                        if not catalog_for(model).get("policies", {}).get(model, ready)
+                    }
+                    tiny_env = mapping.get("tinyvla", DEFAULT_ENVIRONMENTS["tinyvla"])
+                    if tiny_env == "tinyvla_infer" and "lerobot_tinyvla" in environments and tiny_env not in environments:
+                        tiny_env = "lerobot_tinyvla"
+                    if catalog and (not catalog.get("tinyvla_bridge") or environments and tiny_env not in environments):
+                        unavailable.add(("tinyvla", "tinyvla"))
+                    return configure_jobs(adapters, inventory, root, policies, display, catalog_for, unavailable)
+                if action == "install":
+                    message = history.run(lambda: install_benchmark_menu(conda, root, environments, native_env, catalogs))
+                    display.notice(message)
+                    continue
                 if action == "reuse":
                     files = [(p, str(p)) for p in inventory.settings]
                     path = history.run(lambda: select_path("Settings File", files))
@@ -460,12 +608,14 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
                     path = history.run(lambda: select_path("Job Queue Script", scripts))
                     return load_settings(path)
                 if action in {"evaluation", "training"}:
-                    deleted = history.run(lambda: delete_result_runs(root, action, notice=display.notice))
+                    messages = []
+                    deleted = history.run(lambda: delete_result_runs(root, action, notice=messages.append))
                     if deleted:
                         inventory = scan(root, external or root / "externals/TinyVLA", root / "executor/log")
-                        with redirect_stdout(display.stream):
-                            section("Status")
-                            show(inventory, environments, limit=5)
+                        if display.terminal:
+                            show_inventory(display, inventory, environments)
+                    for message in messages:
+                        display.notice(message)
                     continue
                 files = [(p, str(p)) for p in inventory.results]
                 path = history.run(lambda: select_path("Result File", files))
@@ -478,9 +628,9 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             display.notice(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
 
-def configure_jobs(adapters, inventory, root, policies, display):
+def configure_jobs(adapters, inventory, root, policies, display, catalog_for, unavailable):
     def configure():
-        job = configure_job(adapters, inventory, root, policies)
+        job = configure_job(adapters, inventory, root, policies, catalog_for, unavailable)
         return job, ask("Add Another Job? (Y/N)", "N").upper() == "Y"
 
     jobs = []
@@ -501,8 +651,8 @@ def configure_jobs(adapters, inventory, root, policies, display):
         histories.append(QuestionHistory(display))
 
 
-def configure_job(adapters, inventory, root, policies):
-    backend, model = choose_policy(adapters, policies)
+def configure_job(adapters, inventory, root, policies, catalog_for, unavailable):
+    backend, model = choose_policy(adapters, policies, unavailable)
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
                ("both", "Train, then evaluate")]
@@ -514,15 +664,16 @@ def configure_job(adapters, inventory, root, policies):
         print("\n" + styled("Training Setup", "1;36"))
         if tiny:
             print("\nTraining benchmark · LIBERO")
+            print("Training Scope · Action head")
             cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
         else:
-            cfg["train"] = native_train(operation == "resume", inventory, model)
+            cfg["train"] = native_train(operation == "resume", inventory, model, catalog_for(model))
     evaluate = operation in ("eval", "both") or (
         operation in ("resume", "warm") and ask("Evaluate After Training? (Y/N)", "N").upper() == "Y"
     )
     if evaluate:
         print("\n" + styled("Evaluation Setup", "1;36"))
-        cfg["eval"] = eval_settings(cfg["model"], tiny, cfg.get("train"), inventory)
+        cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, catalog_for(None if tiny else model))
     return cfg
 
 
@@ -634,14 +785,15 @@ def plan(args):
         _, external = paths_for(args, settings or {})
         detected[PROJECT_ROOT] = available_environments(conda, PROJECT_ROOT)
         inventory = scan(PROJECT_ROOT, external, LOG_ROOT)
-        section("Status")
-        show(inventory, detected[PROJECT_ROOT], limit=None if args.inventory else 5)
         if args.inventory:
+            section("Status")
+            show(inventory, detected[PROJECT_ROOT])
             return [], conda
         env_map = read_json(args.env_map) if args.env_map else {}
         native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
         settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env,
-                          external=external, environments=detected[PROJECT_ROOT], allow_delete=not args.dry_run)
+                          external=external, environments=detected[PROJECT_ROOT], env_map=env_map,
+                          allow_changes=not args.dry_run)
         if settings is None:
             return [], conda
 

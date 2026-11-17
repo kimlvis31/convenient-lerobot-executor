@@ -23,6 +23,7 @@ class QuestionDisplay:
         self.terminal = stream.isatty() and sys.stdin.isatty() and os.environ.get("TERM") != "dumb"
         self.rows = 0
         self.column = 0
+        self.boundary = 0
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
@@ -43,6 +44,9 @@ class QuestionDisplay:
                 self.column += cells
 
     def write(self, text):
+        history = active_history.get()
+        if history is not None and history.replaying:
+            return len(text)
         if self.terminal:
             self._record(text)
         return self.stream.write(text)
@@ -55,12 +59,17 @@ class QuestionDisplay:
         self._record(value + "\n")
         return value
 
-    def clear(self):
-        if self.terminal and (self.rows or self.column):
-            up = f"\x1b[{self.rows}F" if self.rows else "\r"
+    def mark(self):
+        self.boundary = self.rows
+
+    def clear(self, start=None):
+        start = self.boundary if start is None else start
+        distance = self.rows - start
+        if self.terminal and (distance or self.column):
+            up = f"\x1b[{distance}F" if distance else "\r"
             self.stream.write(up + "\x1b[J")
             self.stream.flush()
-        self.rows = 0
+        self.rows = start
         self.column = 0
 
     def show(self, job_number=None):
@@ -71,33 +80,41 @@ class QuestionDisplay:
 
     def notice(self, message):
         self.clear()
-        print(message, file=self.stream, flush=True)
+        print(message, file=self, flush=True)
+        self.mark()
 
 
 class QuestionHistory:
     def __init__(self, display):
         self.display = display
         self.answers = []
+        self.marks = []
         self.position = 0
+        self.replaying = False
 
     def run(self, configure, job_number=None):
         token = active_history.set(self)
         try:
+            self.replaying = False
+            self.display.show(job_number)
             while True:
                 self.position = 0
-                self.display.show(job_number)
                 try:
                     return configure()
                 except PreviousQuestion:
                     if not self.answers:
                         raise
-                    self.rewind()
+                    self.display.clear(self.rewind())
+                    self.replaying = True
         finally:
             active_history.reset(token)
 
     def rewind(self):
         self.position -= 1
+        mark = self.marks[self.position]
         del self.answers[self.position:]
+        del self.marks[self.position:]
+        return mark
 
 
 def retry_question():

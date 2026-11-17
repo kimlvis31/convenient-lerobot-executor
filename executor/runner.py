@@ -70,30 +70,20 @@ def available_environments(conda, root):
         return set()
 
 
-def native_policies(conda, name, root):
+def environment_catalog(conda, name, root):
     if not conda:
-        return []
-    probe = """
-import json
-import lerobot.policies
-from lerobot.configs import PreTrainedConfig
-
-policies = PreTrainedConfig.get_known_choices()
-print("MANAGER_POLICIES " + json.dumps(sorted(
-    name for name, config in policies.items()
-    if config.__module__.startswith("lerobot.policies.")
-)))
-"""
+        return {}
+    probe = Path(__file__).with_name("benchmarks.py")
     try:
-        result = subprocess.run(conda_command(conda, name, ["python", "-B", "-c", probe]), cwd=root,
-                                text=True, encoding="utf-8", errors="replace", capture_output=True,
-                                timeout=20, check=True)
+        result = subprocess.run(conda_command(conda, name, ["python", "-B", str(probe), "--catalog"]),
+                                cwd=root, text=True, encoding="utf-8", errors="replace",
+                                capture_output=True, timeout=45, check=True)
         for line in reversed(result.stdout.splitlines()):
-            if line.startswith("MANAGER_POLICIES "):
-                return json.loads(line.removeprefix("MANAGER_POLICIES "))
+            if line.startswith("MANAGER_CATALOG "):
+                return json.loads(line.removeprefix("MANAGER_CATALOG "))
     except (OSError, ValueError, subprocess.SubprocessError):
-        return []
-    return []
+        pass
+    return {}
 
 
 def resolve_environment(conda, name, root):

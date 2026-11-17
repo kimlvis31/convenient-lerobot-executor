@@ -9,9 +9,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
+from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json, training_flags
 from inventory import Inventory, scan, show
-from manage import ask, choose_policy, delete_result_runs, eval_settings, main, model_size, normalize_paths, number, plan, settings_jobs, show_job_result, show_settings, wizard
+from manage import (ask, choose_policy, configure_training_scope, delete_result_runs, eval_settings,
+                    install_benchmark_menu, main, model_size, normalize_paths, number, plan,
+                    settings_jobs, show_job_result, show_settings, wizard)
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -270,7 +272,7 @@ class ManagerTests(unittest.TestCase):
             {**sample_settings(), "label": "second"},
         ]
         with patch("sys.stdin", io.StringIO("1\nY\nN\n")), \
-             patch("manage.native_policies", return_value=["smolvla"]), \
+             patch("manage.environment_catalog", return_value={"policies": {"smolvla": True}}), \
              patch("manage.configure_job", side_effect=jobs), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
             settings = wizard(load_adapters([]), Inventory(), self.root)
@@ -289,7 +291,7 @@ class ManagerTests(unittest.TestCase):
             return settings
 
         answers = io.StringIO("1\nfirst\ninvalid\n60\nB\n80\nY\nB\nN\n")
-        with patch("sys.stdin", answers), patch("manage.native_policies", return_value=["smolvla"]), \
+        with patch("sys.stdin", answers), patch("manage.environment_catalog", return_value={"policies": {"smolvla": True}}), \
              patch("manage.configure_job", side_effect=configure), contextlib.redirect_stdout(io.StringIO()) as menu:
             settings = wizard(load_adapters([]), Inventory(), self.root)
         job, = settings_jobs(settings)
@@ -531,18 +533,54 @@ class ManagerTests(unittest.TestCase):
     def test_policy_menu_lists_native_models_before_external_models(self):
         answers = io.StringIO("4\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
-            selected = choose_policy(load_adapters([]), ["xvla", "act"])
+            selected = choose_policy(load_adapters([]), ["xvla", "act"], {("native", "xvla")})
         self.assertEqual(selected, ("tinyvla", "tinyvla"))
         rows = [line.strip() for line in menu.getvalue().splitlines() if "Native]" in line or "External]" in line]
         self.assertTrue(rows[0].startswith("1. [LeRobot Native] act"))
         self.assertTrue(rows[0].endswith("[51.7 M] [Default]"))
-        self.assertTrue(rows[1].endswith("[879.7 M]"))
+        self.assertTrue(rows[1].endswith("[879.7 M] <Not Installed>"))
         self.assertIn("3. [LeRobot Native] Enter a model name manually", rows[2])
         self.assertIn("TinyVLA   [740.4 M]", rows[3])
-        self.assertEqual(rows[0].index("act"), rows[3].index("TinyVLA"))
+        self.assertEqual(rows[0].index("act"), rows[1].index("xvla"))
         self.assertEqual(rows[0].index("[51.7 M]"), rows[1].index("[879.7 M]"))
-        self.assertEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
+        self.assertNotEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
         self.assertIn("Policy Model:", menu.getvalue())
+
+    def test_benchmark_menu_installs_in_selected_environment_and_refreshes_catalog(self):
+        catalogs = {"lerobot": {"benchmarks": {"libero": True, "pusht": False}}}
+        refreshed = {"benchmarks": {"libero": True, "pusht": True}}
+        with patch("sys.stdin", io.StringIO("\n\nY\n")), \
+             patch("manage.subprocess.run") as subprocess, \
+             patch("manage.environment_catalog", return_value=refreshed), \
+             contextlib.redirect_stdout(io.StringIO()) as menu:
+            subprocess.return_value.returncode = 0
+            message = install_benchmark_menu("conda", self.root, {"lerobot"}, "lerobot", catalogs)
+        command = subprocess.call_args.args[0]
+        self.assertEqual(command[:5], ["conda", "run", "--no-capture-output", "-n", "lerobot"])
+        self.assertEqual(command[-2:], ["--install", "pusht"])
+        self.assertIn("PushT <Not Installed>", menu.getvalue())
+        self.assertEqual(message, "Installed pusht in lerobot.")
+        self.assertTrue(catalogs["lerobot"]["benchmarks"]["pusht"])
+
+    def test_training_scope_and_lora_map_to_native_flags(self):
+        catalog = {"training": {"smolvla": ["freeze_vision_encoder"]},
+                   "peft_policies": ["smolvla"], "peft_ready": True}
+        train = {"pretrained": "lerobot/smolvla_base"}
+        with patch("sys.stdin", io.StringIO("3\n8\n16\nq_proj\nnone\n")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            configure_training_scope(train, "smolvla", catalog)
+        self.assertEqual(train["lora"], {"rank": 8, "alpha": 16, "target_modules": "q_proj",
+                                        "full_training_modules": []})
+        self.assertEqual(training_flags(train, "smolvla"), [
+            "--peft.method_type=LORA", "--peft.r=8", "--peft.lora_alpha=16",
+            "--peft.target_modules=q_proj", "--peft.full_training_modules=[]",
+        ])
+        with self.assertRaises(ValueError):
+            training_flags({**train, "resume": "checkpoint"}, "smolvla")
+        train = {}
+        with patch("sys.stdin", io.StringIO("2\n2\n")), contextlib.redirect_stdout(io.StringIO()):
+            configure_training_scope(train, "smolvla", catalog)
+        self.assertEqual(training_flags(train, "smolvla"), ["--policy.freeze_vision_encoder=true"])
 
     def test_model_size_uses_parameter_units_or_na(self):
         self.assertEqual(model_size("diffusion"), "[262.7 M]")
