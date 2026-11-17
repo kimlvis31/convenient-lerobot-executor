@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import model_location, scan, show
-from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, seconds, styled
+from runner import ANSI, STAGE_LABELS, available_environments, conda_executable, execute, load_settings, native_policies, seconds, styled
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -52,10 +52,13 @@ LOG_ROOT = PROJECT_ROOT / "executor/log"
 SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
+def divider():
+    print(styled("-" * shutil.get_terminal_size().columns, "90"), flush=True)
+
+
 def section(title):
-    width = shutil.get_terminal_size().columns
-    print(styled("-" * width, "90"))
-    print(styled(f"<{title}>", "1;95"))
+    divider()
+    print(styled(f"<{title}>", "1;95"), flush=True)
 
 
 def ask(question, default=None, optional=False, *, choices=()):
@@ -511,6 +514,31 @@ def plan(args):
     return plans, conda
 
 
+def command_preview(arguments):
+    groups = []
+    for argument in arguments:
+        if not groups or argument.startswith("--"):
+            groups.append([])
+        groups[-1].append(argument)
+    return " \\\n".join(f"    {shlex.join(group)}" for group in groups)
+
+
+def show_settings(plans, show_commands):
+    for index, (cfg, stages, _, _) in enumerate(plans, 1):
+        if index > 1:
+            print()
+        title = styled(f"[Job {index}]", "1;36")
+        print(f"{title} {cfg.get('label') or cfg['model']}")
+        for stage in stages:
+            print(f"  {STAGE_LABELS[stage.name]} · Environment {stage.environment}")
+            if show_commands:
+                print(command_preview(stage.arguments))
+        evaluation = cfg.get("eval")
+        if evaluation and evaluation["batch"] > evaluation["episodes"]:
+            print(f"  Effective evaluation batch size: {evaluation['episodes']} "
+                  f"({evaluation['batch']} requested, {evaluation['episodes']} episodes per task)")
+
+
 def run_plans(plans, conda, verbose):
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
         if len(plans) > 1:
@@ -549,26 +577,27 @@ def evaluation_summary(output):
         average = total / episodes
     average_text = f"{average:.2f} s" if average is not None else "N/A"
 
-    lines = [f"Overall success rate: {success_rate(overall)}"]
+    lines = [f"• Overall success rate: {success_rate(overall)}"]
     groups = info.get("per_group")
     if isinstance(groups, dict) and groups:
-        lines.append("Suite success rates:")
-        lines.extend(f"  {name}: {success_rate(stats)}" for name, stats in groups.items())
+        lines.append("• Suite success rates:")
+        lines.extend(f"  • {name}: {success_rate(stats)}" for name, stats in groups.items())
     else:
-        lines.append("Suite success rates: N/A")
-    lines.extend((f"Total evaluation time: {seconds(total)}",
-                  f"Average time per episode: {average_text}", f"Result path: {output}"))
+        lines.append("• Suite success rates: N/A")
+    lines.extend((f"• Total evaluation time: {seconds(total)}",
+                  f"• Average time per episode: {average_text}", f"• Result path: {output}"))
     return "\n".join(lines)
 
 
 def finish(plans):
-    section("Finish")
+    section("Result")
     outputs = [stage.output for _, stages, _, _ in plans
                for stage in stages if stage.name == "eval" and stage.output is not None]
     if outputs:
         print("\n\n".join(evaluation_summary(output) for output in outputs))
     else:
         print(styled(f"Completed {len(plans)} {'job' if len(plans) == 1 else 'jobs'}.", "32"))
+    divider()
 
 
 def main():
@@ -590,38 +619,28 @@ def main():
         if not plans:
             return 0
         section("Settings")
-        show_commands = not (args.settings or args.queue) or args.dry_run
-        for index, (cfg, stages, _, _) in enumerate(plans, 1):
-            if show_commands:
-                if len(plans) > 1:
-                    print(f"Job {index}/{len(plans)} · {cfg.get('label') or cfg['model']}")
-                for stage in stages:
-                    print(f"{stage.name} [{stage.environment}] {shlex.join(stage.arguments)}")
-            else:
-                print(f"{cfg.get('label') or cfg['model']} · " + ", ".join(
-                    f"{stage.name} [{stage.environment}]" for stage in stages))
-            evaluation = cfg.get("eval")
-            if evaluation and evaluation["batch"] > evaluation["episodes"]:
-                print(f"Effective evaluation batch size: {evaluation['episodes']} "
-                      f"({evaluation['batch']} requested, {evaluation['episodes']} episodes per task)")
+        show_settings(plans, show_commands=not (args.settings or args.queue) or args.dry_run)
         if args.dry_run:
             return 0
         if not (args.settings or args.queue) and ask(f"Run {len(plans)} job(s)? (y/N)", "n").lower() != "y":
-            section("Finish")
+            section("Result")
             print("Run canceled.")
+            divider()
             return 0
         section("Progress")
         run_plans(plans, conda or conda_executable(args.conda), args.verbose)
         finish(plans)
         return 0
     except (KeyboardInterrupt, EOFError):
-        section("Finish")
-        print("Run interrupted.", file=sys.stderr)
+        section("Result")
+        print("Run interrupted.", file=sys.stderr, flush=True)
+        divider()
         return 130
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.TimeoutExpired) as error:
-        section("Finish")
-        print(f"Run failed ({error})", file=sys.stderr)
+        section("Result")
+        print(f"Run failed ({error})", file=sys.stderr, flush=True)
+        divider()
         return 1
 
 

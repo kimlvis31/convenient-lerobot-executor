@@ -35,7 +35,8 @@ def track_parallel_rollouts(evaluator):
             task_state.remaining -= count
             with lock:
                 completed += count
-                print(f"[Eval progress] Episodes completed: {completed}", flush=True)
+                print(f"[Eval progress] Rollout ended: {task_state.label}\n"
+                      f"[Eval progress] Episodes completed: {completed}", flush=True)
         return result
 
     @wraps(original_trange)

@@ -49,7 +49,7 @@ Use `--name=value` for additional LeRobot options. For example, set a camera map
 
 ## Results and resume
 
-After evaluation, the Finish section shows overall and per-suite success rates, total evaluation time, average time per episode, and the result path.
+After evaluation, the Result section shows overall and per-suite success rates, total evaluation time, average time per episode, and the result path.
 
 After you confirm the settings, the executor generates and runs one script per job.
 
@@ -62,7 +62,7 @@ After you confirm the settings, the executor generates and runs one script per j
 | `outputs/training/<run-name>/` | Checkpoints, training results, and the saved dataset split where applicable |
 | `outputs/evaluation/<run-name>/` | Evaluation results and videos saved by LeRobot |
 
-With Rich installed, the terminal updates the job gauge in place. Evaluation adds a reference gauge for the latest reported rollout, with control steps elapsed and the environment's step limit. Episodes can finish before that limit. Parallel TinyVLA evaluation labels the reference gauge with the suite and task ID. Install it with `python -m pip install rich` in the environment that runs the executor if needed. Redirected output uses plain lines so progress can be read from a file or pipeline.
+With Rich installed, the terminal updates the job gauge in place. Evaluation adds an episode gauge with steps elapsed and the environment's step limit. Episodes can finish before that limit. In parallel TinyVLA evaluation, the episode gauge shows the active batch with the lowest completion percentage and labels it with the suite and task ID. Install it with `python -m pip install rich` in the environment that runs the executor if needed. Redirected output uses plain lines so progress can be read from a file or pipeline.
 
 The status line shows overall completion, the current stage's completed and total units, and the estimated time remaining in hours, minutes, and seconds. Training counts optimizer steps. Evaluation counts completed episodes from LeRobot's reported batches. Seconds Per Episode shows the measured elapsed time divided by the number of completed episodes, including episodes processed in parallel. The executor estimates the whole job when it has measured timings for the remaining stages, including prior compatible TinyVLA evaluation timings. Otherwise it announces the current-stage ETA when measured progress is available. Estimated Time of Completion shows a remaining duration, with a day count for durations of 24 hours or more. It shows N/A when there is no usable estimate.
 

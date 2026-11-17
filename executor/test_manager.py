@@ -2,6 +2,7 @@ import contextlib
 from dataclasses import asdict
 import io
 import json
+import shlex
 from pathlib import Path
 import sys
 import tempfile
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan, show
-from manage import choose_policy, eval_settings, finish, model_size, normalize_paths, number, plan, run_plans, settings_jobs, wizard
+from manage import choose_policy, eval_settings, finish, model_size, normalize_paths, number, plan, run_plans, settings_jobs, show_settings, wizard
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -103,6 +104,11 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(status["status"], "completed")
         self.assertTrue(status["ended_at"] >= status["started_at"])
         self.assertGreater(status["seconds"], 0)
+        self.assertIn(
+            f"Evaluation · Environment smolvla_env\nRun script: {run / 'run.py'}\n"
+            f"Output directory: {adapter.eval_dir}\n[Status]\n[Total]",
+            text.getvalue(),
+        )
         self.assertRegex(text.getvalue(), r"100\.000 % \| 2/2 Episodes \| Seconds Per Episode: \d+\.\d{2} s \| Estimated Time of Completion: 00:00:00")
         script = run / "run.py"
         self.assertEqual(load_settings(script), settings)
@@ -271,6 +277,18 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(scan(self.root, self.external, self.logs).settings, [training / "script.py"])
         self.assertFalse(self.logs.exists())
 
+    def test_settings_numbers_a_single_job_and_wraps_the_shell_command(self):
+        command = ["python", "-u", "path with spaces/eval.py", "--env.type=libero", "--title", "one 'two'"]
+        stage = Stage("eval", "lerobot", command, (), 4)
+        plans = [({"model": "smolvla", "label": "Evaluate on LIBERO"}, [stage], self.logs, self.root)]
+        with contextlib.redirect_stdout(io.StringIO()) as text:
+            show_settings(plans, show_commands=True)
+        title, environment, preview = text.getvalue().split("\n", 2)
+        self.assertEqual(title, "[Job 1] Evaluate on LIBERO")
+        self.assertEqual(environment, "  Evaluation · Environment lerobot")
+        self.assertGreater(len(preview.splitlines()), 1)
+        self.assertEqual(shlex.split(preview.replace("\\\n", "")), command)
+
     def test_finish_summarizes_completed_evaluations(self):
         output = self.root / "evaluation"
         output.mkdir()
@@ -281,14 +299,15 @@ class ManagerTests(unittest.TestCase):
         stage = Stage("eval", "lerobot", [], (), 4, output=output)
         with contextlib.redirect_stdout(io.StringIO()) as text:
             finish([({}, [stage], output / "executor", self.root)])
-        self.assertIn("<Finish>", text.getvalue())
-        self.assertIn("Overall success rate: 3/4 (75.00%)", text.getvalue())
-        self.assertIn("  libero_object: 1/2 (50.00%)", text.getvalue())
-        self.assertIn("  libero_goal: 2/2 (100.00%)", text.getvalue())
+        self.assertIn("<Result>", text.getvalue())
+        self.assertIn("• Overall success rate: 3/4 (75.00%)", text.getvalue())
+        self.assertIn("  • libero_object: 1/2 (50.00%)", text.getvalue())
+        self.assertIn("  • libero_goal: 2/2 (100.00%)", text.getvalue())
         self.assertIn("Total evaluation time: 00:00:09", text.getvalue())
         self.assertIn("Average time per episode: 2.20 s", text.getvalue())
         self.assertIn(f"Result path: {output}", text.getvalue())
         self.assertNotIn("Completed 1 job.", text.getvalue())
+        self.assertRegex(text.getvalue(), r"\n-+\n\Z")
 
         report = {"aggregated": {"n_episodes": 2, "pc_success": 50, "eval_s": 3}}
         (output / "eval_info.json").write_text(json.dumps(report), encoding="utf-8")
@@ -343,7 +362,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(progress.fraction(), 0.99)
         self.assertAlmostEqual(progress.average(), 7 / 6)
         self.assertEqual(status_line(99, 6, 6, "eval", None, progress.average()),
-                         "[Status] Completion: 99.000 % | 6/6 Episodes | Seconds Per Episode: 1.17 s | Estimated Time of Completion: N/A")
+                         "[Total] Completion: 99.000 % | 6/6 Episodes | Seconds Per Episode: 1.17 s | Estimated Time of Completion: N/A")
         self.assertIsNone(progress.eta())
 
     def test_inventory_lists_complete_hugging_face_snapshots_without_assuming_resume_state(self):
@@ -372,9 +391,9 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(progress.update("step:2/8", 14))
         self.assertEqual(progress.eta(), 12)
         self.assertEqual(status_line(25, 2, 8, "train", progress.eta()),
-                         "[Status] Completion: 25.000 % | 2/8 Steps | Estimated Time of Completion: 00:00:12")
+                         "[Total] Completion: 25.000 % | 2/8 Steps | Estimated Time of Completion: 00:00:12")
         self.assertEqual(status_line(0, 0, None, "eval", None),
-                         "[Status] Completion: 0.000 % | 0/N/A Episodes | Seconds Per Episode: N/A | Estimated Time of Completion: N/A")
+                         "[Total] Completion: 0.000 % | 0/N/A Episodes | Seconds Per Episode: N/A | Estimated Time of Completion: N/A")
 
     def test_reuses_a_legacy_evaluation_timing_with_a_different_checkpoint_path(self):
         settings = {"adapter": "tinyvla", "model": "tinyvla"}

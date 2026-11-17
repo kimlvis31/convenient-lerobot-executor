@@ -26,11 +26,14 @@ NATIVE_STEP = re.compile(r"\bstep:\s*(\d+(?:\.\d+)?)([KMB]?)\b(?![/\d.])", re.I)
 TINY_STEP = re.compile(r"\bstep:(\d+)/(\d+)\b")
 CHECKPOINT_STEP = re.compile(r"\bCheckpoint policy after step (\d+)\b")
 PARALLEL_EPISODES = re.compile(r"^\[Eval progress\] Episodes completed: (\d+)$")
+ROLLOUT_ENDED = re.compile(r"\[Eval progress\] Rollout ended: (\S+)$")
 EVAL_BATCH = re.compile(r"Stepping through eval batches[^|]*\|[^|]*\|\s*(\d+)\s*/\s*(\d+)")
 
 ROLLOUT_STEPS = re.compile(
     r"Running rollout(?: \[([^\]]+)\])? with at most \d+ steps:\s*\d+%\|[^|]*\|\s*(\d+)\s*/\s*(\d+)"
 )
+
+STAGE_LABELS = {"train": "Training", "eval": "Evaluation"}
 
 
 def write_json(path, data):
@@ -130,7 +133,7 @@ def seconds(value):
 def status_line(percent, count, total, stage, eta, average=None):
     current = count if count is not None else "N/A"
     target = total if total is not None else "N/A"
-    parts = [f"[Status] Completion: {percent:.3f} %"]
+    parts = [f"[Total] Completion: {percent:.3f} %"]
     if stage == "eval":
         parts.append(f"{current}/{target} Episodes")
         speed = f"{average:.2f} s" if average is not None else "N/A"
@@ -305,7 +308,7 @@ def stop_process(process):
 def progress_display(evaluation):
     if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
         try:
-            from rich.console import Console
+            from rich.console import Console, Group
             from rich.live import Live
             from rich.progress_bar import ProgressBar
             from rich.table import Table
@@ -321,17 +324,26 @@ def progress_display(evaluation):
                     gauges = Table.grid(padding=(0, 1))
                     gauges.add_column(width=width)
                     gauges.add_column()
-                    gauges.add_row(ProgressBar(total=100, completed=completion, width=width), Text(message))
+                    gauges.add_row(
+                        ProgressBar(total=100, completed=completion, width=width,
+                                    complete_style="green", finished_style="green"),
+                        Text(message),
+                    )
                     if evaluation:
                         if episode is None:
-                            text = "[Episode] Waiting for control steps (reference)"
+                            text = "[Episode] No active batch"
                             current, limit = 0, 1
                         else:
                             task, current, limit = episode
-                            label = f"{task} · " if task else ""
-                            text = f"[Episode] {label}{current}/{limit} control steps (reference)"
-                        gauges.add_row(ProgressBar(total=limit, completed=current, width=width), Text(text))
-                    live.update(gauges, refresh=True)
+                            text = f"[Episode] Completion: {100 * current / limit:.3f} % | {current}/{limit} Steps"
+                            if task:
+                                text += f" | Task: {task}"
+                        gauges.add_row(
+                            ProgressBar(total=limit, completed=current, width=width,
+                                        complete_style="bright_blue", finished_style="bright_blue"),
+                            Text(text),
+                        )
+                    live.update(Group(Text("[Status]"), gauges), refresh=True)
 
                 yield refresh, console.print, evaluation
             return
@@ -339,6 +351,7 @@ def progress_display(evaluation):
     def status_text(message, _completion, _episode):
         print(message, flush=True)
 
+    print("[Status]", flush=True)
     yield status_text, partial(print, flush=True), False
 
 
@@ -354,7 +367,8 @@ def run_stage(command, stage, root, logfile, update, write_message=None):
                 log.flush()
                 clean = ANSI.sub("", line).strip()
                 if write_message and clean and not (
-                    ROLLOUT_STEPS.search(clean) or EVAL_BATCH.search(clean) or PARALLEL_EPISODES.fullmatch(clean)
+                    ROLLOUT_STEPS.search(clean) or ROLLOUT_ENDED.search(clean)
+                    or EVAL_BATCH.search(clean) or PARALLEL_EPISODES.fullmatch(clean)
                 ):
                     write_message(clean)
                 update(clean)
@@ -439,7 +453,6 @@ def execute(stages, settings, run_dir, root, conda, verbose):
     )
     with script.open("x", encoding="utf-8", newline="\n") as file:
         file.write(source)
-    print(f"Run script: {script}", flush=True)
     runpy.run_path(str(script), run_name="__main__")
 
 
@@ -482,12 +495,12 @@ def run_job(job, run_dir):
             saved["status"] = "running"
             saved["started_at"] = datetime.now(timezone.utc).isoformat()
             save_status()
-            label = {"train": "Training", "eval": "Evaluation"}[stage.name]
+            label = STAGE_LABELS[stage.name]
             future_eta = sum(known_future) if None not in known_future else None
             historical_time = previous.get(signatures[index], previous.get(timing_keys[index]))
             last_print = begin - 5
             last_episode_print = begin - 1
-            episode = None
+            active_episodes = {}
 
             def report(now, completed=False):
                 nonlocal eta_scope
@@ -507,6 +520,12 @@ def run_job(job, run_dir):
                 count = stage.units if completed and stage.units is not None else progress.count
                 completion = 100 * (index + fraction) / len(stages)
                 line = status_line(completion, count, stage.units, stage.name, display_eta, progress.average())
+                episode = None
+                if active_episodes and not completed:
+                    task, (current, limit) = min(
+                        active_episodes.items(), key=lambda item: item[1][0] / item[1][1]
+                    )
+                    episode = (task, current, limit)
                 show_status(line, completion, episode)
                 saved.update(units_done=count, units_total=stage.units, eta_seconds=eta,
                              overall_eta_seconds=overall)
@@ -514,21 +533,24 @@ def run_job(job, run_dir):
                     saved["average_seconds_per_episode"] = progress.average()
 
             def update(line):
-                nonlocal last_print, last_episode_print, episode
+                nonlocal last_print, last_episode_print
                 now = time.monotonic()
                 if show_episode and (rollout := ROLLOUT_STEPS.search(line)):
                     task, current, limit = rollout.groups()
                     current, limit = int(current), int(limit)
-                    if 0 <= current <= limit and limit > 0:
-                        sample = (task, current, limit)
-                        if sample != episode:
-                            episode = sample
-                            if now - last_episode_print >= 0.25 or current == limit:
-                                last_episode_print = now
-                                report(now)
+                    sample = (current, limit)
+                    if limit > 0 and current <= limit and active_episodes.get(task) != sample:
+                        active_episodes[task] = sample
+                        if now - last_episode_print >= 0.25 or current == limit:
+                            last_episode_print = now
+                            report(now)
+                if show_episode and (ended := ROLLOUT_ENDED.search(line)):
+                    if active_episodes.pop(ended[1], None) is not None:
+                        report(now)
                 previous_count = progress.count
                 if not progress.update(line, now) or progress.count == previous_count:
                     return
+                active_episodes.pop(None, None)
                 if now - last_print < 2 and progress.count != stage.units:
                     if progress.rate is None or eta_scope is not None:
                         return
@@ -536,7 +558,10 @@ def run_job(job, run_dir):
                 report(now)
                 save_status()
 
-            print(f"\n{label} · Environment {stage.environment}", flush=True)
+            if index:
+                print()
+            print(f"{label} · Environment {stage.environment}", flush=True)
+            print(f"Run script: {run_dir / 'run.py'}", flush=True)
             stage_log = run_dir
             if stage.output:
                 if run_dir.name == "executor" and stage.name == "eval":
