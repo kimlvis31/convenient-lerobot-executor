@@ -4,7 +4,6 @@ import ast
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
-from functools import partial
 import hashlib
 import json
 import os
@@ -308,12 +307,17 @@ def stop_process(process):
         process.wait()
 
 
+def print_status_detail(message):
+    print(f"    • {message}", flush=True)
+
+
 @contextmanager
 def progress_display(evaluation):
     if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
         try:
             from rich.console import Console
             from rich.live import Live
+            from rich.padding import Padding
             from rich.progress_bar import ProgressBar
             from rich.table import Table
             from rich.text import Text
@@ -324,11 +328,13 @@ def progress_display(evaluation):
             with Live(console=console, auto_refresh=False,
                       redirect_stdout=False, redirect_stderr=False) as live:
                 def refresh(message, completion, episode):
-                    width = 16
+                    width = max(8, min(22, console.width // 6))
                     gauges = Table.grid(padding=(0, 1))
+                    gauges.add_column(width=1)
                     gauges.add_column(width=width)
                     gauges.add_column()
                     gauges.add_row(
+                        Text("•"),
                         ProgressBar(total=100, completed=completion, width=width,
                                     complete_style="green", finished_style="green"),
                         Text(message),
@@ -343,19 +349,23 @@ def progress_display(evaluation):
                             if task:
                                 text += f" | Task: {task}"
                         gauges.add_row(
+                            Text("•"),
                             ProgressBar(total=limit, completed=current, width=width,
                                         complete_style="bright_blue", finished_style="bright_blue"),
                             Text(text),
                         )
-                    live.update(gauges, refresh=True)
+                    live.update(Padding(gauges, (0, 0, 0, 4), expand=False), refresh=True)
 
-                yield refresh, console.print, evaluation
+                def note(message):
+                    console.print(f"    • {message}")
+
+                yield refresh, note, evaluation
             return
 
     def status_text(message, _completion, _episode):
-        print(message, flush=True)
+        print_status_detail(message)
 
-    yield status_text, partial(print, flush=True), False
+    yield status_text, print_status_detail, False
 
 
 def run_stage(command, stage, root, logfile, update, write_message=None):
@@ -563,8 +573,8 @@ def run_job(job, run_dir):
 
             if index:
                 print()
-            print(stage_title(stage, settings["model"]), flush=True)
-            print(f"Run script: {run_dir / 'run.py'}", flush=True)
+            print_status_detail(stage_title(stage, settings["model"]))
+            print_status_detail(f"Run script: {run_dir / 'run.py'}")
             stage_log = run_dir
             if stage.output:
                 if run_dir.name == "executor" and stage.name == "eval":
@@ -582,7 +592,7 @@ def run_job(job, run_dir):
                     if stage.output.exists() or stage.output.is_symlink():
                         raise FileExistsError(f"Output path already exists ({stage.output}).")
                     stage.output.parent.mkdir(parents=True, exist_ok=True)
-                print(f"Output directory: {stage.output}", flush=True)
+                print_status_detail(f"Output directory: {stage.output}")
             with progress_display(stage.name == "eval") as (show_status, write_message, show_episode):
                 report(begin)
                 save_status()

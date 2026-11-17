@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from textwrap import indent
 from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
@@ -543,9 +544,14 @@ def show_settings(plans, show_commands):
                   f"({evaluation['batch']} requested, {evaluation['episodes']} episodes per task)")
 
 
+def job_subheading(title):
+    print(styled(f"  ({title})", "1;94"), flush=True)
+
+
 def run_plans(plans, conda, verbose):
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
         print(job_title(index, cfg), flush=True)
+        job_subheading("Status")
         execute(stages, cfg, run_dir, root, conda, verbose)
         show_job_result(stages)
 
@@ -585,7 +591,7 @@ def evaluation_summary(output):
     groups = info.get("per_group")
     if isinstance(groups, dict) and groups:
         lines.append("• Suite success rates:")
-        lines.extend(f"  • {name}: {success_rate(stats)}" for name, stats in groups.items())
+        lines.extend(f"  ◦ {name}: {success_rate(stats)}" for name, stats in groups.items())
     else:
         lines.append("• Suite success rates: N/A")
     lines.extend((f"• Total evaluation time: {seconds(total)}",
@@ -595,7 +601,7 @@ def evaluation_summary(output):
 
 def result_heading(in_job):
     if in_job:
-        print(styled("[Result]", "1;95"), flush=True)
+        job_subheading("Result")
     else:
         section("Result")
 
@@ -604,12 +610,19 @@ def show_job_result(stages):
     result_heading(in_job=True)
     evaluations = [stage.output for stage in stages if stage.name == "eval" and stage.output is not None]
     if evaluations:
-        print("\n\n".join(evaluation_summary(output) for output in evaluations))
+        print("\n\n".join(indent(evaluation_summary(output), "    ") for output in evaluations))
     else:
-        print(styled("• Job completed.", "32"))
+        print(styled("    • Job completed.", "32"))
         for stage in stages:
             if stage.output is not None:
-                print(f"• Result path: {stage.output}")
+                print(f"    • Result path: {stage.output}")
+    divider()
+
+
+def report_failure(message, in_job):
+    result_heading(in_job)
+    prefix = "    • " if in_job else ""
+    print(f"{prefix}{message}", file=sys.stderr, flush=True)
     divider()
 
 
@@ -649,15 +662,11 @@ def main():
         run_plans(plans, conda, args.verbose)
         return 0
     except (KeyboardInterrupt, EOFError):
-        result_heading(in_job=executing)
-        print("Run interrupted.", file=sys.stderr, flush=True)
-        divider()
+        report_failure("Run interrupted.", in_job=executing)
         return 130
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.TimeoutExpired) as error:
-        result_heading(in_job=executing)
-        print(f"Run failed ({error})", file=sys.stderr, flush=True)
-        divider()
+        report_failure(f"Run failed ({error})", in_job=executing)
         return 1
 
 

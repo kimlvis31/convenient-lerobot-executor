@@ -49,7 +49,7 @@ Use `--name=value` for additional LeRobot options. For example, set a camera map
 
 ## Results and resume
 
-The Execution section shows each numbered job's progress and its Result block before moving to the next job. Evaluation results include overall and per-suite success rates, total evaluation time, average time per episode, and the result path.
+The Execution section shows each numbered job's (Status) and (Result) before moving to the next job. Evaluation results include overall and per-suite success rates, total evaluation time, average time per episode, and the result path.
 
 After you confirm the settings, the executor generates and runs one script per job.
 

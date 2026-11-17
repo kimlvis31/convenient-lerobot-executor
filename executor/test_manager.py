@@ -105,8 +105,8 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(status["ended_at"] >= status["started_at"])
         self.assertGreater(status["seconds"], 0)
         self.assertIn(
-            f"Evaluation · Model smolvla · Environment smolvla_env\nRun script: {run / 'run.py'}\n"
-            f"Output directory: {adapter.eval_dir}\n[Total]",
+            f"    • Evaluation · Model smolvla · Environment smolvla_env\n    • Run script: {run / 'run.py'}\n"
+            f"    • Output directory: {adapter.eval_dir}\n    • [Total]",
             text.getvalue(),
         )
         self.assertRegex(text.getvalue(), r"100\.000 % \| 2/2 Episodes \| Seconds Per Episode: \d+\.\d{2} s \| Estimated Time of Completion: 00:00:00")
@@ -299,10 +299,10 @@ class ManagerTests(unittest.TestCase):
         stage = Stage("eval", "lerobot", [], (), 4, output=output)
         with contextlib.redirect_stdout(io.StringIO()) as text:
             show_job_result([stage])
-        self.assertIn("[Result]", text.getvalue())
+        self.assertIn("  (Result)\n    • Overall success rate:", text.getvalue())
         self.assertIn("• Overall success rate: 3/4 (75.00%)", text.getvalue())
-        self.assertIn("  • libero_object: 1/2 (50.00%)", text.getvalue())
-        self.assertIn("  • libero_goal: 2/2 (100.00%)", text.getvalue())
+        self.assertIn("      ◦ libero_object: 1/2 (50.00%)", text.getvalue())
+        self.assertIn("      ◦ libero_goal: 2/2 (100.00%)", text.getvalue())
         self.assertIn("Total evaluation time: 00:00:09", text.getvalue())
         self.assertIn("Average time per episode: 2.20 s", text.getvalue())
         self.assertIn(f"Result path: {output}", text.getvalue())
@@ -345,12 +345,13 @@ class ManagerTests(unittest.TestCase):
              contextlib.redirect_stderr(output):
             self.assertEqual(main(), 1)
         execution = output.getvalue().split("<Execution>\n", 1)[1]
-        first_result = execution.index("[Result]")
+        first_result = execution.index("(Result)")
         second_job = execution.index("[Job 2]")
         self.assertTrue(execution.startswith("[Job 1]"))
+        self.assertIn("\n  (Status)\n    • Evaluation", execution)
         self.assertLess(first_result, execution.index("• Overall success rate:"))
         self.assertLess(execution.index("• Overall success rate:"), second_job)
-        self.assertIn("[Result]\nRun failed", execution[second_job:])
+        self.assertIn("  (Result)\n    • Run failed", execution[second_job:])
         self.assertNotIn("[Job 3]", execution)
         self.assertEqual(read_json(self.logs / "job-0/status.json")["status"], "completed")
         self.assertEqual(read_json(self.logs / "job-1/status.json")["status"], "failed")
