@@ -390,18 +390,18 @@ class ManagerTests(unittest.TestCase):
     def test_policy_menu_lists_native_models_before_external_models(self):
         answers = io.StringIO("4\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
-            selected = choose_policy(load_adapters([]), ["xvla", "act"], Inventory())
+            selected = choose_policy(load_adapters([]), ["xvla", "act"])
         self.assertEqual(selected, ("tinyvla", "tinyvla"))
-        self.assertIn("1. [LeRobot Native] act [Default]  size unavailable", menu.getvalue())
-        self.assertIn("2. [LeRobot Native] xvla  ~900M params", menu.getvalue())
+        self.assertIn("1. [LeRobot Native] act [Default]  [51.7 M]", menu.getvalue())
+        self.assertIn("2. [LeRobot Native] xvla  [879.7 M]", menu.getvalue())
         self.assertIn("3. [LeRobot Native] Enter a model name manually", menu.getvalue())
-        self.assertIn("4. [External] TinyVLA  700M backbone", menu.getvalue())
+        self.assertIn("4. [External] TinyVLA  [740.4 M]", menu.getvalue())
 
-    def test_model_size_reports_local_weights_when_reference_size_is_missing(self):
-        model = self.root / "act"
-        model.mkdir()
-        (model / "model.safetensors").write_bytes(bytes(2048))
-        self.assertEqual(model_size("act", Inventory(models=[(model, "act")])), "2.0 KiB local weights")
+    def test_model_size_uses_parameter_units_or_na(self):
+        self.assertEqual(model_size("diffusion"), "[262.7 M]")
+        self.assertEqual(model_size("dm05"), "[5.2 B]")
+        self.assertEqual(model_size("fastwam"), "[6 B]")
+        self.assertEqual(model_size("gaussian_actor"), "[N/A]")
 
     def test_completion_time_includes_days_when_needed(self):
         self.assertEqual(seconds(None), "N/A")

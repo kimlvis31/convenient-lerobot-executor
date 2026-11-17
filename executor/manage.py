@@ -13,24 +13,39 @@ import subprocess
 import sys
 from uuid import uuid4
 
-from adapters import SUITES, load_adapters, native_checkpoint, read_json, weight_files
+from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import model_location, scan, show
 from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, styled
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
-# Published reference sizes. Individual checkpoints can differ.
+# Representative checkpoints, usually using the Hub's Safetensors parameter total.
 REFERENCE_MODEL_SIZES = {
-    "eo1": "3B reference checkpoint",
-    "evo1": "770M params",
-    "fineart_vla": "~4B reference checkpoint",
-    "lingbot_va": "~5B transformer",
-    "lingbot_vla_v2": "6B base checkpoint",
-    "multi_task_dit": "~450M params",
-    "smolvla": "450M params",
-    "tinyvla": "700M backbone",
-    "wall_oss_05": "~4B reference checkpoint",
-    "xvla": "~900M params",
+    "act": 51_685_096,  # lerobot/act_aloha_sim_transfer_cube_human @ ba73b27
+    "diffusion": 262_709_062,  # lerobot/diffusion_pusht @ 84a7c23
+    "dm05": 5_157_859_728,  # lerobot/dm05_base @ 84ea03f
+    "eo1": 3_771_607_072,  # lerobot/eo1-base @ bba306b
+    "evo1": 770_000_000,  # LeRobot v0.6.0 release announcement
+    "fastwam": 6_020_710_599,  # lerobot/fastwam_libero_uncond_2cam224 @ 53983e1
+    "fineart_vla": 4_143_404_816,  # lerobot/FineART-VLA-subtask-midtrained @ b6cf4fa
+    "flux3": 6_947_071_232,  # black-forest-labs/flux-3-action-so101 @ e2584b2
+    "groot": 3_144_016_000,  # nvidia/GR00T-N1.7-3B @ 373d34e
+    "lawam": 2_555_179_360,  # jialei02/lawam-pretrain-lerobot @ bc45090
+    "lingbot_va": 5_088_872_670,  # lerobot/lingbot_va_base @ a9b1da7
+    "lingbot_vla_v2": 6_375_907_511,  # lerobot/lingbot_vla_v2_base @ 32d0a32
+    "longwam": 12_406_309_603,  # Efficient-Large-Model/Long-WAM-LIBERO-IDM-LeRobot @ 92f0910
+    "molmoact2": 5_442_196_272,  # allenai/MolmoAct2-LIBERO-LeRobot @ f0c5a95
+    "multi_task_dit": 450_000_000,  # LeRobot Multi-task DiT policy documentation
+    "pi0": 3_501_372_176,  # lerobot/pi0_base @ 6e24539
+    "pi05": 3_616_757_520,  # lerobot/pi05_base @ 22c30e5
+    "pi0_fast": 2_923_335_408,  # lerobot/pi0fast-base @ 308eb84
+    "smolvla": 450_046_176,  # lerobot/smolvla_base @ 5e8d12a
+    "tinyvla": 740_388_103,  # Tensor count in the prepared example model, including its action head
+    "vla_jepa": 3_081_498_247,  # lerobot/VLA-JEPA-LIBERO @ 735d9f6
+    "vqbet": 39_532_013,  # lerobot/vqbet_pusht @ 15c2d0a
+    "wall_oss_05": 4_162_219_008,  # lerobot/wall-oss-0.5 @ 03ab102
+    "wall_x": 4_224_041_072,  # x-square-robot/wall-oss-flow @ 44e8276
+    "xvla": 879_738_545,  # lerobot/xvla-libero @ 8e6aeef
 }
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_ROOT = PROJECT_ROOT / "executor/log"
@@ -183,38 +198,16 @@ def tiny_train(warm, inventory, root):
     return train
 
 
-def format_model_bytes(size):
-    for divisor, unit in ((1024**3, "GiB"), (1024**2, "MiB"), (1024, "KiB")):
-        if size >= divisor:
-            return f"{size / divisor:.1f} {unit}"
-    return f"{size} B"
+def model_size(model):
+    parameters = REFERENCE_MODEL_SIZES.get(model)
+    if parameters is None:
+        return "[N/A]"
+    divisor, unit = (1_000_000_000, "B") if parameters >= 1_000_000_000 else (1_000_000, "M")
+    amount = f"{parameters / divisor:.1f}".removesuffix(".0")
+    return f"[{amount} {unit}]"
 
 
-def model_size(model, inventory):
-    if model in REFERENCE_MODEL_SIZES:
-        return REFERENCE_MODEL_SIZES[model]
-
-    sizes = set()
-    for path, kind in inventory.models:
-        if kind != model:
-            continue
-        try:
-            legacy = path / "pytorch_model.bin"
-            if legacy.is_file() and not any((path / name).is_file() for name in
-                                           ("model.safetensors", "model.safetensors.index.json")):
-                sizes.add(legacy.stat().st_size)
-            else:
-                sizes.add(sum(file.stat().st_size for file in weight_files(path)))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-
-    if not sizes:
-        return "size unavailable"
-    smallest, largest = format_model_bytes(min(sizes)), format_model_bytes(max(sizes))
-    return f"{smallest} local weights" if smallest == largest else f"{smallest}–{largest} local weights"
-
-
-def choose_policy(adapters, policies, inventory):
+def choose_policy(adapters, policies):
     native = styled("[LeRobot Native]", "38;5;75")
     external = styled("[External]", "38;5;208")
     if not policies:
@@ -222,7 +215,7 @@ def choose_policy(adapters, policies, inventory):
     entries = [(("native", model), f"{native} {model}") for model in sorted(policies)]
     entries.append((("native", ""), f"{native} Enter a model name manually"))
     entries += [((key, key), f"{external} {adapters[key].label}") for key in sorted(adapters) if key != "native"]
-    sizes = {value: model_size(value[1], inventory) for value, _ in entries if value[1]}
+    sizes = {value: model_size(value[1]) for value, _ in entries if value[1]}
     default = next((index for index, (value, _) in enumerate(entries, 1) if value == ("native", "smolvla")), 1)
     backend, model = choose("Policy model", entries, default=default, details=sizes)
     if not model:
@@ -365,7 +358,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
                     ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
         print(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
-    backend, model = choose_policy(adapters, native_policies(conda, native_env, root), inventory)
+    backend, model = choose_policy(adapters, native_policies(conda, native_env, root))
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
                ("both", "Train, then evaluate")]

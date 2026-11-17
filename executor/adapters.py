@@ -61,19 +61,17 @@ def native_checkpoint(path):
     raise FileNotFoundError(f"LeRobot training configuration not found ({path}).")
 
 
-def weight_files(path):
+def weights(path):
+    require(path / "config.json")
     index = path / "model.safetensors.index.json"
     if index.is_file() and not (path / "model.safetensors").is_file():
         shards = set(read_json(index)["weight_map"].values())
         if not shards or any(Path(name).name != name for name in shards):
             raise ValueError(f"Invalid model weight index ({index}).")
-        return tuple(require(path / name) for name in sorted(shards))
-    return (require(path / "model.safetensors"),)
-
-
-def weights(path):
-    require(path / "config.json")
-    weight_files(path)
+        for name in shards:
+            require(path / name)
+    else:
+        require(path / "model.safetensors")
     return path
 
 
