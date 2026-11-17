@@ -130,6 +130,11 @@ def seconds(value):
     return f"{days}d {clock}" if days else clock
 
 
+def stage_title(stage):
+    environment = "LeRobot" if stage.environment == "lerobot" else stage.environment
+    return f"{STAGE_LABELS[stage.name]} · Environment {environment}"
+
+
 def status_line(percent, count, total, stage, eta, average=None):
     current = count if count is not None else "N/A"
     target = total if total is not None else "N/A"
@@ -308,7 +313,7 @@ def stop_process(process):
 def progress_display(evaluation):
     if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
         try:
-            from rich.console import Console, Group
+            from rich.console import Console
             from rich.live import Live
             from rich.progress_bar import ProgressBar
             from rich.table import Table
@@ -343,7 +348,7 @@ def progress_display(evaluation):
                                         complete_style="bright_blue", finished_style="bright_blue"),
                             Text(text),
                         )
-                    live.update(Group(Text("[Status]"), gauges), refresh=True)
+                    live.update(gauges, refresh=True)
 
                 yield refresh, console.print, evaluation
             return
@@ -351,7 +356,6 @@ def progress_display(evaluation):
     def status_text(message, _completion, _episode):
         print(message, flush=True)
 
-    print("[Status]", flush=True)
     yield status_text, partial(print, flush=True), False
 
 
@@ -560,7 +564,7 @@ def run_job(job, run_dir):
 
             if index:
                 print()
-            print(f"{label} · Environment {stage.environment}", flush=True)
+            print(stage_title(stage), flush=True)
             print(f"Run script: {run_dir / 'run.py'}", flush=True)
             stage_log = run_dir
             if stage.output:
@@ -580,7 +584,6 @@ def run_job(job, run_dir):
                         raise FileExistsError(f"Output path already exists ({stage.output}).")
                     stage.output.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Output directory: {stage.output}", flush=True)
-            print()
             with progress_display(stage.name == "eval") as (show_status, write_message, show_episode):
                 report(begin)
                 save_status()

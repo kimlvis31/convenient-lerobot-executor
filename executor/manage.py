@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import model_location, scan, show
-from runner import ANSI, STAGE_LABELS, available_environments, conda_executable, execute, load_settings, native_policies, seconds, styled
+from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, seconds, stage_title, styled
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -530,7 +530,7 @@ def show_settings(plans, show_commands):
         title = styled(f"[Job {index}]", "1;36")
         print(f"{title} {cfg.get('label') or cfg['model']}")
         for stage in stages:
-            print(f"  {STAGE_LABELS[stage.name]} · Environment {stage.environment}")
+            print(f"  {stage_title(stage)}")
             if show_commands:
                 print(command_preview(stage.arguments))
         evaluation = cfg.get("eval")

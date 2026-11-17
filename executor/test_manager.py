@@ -106,7 +106,7 @@ class ManagerTests(unittest.TestCase):
         self.assertGreater(status["seconds"], 0)
         self.assertIn(
             f"Evaluation · Environment smolvla_env\nRun script: {run / 'run.py'}\n"
-            f"Output directory: {adapter.eval_dir}\n\n[Status]\n[Total]",
+            f"Output directory: {adapter.eval_dir}\n[Total]",
             text.getvalue(),
         )
         self.assertRegex(text.getvalue(), r"100\.000 % \| 2/2 Episodes \| Seconds Per Episode: \d+\.\d{2} s \| Estimated Time of Completion: 00:00:00")
@@ -285,7 +285,7 @@ class ManagerTests(unittest.TestCase):
             show_settings(plans, show_commands=True)
         title, environment, preview = text.getvalue().split("\n", 2)
         self.assertEqual(title, "[Job 1] Evaluate on LIBERO")
-        self.assertEqual(environment, "  Evaluation · Environment lerobot")
+        self.assertEqual(environment, "  Evaluation · Environment LeRobot")
         self.assertGreater(len(preview.splitlines()), 1)
         self.assertEqual(shlex.split(preview.replace("\\\n", "")), command)
 
