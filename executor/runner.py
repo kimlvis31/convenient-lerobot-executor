@@ -1,8 +1,10 @@
 """Launch local Conda commands and record their measured progress."""
 
 import ast
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
 import json
 import os
@@ -295,7 +297,30 @@ def stop_process(process):
         process.wait()
 
 
-def run_stage(command, stage, root, logfile, update, verbose):
+@contextmanager
+def progress_display():
+    if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+        try:
+            from rich.console import Console
+            from rich.live import Live
+            from rich.text import Text
+        except ImportError:
+            pass
+        else:
+            console = Console(file=sys.stdout, markup=False, highlight=False, emoji=False)
+            with Live(console=console, auto_refresh=False,
+                      redirect_stdout=False, redirect_stderr=False) as live:
+                def refresh(message):
+                    live.update(Text(message), refresh=True)
+
+                yield refresh, console.print
+            return
+
+    plain = partial(print, flush=True)
+    yield plain, plain
+
+
+def run_stage(command, stage, root, logfile, update, write_message=None):
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", **stage.env}
     with logfile.open("x", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
@@ -306,8 +331,8 @@ def run_stage(command, stage, root, logfile, update, verbose):
                 log.write(line)
                 log.flush()
                 clean = ANSI.sub("", line).strip()
-                if verbose and clean:
-                    print(clean, flush=True)
+                if write_message and clean:
+                    write_message(clean)
                 update(clean)
             code = process.wait()
         except BaseException:
@@ -450,12 +475,12 @@ def run_job(job, run_dir):
                 if display_eta is not None:
                     scope = "whole job" if overall is not None else label.lower()
                     if scope != eta_scope and (scope != "whole job" or eta_scope is not None):
-                        print(f"Time estimate scope · {scope}", flush=True)
+                        write_message(f"Time estimate scope · {scope}")
                     eta_scope = scope
                 fraction = 1 if completed else progress.fraction()
                 count = stage.units if completed and stage.units is not None else progress.count
-                print(status_line(100 * (index + fraction) / len(stages), count, stage.units,
-                                  stage.name, display_eta, progress.average()), flush=True)
+                show_status(status_line(100 * (index + fraction) / len(stages), count, stage.units,
+                                        stage.name, display_eta, progress.average()))
                 saved.update(units_done=count, units_total=stage.units, eta_seconds=eta,
                              overall_eta_seconds=overall)
                 if stage.name == "eval":
@@ -493,15 +518,17 @@ def run_job(job, run_dir):
                         raise FileExistsError(f"Output path already exists ({stage.output}).")
                     stage.output.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Output directory: {stage.output}", flush=True)
-            report(begin)
-            save_status()
-            try:
-                run_stage(stage.arguments, stage, root, stage_log / f"{stage.name}.log", update, job["verbose"])
-            finally:
-                saved.update(seconds=time.monotonic()-begin, ended_at=datetime.now(timezone.utc).isoformat())
-            saved["status"] = "completed"
-            report(time.monotonic(), completed=True)
-            save_status()
+            with progress_display() as (show_status, write_message):
+                report(begin)
+                save_status()
+                try:
+                    run_stage(stage.arguments, stage, root, stage_log / f"{stage.name}.log",
+                              update, write_message if job["verbose"] else None)
+                finally:
+                    saved.update(seconds=time.monotonic()-begin, ended_at=datetime.now(timezone.utc).isoformat())
+                saved["status"] = "completed"
+                report(time.monotonic(), completed=True)
+                save_status()
         status["status"] = "completed"
     except BaseException as error:
         status["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"

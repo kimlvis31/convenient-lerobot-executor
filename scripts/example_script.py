@@ -1,31 +1,35 @@
-"""Examples for base and checkpoint evaluation, reset, continuation, and resume."""
+"""Examples for batch evaluation, train-then-evaluate, continuation, and resume."""
 
 # JOBS is an ordered list. Each dictionary describes one executor job.
-# For SmolVLA, set adapter to "native" and model to "smolvla". In eval, set
-# policy to a pretrained repository name or local checkpoint path, and set
-# device to "cuda" or "cpu". For another native policy, use its model name.
+# To evaluate SmolVLA, use adapter "native", model "smolvla", and set
+# eval.policy to a compatible Hugging Face repository ID or the local snapshot
+# shown in the inventory. Set eval.device to "cuda" or "cpu". Match the
+# checkpoint's environment, camera size, and control mode.
+# parallel_tasks and action_steps below are TinyVLA evaluation options.
 # A job can contain train, eval, or both. With both present, evaluation uses
 # the checkpoint produced by that job's training stage.
 # The dataset and checkpoints below are example assets under the convLexecutor root.
 JOBS = [
     {
-        "label": "Base model, task 1",  # Name shown in the queue.
+        "label": "Base model: parallel evaluation of tasks 1 and 2",  # Name shown in the queue.
         "adapter": "tinyvla",  # Execution backend. Use "native" for built-in policies.
         "model": "tinyvla",  # Policy name. Native examples include "smolvla" and "act".
         "eval": {  # Evaluation settings. Omitting policy uses the TinyVLA base weights.
             "env": "libero",  # Simulation environment type.
             "tasks": ["libero_object"],  # Benchmark suites to run.
-            "task_ids": [1],  # Zero-based task IDs for a single suite. Use [] for all tasks.
-            "episodes": 1,  # Number of episodes per task.
-            "batch": 1,  # Number of episodes to run in parallel. TinyVLA requires 1.
+            "task_ids": [1, 2],  # Zero-based task IDs for a single suite. Use [] for all tasks.
+            "episodes": 2,  # Episodes to run for each task.
+            "batch": 2,  # Episodes evaluated together per task, capped at episodes.
+            "parallel_tasks": 2,  # Number of distinct tasks to evaluate concurrently.
             "seed": 0,  # Random seed for the evaluation and the TinyVLA worker.
             "control": "relative",  # Action control mode. TinyVLA requires relative control.
             "size": 256,  # Camera image width and height in pixels.
-            "episode_length": 10,  # Maximum control steps per episode. Use 0 for the default.
+            "episode_length": 10,  # Maximum control steps per episode. Use 0 for the benchmark default.
+            "action_steps": 16,  # Actions executed per prediction, from 1 to 16 for TinyVLA.
         },
     },
     {
-        # Load the trained model and evaluate it with the same settings.
+        # Evaluate a prepared local checkpoint with one task and one episode.
         "label": "Evaluate the trained checkpoint, task 1",
         "adapter": "tinyvla",
         "model": "tinyvla",
@@ -43,7 +47,7 @@ JOBS = [
         },
     },
     {
-        "label": "Reset: train a new action head, task 1",
+        "label": "Reset: train a new action head, then evaluate task 1",
         "adapter": "tinyvla",
         "model": "tinyvla",
         "train": {  # The base weights are loaded with a newly initialized action head and optimizer.
@@ -55,6 +59,17 @@ JOBS = [
             "lr": 0.0001,  # Learning rate for the action-head optimizer.
             "seed": 0,  # Random seed for model initialization and batch sampling.
             "save_freq": 2,  # Save training state every two optimizer steps.
+        },
+        "eval": {  # Uses the model saved by this job's training stage.
+            "env": "libero",
+            "tasks": ["libero_object"],
+            "task_ids": [1],
+            "episodes": 1,
+            "batch": 1,
+            "seed": 0,
+            "control": "relative",
+            "size": 256,
+            "episode_length": 10,
         },
     },
     {

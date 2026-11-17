@@ -22,7 +22,7 @@ In a numbered menu, press Enter to select the row marked [Default]. In a text or
 
 Select **Import a job queue script** to list job queue and settings files in the project `scripts/` directory. In [example_script.py](../scripts/example_script.py), `JOBS` is an ordered list of job dictionaries. The interactive prompts fill the same fields. Specify `adapter`, `model`, and at least one of `train` or `eval` for each job. Include both stages in a single dictionary to evaluate the checkpoint produced by training.
 
-The example contains five TinyVLA jobs: base evaluation, checkpoint evaluation, reset training from the base model, continuation from saved weights with a new optimizer, and exact resume from step 2. The preparation script writes the demonstration and its split under `datasets/example/libero/`, and the checkpoints under `outputs/example/`. Copy or remove individual dictionaries to select the scenarios you want to run.
+The example contains five TinyVLA jobs: batched evaluation of the base model across two parallel tasks, checkpoint evaluation, reset training followed by evaluation, continuation from saved weights with a new optimizer, and exact resume from step 2. The preparation script writes the demonstration and its split under `datasets/example/libero/`, and the checkpoints under `outputs/example/`. Copy or remove individual dictionaries to select the scenarios you want to run.
 
 ```bash
 python -B ~/convLexecutor/executor/manage.py --queue ~/convLexecutor/scripts/example_script.py --dry-run
@@ -61,6 +61,8 @@ After you confirm the settings, the executor generates and runs one script per j
 | `outputs/{training,evaluation}/<run-name>/executor/{train,eval}.log` | Console output for each stage that ran |
 | `outputs/training/<run-name>/` | Checkpoints, training results, and the saved dataset split where applicable |
 | `outputs/evaluation/<run-name>/` | Evaluation results and videos saved by LeRobot |
+
+With Rich installed, the terminal updates the status line in place. Install it with `python -m pip install rich` in the environment that runs the executor if needed. Redirected output uses plain lines so progress can be read from a file or pipeline.
 
 The status line shows overall completion, the current stage's completed and total units, and the estimated time remaining in hours, minutes, and seconds. Training counts optimizer steps. Evaluation counts completed episodes from LeRobot's reported batches. Seconds Per Episode shows the measured elapsed time divided by the number of completed episodes, including episodes processed in parallel. The executor estimates the whole job when it has measured timings for the remaining stages, including prior compatible TinyVLA evaluation timings. Otherwise it announces the current-stage ETA when measured progress is available. Estimated Time of Completion shows a remaining duration, with a day count for durations of 24 hours or more. It shows N/A when there is no usable estimate.
 
