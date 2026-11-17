@@ -8,6 +8,8 @@ LeRobot의 학습·평가·재개 작업을 실행하는 도구입니다. 대화
 
 ## 직접 설치하기
 
+아래 명령은 Git과 Conda를 설치한 Linux의 Bash 터미널에서 실행합니다.
+
 실행 관리자는 `convLexecutor/`의 `scripts/`에서 작업 큐를, `datasets/`에서 데이터를, `externals/`에서 모델 연결을 읽습니다. 결과는 `outputs/`에 저장합니다. LeRobot은 선택한 Conda 환경에서 실행합니다. 기존 소스 폴더에 연결된 설치도 사용할 수 있습니다.
 
 검증 환경은 Linux, Conda, LeRobot 0.6.2의 `145cc7ea53e5864bd5efec4e9bb70ee799e47bd8` 소스 버전, bfloat16을 지원하는 NVIDIA 장치입니다. 기존 호환 환경이 있으면 재사용합니다. 새 환경은 아래 명령으로 만들 수 있습니다. LIBERO(Lifelong Learning Benchmark on Robot Manipulation, 로봇 조작 평생학습 벤치마크)의 환경 요구 사항은 공식 문서에서 확인할 수 있습니다. [영문 설치 안내](README.md#manual-setup) · [LIBERO 설치](https://huggingface.co/docs/lerobot/libero)
@@ -34,6 +36,8 @@ LeRobot 기본 모델만 사용한다면 별도 모델 환경과 아래 TinyVLA(
 ## 실습 자산 준비와 실행
 
 ```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate lerobot
 python -B ~/convLexecutor/scripts/prepare_examples.py --dry-run
 python -B ~/convLexecutor/scripts/prepare_examples.py
 python -B ~/convLexecutor/executor/manage.py --inventory

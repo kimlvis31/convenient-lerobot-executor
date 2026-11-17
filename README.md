@@ -24,6 +24,8 @@ convLexecutor/
 
 ## Manual setup
 
+The following commands use Bash on Linux with Git and Conda available.
+
 The verified configuration uses Linux, Conda, LeRobot 0.6.2 at revision `145cc7ea53e5864bd5efec4e9bb70ee799e47bd8`, and an NVIDIA device that supports bfloat16. Reuse an existing compatible Conda environment when available. On a fresh machine, install the [LIBERO extra](https://huggingface.co/docs/lerobot/libero) in the native `lerobot` environment.
 
 ```bash
@@ -48,6 +50,8 @@ conda run -n lerobot python -m pip install --no-deps --no-build-isolation \
 ## Prepare and run the examples
 
 ```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate lerobot
 python -B ~/convLexecutor/scripts/prepare_examples.py --dry-run
 python -B ~/convLexecutor/scripts/prepare_examples.py
 python -B ~/convLexecutor/executor/manage.py --inventory
