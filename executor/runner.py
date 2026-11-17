@@ -28,6 +28,10 @@ CHECKPOINT_STEP = re.compile(r"\bCheckpoint policy after step (\d+)\b")
 PARALLEL_EPISODES = re.compile(r"^\[Eval progress\] Episodes completed: (\d+)$")
 EVAL_BATCH = re.compile(r"Stepping through eval batches[^|]*\|[^|]*\|\s*(\d+)\s*/\s*(\d+)")
 
+ROLLOUT_STEPS = re.compile(
+    r"Running rollout(?: \[([^\]]+)\])? with at most \d+ steps:\s*\d+%\|[^|]*\|\s*(\d+)\s*/\s*(\d+)"
+)
+
 
 def write_json(path, data):
     temporary = path.with_suffix(".tmp")
@@ -298,11 +302,13 @@ def stop_process(process):
 
 
 @contextmanager
-def progress_display():
+def progress_display(evaluation):
     if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
         try:
             from rich.console import Console
             from rich.live import Live
+            from rich.progress_bar import ProgressBar
+            from rich.table import Table
             from rich.text import Text
         except ImportError:
             pass
@@ -310,14 +316,30 @@ def progress_display():
             console = Console(file=sys.stdout, markup=False, highlight=False, emoji=False)
             with Live(console=console, auto_refresh=False,
                       redirect_stdout=False, redirect_stderr=False) as live:
-                def refresh(message):
-                    live.update(Text(message), refresh=True)
+                def refresh(message, completion, episode):
+                    width = 16
+                    gauges = Table.grid(padding=(0, 1))
+                    gauges.add_column(width=width)
+                    gauges.add_column()
+                    gauges.add_row(ProgressBar(total=100, completed=completion, width=width), Text(message))
+                    if evaluation:
+                        if episode is None:
+                            text = "[Episode] Waiting for control steps (reference)"
+                            current, limit = 0, 1
+                        else:
+                            task, current, limit = episode
+                            label = f"{task} · " if task else ""
+                            text = f"[Episode] {label}{current}/{limit} control steps (reference)"
+                        gauges.add_row(ProgressBar(total=limit, completed=current, width=width), Text(text))
+                    live.update(gauges, refresh=True)
 
-                yield refresh, console.print
+                yield refresh, console.print, evaluation
             return
 
-    plain = partial(print, flush=True)
-    yield plain, plain
+    def status_text(message, _completion, _episode):
+        print(message, flush=True)
+
+    yield status_text, partial(print, flush=True), False
 
 
 def run_stage(command, stage, root, logfile, update, write_message=None):
@@ -331,7 +353,9 @@ def run_stage(command, stage, root, logfile, update, write_message=None):
                 log.write(line)
                 log.flush()
                 clean = ANSI.sub("", line).strip()
-                if write_message and clean:
+                if write_message and clean and not (
+                    ROLLOUT_STEPS.search(clean) or EVAL_BATCH.search(clean) or PARALLEL_EPISODES.fullmatch(clean)
+                ):
                     write_message(clean)
                 update(clean)
             code = process.wait()
@@ -462,6 +486,8 @@ def run_job(job, run_dir):
             future_eta = sum(known_future) if None not in known_future else None
             historical_time = previous.get(signatures[index], previous.get(timing_keys[index]))
             last_print = begin - 5
+            last_episode_print = begin - 1
+            episode = None
 
             def report(now, completed=False):
                 nonlocal eta_scope
@@ -479,16 +505,27 @@ def run_job(job, run_dir):
                     eta_scope = scope
                 fraction = 1 if completed else progress.fraction()
                 count = stage.units if completed and stage.units is not None else progress.count
-                show_status(status_line(100 * (index + fraction) / len(stages), count, stage.units,
-                                        stage.name, display_eta, progress.average()))
+                completion = 100 * (index + fraction) / len(stages)
+                line = status_line(completion, count, stage.units, stage.name, display_eta, progress.average())
+                show_status(line, completion, episode)
                 saved.update(units_done=count, units_total=stage.units, eta_seconds=eta,
                              overall_eta_seconds=overall)
                 if stage.name == "eval":
                     saved["average_seconds_per_episode"] = progress.average()
 
             def update(line):
-                nonlocal last_print
+                nonlocal last_print, last_episode_print, episode
                 now = time.monotonic()
+                if show_episode and (rollout := ROLLOUT_STEPS.search(line)):
+                    task, current, limit = rollout.groups()
+                    current, limit = int(current), int(limit)
+                    if 0 <= current <= limit and limit > 0:
+                        sample = (task, current, limit)
+                        if sample != episode:
+                            episode = sample
+                            if now - last_episode_print >= 0.25 or current == limit:
+                                last_episode_print = now
+                                report(now)
                 previous_count = progress.count
                 if not progress.update(line, now) or progress.count == previous_count:
                     return
@@ -518,7 +555,7 @@ def run_job(job, run_dir):
                         raise FileExistsError(f"Output path already exists ({stage.output}).")
                     stage.output.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Output directory: {stage.output}", flush=True)
-            with progress_display() as (show_status, write_message):
+            with progress_display(stage.name == "eval") as (show_status, write_message, show_episode):
                 report(begin)
                 save_status()
                 try:
