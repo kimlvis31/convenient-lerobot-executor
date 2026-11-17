@@ -117,7 +117,7 @@ def environment_catalog():
             "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable}
 
 
-def install_benchmark(name, *, plugin=False):
+def install_benchmark(name, *, plugin=False, isolated=False):
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
@@ -141,8 +141,9 @@ def install_benchmark(name, *, plugin=False):
 
     with tempfile.TemporaryDirectory(prefix="convlexecutor-benchmark-") as directory:
         constraints = Path(directory) / "installed.txt"
-        constraints.write_text("".join(f"{name}=={version}\n" for name, version in sorted(versions.items())),
-                               encoding="utf-8")
+        core = {"lerobot", "numpy", "torch", "torchvision", "torchcodec", "transformers"}
+        pins = ((name, version) for name, version in sorted(versions.items()) if not isolated or name in core)
+        constraints.write_text("".join(f"{name}=={version}\n" for name, version in pins), encoding="utf-8")
         subprocess.run([sys.executable, "-m", "pip", "install", "--no-input", "--no-user",
                         "--disable-pip-version-check", "--progress-bar", "off",
                         "--constraint", str(constraints), *needed], check=True)
@@ -154,12 +155,13 @@ def main():
     operation.add_argument("--catalog", action="store_true")
     operation.add_argument("--install")
     operation.add_argument("--plugin")
+    parser.add_argument("--isolated", action="store_true")
     args = parser.parse_args()
     try:
         if args.catalog:
             print("MANAGER_CATALOG " + json.dumps(environment_catalog()))
         else:
-            install_benchmark(args.plugin or args.install, plugin=args.plugin is not None)
+            install_benchmark(args.plugin or args.install, plugin=args.plugin is not None, isolated=args.isolated)
     except (ImportError, ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"Benchmark setup failed ({error}).", file=sys.stderr)
         return 1

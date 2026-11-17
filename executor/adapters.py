@@ -249,7 +249,10 @@ class NativeAdapter:
             env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"}
         else:
             env = {}
-        return Stage("eval", self.environment, args, (output / "eval_info.json",), units,
+        environment = cfg.get("environment") or self.environment
+        if not isinstance(environment, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", environment):
+            raise ValueError("Invalid Conda evaluation environment name.")
+        return Stage("eval", environment, args, (output / "eval_info.json",), units,
                      eval_batches=(episodes + batch - 1) // batch, env=env, output=output)
 
 

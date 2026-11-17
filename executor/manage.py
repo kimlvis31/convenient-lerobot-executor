@@ -518,19 +518,41 @@ def install_benchmark_menu(conda, root, environments, native_env, catalogs):
     if installed.get(selection):
         return f"{selection} is already installed in {target}."
     argument = ask("LeRobot Environment Plugin Package") if selection == "plugin" else selection
+    isolated = choose("Installation Target", [
+        (False, f"Use {target} and preserve its installed packages"),
+        (True, f"Clone {target} into a separate benchmark environment"),
+    ])
+    source = target
+    if isolated:
+        suffix = "benchmark" if selection == "plugin" else selection
+        target = ask("New Conda Environment Name", f"{source}_{suffix}")
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", target) or target in environments:
+            return "Choose a new Conda environment name."
     if ask(f"Install {argument} in {target}? (Y/N)", "N").upper() != "Y":
         return "Benchmark Installation Canceled."
 
+    process_options = {"cwd": root, "text": True, "encoding": "utf-8", "errors": "replace",
+                       "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    if isolated:
+        print(f"Cloning {source} into {target}…", flush=True)
+        clone = subprocess.run([conda, "create", "--yes", "--name", target, "--clone", source], **process_options)
+        if clone.returncode:
+            return clone.stdout.strip() or f"Could not clone {source} into {target}."
+        environments.add(target)
     installer = Path(__file__).with_name("benchmarks.py")
     option = "--plugin" if selection == "plugin" else "--install"
+    program = ["python", "-B", str(installer), option, argument]
+    if isolated:
+        program.append("--isolated")
     print(f"Installing {argument} in {target}…", flush=True)
-    result = subprocess.run(conda_command(conda, target, ["python", "-B", str(installer), option, argument]),
-                            cwd=root, text=True, encoding="utf-8", errors="replace",
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = subprocess.run(conda_command(conda, target, program), **process_options)
     refreshed = environment_catalog(conda, target, root)
     catalogs[target] = refreshed
     if result.returncode:
-        return result.stdout.strip() or f"Could not install {argument} in {target}."
+        message = result.stdout.strip() or f"Could not install {argument} in {target}."
+        if not isolated:
+            message += "\nYou can retry in a separate benchmark environment from Install a benchmark."
+        return message
     if selection == "plugin":
         new_types = sorted(set(refreshed.get("plugins", ())) - set(catalog.get("plugins", ())))
         if new_types:
@@ -553,12 +575,25 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
     display = QuestionDisplay(sys.stdout, section)
     mapping = env_map or {}
     catalogs = {}
+    environments = set(environments)
 
-    def catalog_for(model=None):
-        env = mapping.get(model, native_env)
-        if env not in catalogs:
-            catalogs[env] = environment_catalog(conda, env, root)
-        return catalogs[env]
+    def catalog_for(environment):
+        if environment not in catalogs:
+            catalogs[environment] = environment_catalog(conda, environment, root)
+        return catalogs[environment]
+
+    def evaluation_environment(model, tiny):
+        preferred = native_env if tiny else mapping.get(model, native_env)
+        selected = preferred
+        if not tiny:
+            excluded = {"base", "miniconda3", "tinyvla_infer", "lerobot_tinyvla", mapping.get("tinyvla")}
+            options = [(preferred, preferred)]
+            for environment in sorted(environments - {preferred} - excluded):
+                if catalog_for(environment).get("policies", {}).get(model):
+                    options.append((environment, environment))
+            if len(options) > 1:
+                selected = choose("Evaluation Conda Environment", options)
+        return selected, catalog_for(selected), selected != preferred
 
     with redirect_stdout(display):
         show_inventory(display, inventory, environments)
@@ -583,18 +618,21 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             history = QuestionHistory(display)
             try:
                 if action == "new":
-                    catalog = catalog_for()
+                    catalog = catalog_for(native_env)
                     policies = catalog.get("policies", {})
-                    unavailable = {
-                        ("native", model) for model, ready in policies.items()
-                        if not catalog_for(model).get("policies", {}).get(model, ready)
-                    }
+                    unavailable = set()
+                    for model, ready in policies.items():
+                        details = catalog_for(mapping.get(model, native_env))
+                        if not (details.get("policies", {}).get(model, False) if details else ready):
+                            unavailable.add(("native", model))
                     tiny_env = mapping.get("tinyvla", DEFAULT_ENVIRONMENTS["tinyvla"])
                     if tiny_env == "tinyvla_infer" and "lerobot_tinyvla" in environments and tiny_env not in environments:
                         tiny_env = "lerobot_tinyvla"
                     if catalog and (not catalog.get("tinyvla_bridge") or environments and tiny_env not in environments):
                         unavailable.add(("tinyvla", "tinyvla"))
-                    return configure_jobs(adapters, inventory, root, policies, display, catalog_for, unavailable)
+                    training_catalog = lambda model: catalog_for(mapping.get(model, native_env))
+                    return configure_jobs(adapters, inventory, root, policies, display, training_catalog,
+                                          evaluation_environment, unavailable)
                 if action == "install":
                     message = history.run(lambda: install_benchmark_menu(conda, root, environments, native_env, catalogs))
                     display.notice(message)
@@ -628,9 +666,9 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             display.notice(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
 
-def configure_jobs(adapters, inventory, root, policies, display, catalog_for, unavailable):
+def configure_jobs(adapters, inventory, root, policies, display, training_catalog, evaluation_environment, unavailable):
     def configure():
-        job = configure_job(adapters, inventory, root, policies, catalog_for, unavailable)
+        job = configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment, unavailable)
         return job, ask("Add Another Job? (Y/N)", "N").upper() == "Y"
 
     jobs = []
@@ -651,7 +689,7 @@ def configure_jobs(adapters, inventory, root, policies, display, catalog_for, un
         histories.append(QuestionHistory(display))
 
 
-def configure_job(adapters, inventory, root, policies, catalog_for, unavailable):
+def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment, unavailable):
     backend, model = choose_policy(adapters, policies, unavailable)
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
@@ -667,13 +705,16 @@ def configure_job(adapters, inventory, root, policies, catalog_for, unavailable)
             print("Training Scope · Action head")
             cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
         else:
-            cfg["train"] = native_train(operation == "resume", inventory, model, catalog_for(model))
+            cfg["train"] = native_train(operation == "resume", inventory, model, training_catalog(model))
     evaluate = operation in ("eval", "both") or (
         operation in ("resume", "warm") and ask("Evaluate After Training? (Y/N)", "N").upper() == "Y"
     )
     if evaluate:
         print("\n" + styled("Evaluation Setup", "1;36"))
-        cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, catalog_for(None if tiny else model))
+        environment, catalog, override = evaluation_environment(model, tiny)
+        cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, catalog)
+        if override:
+            cfg["eval"]["environment"] = environment
     return cfg
 
 

@@ -549,7 +549,7 @@ class ManagerTests(unittest.TestCase):
     def test_benchmark_menu_installs_in_selected_environment_and_refreshes_catalog(self):
         catalogs = {"lerobot": {"benchmarks": {"libero": True, "pusht": False}}}
         refreshed = {"benchmarks": {"libero": True, "pusht": True}}
-        with patch("sys.stdin", io.StringIO("\n\nY\n")), \
+        with patch("sys.stdin", io.StringIO("\n\n\nY\n")), \
              patch("manage.subprocess.run") as subprocess, \
              patch("manage.environment_catalog", return_value=refreshed), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
@@ -561,6 +561,28 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("PushT <Not Installed>", menu.getvalue())
         self.assertEqual(message, "Installed pusht in lerobot.")
         self.assertTrue(catalogs["lerobot"]["benchmarks"]["pusht"])
+
+    def test_benchmark_can_be_installed_and_selected_in_a_cloned_environment(self):
+        environments = {"lerobot"}
+        catalogs = {"lerobot": {"benchmarks": {"pusht": False}}}
+        refreshed = {"benchmarks": {"pusht": True}}
+        with patch("sys.stdin", io.StringIO("\n\n2\n\nY\n")), \
+             patch("manage.subprocess.run") as subprocess, \
+             patch("manage.environment_catalog", return_value=refreshed), \
+             contextlib.redirect_stdout(io.StringIO()):
+            subprocess.return_value.returncode = 0
+            message = install_benchmark_menu("conda", self.root, environments, "lerobot", catalogs)
+        clone, install = [call.args[0] for call in subprocess.call_args_list]
+        self.assertEqual(clone, ["conda", "create", "--yes", "--name", "lerobot_pusht", "--clone", "lerobot"])
+        self.assertIn("lerobot_pusht", install)
+        self.assertEqual(install[-3:], ["--install", "pusht", "--isolated"])
+        self.assertIn("lerobot_pusht", environments)
+        self.assertEqual(message, "Installed pusht in lerobot_pusht.")
+        job = sample_settings()
+        job["eval"]["environment"] = "lerobot_pusht"
+        adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
+        self.assertEqual(adapter.evaluate(after_training=True).environment, "lerobot_pusht")
+        self.assertEqual(adapter.train().environment, "smolvla_env")
 
     def test_training_scope_and_lora_map_to_native_flags(self):
         catalog = {"training": {"smolvla": ["freeze_vision_encoder"]},
