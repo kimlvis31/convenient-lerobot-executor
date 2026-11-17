@@ -1,0 +1,23 @@
+{
+  "files": {
+    "meta/info.json": 2968,
+    "meta/stats.json": 13928,
+    "meta/tasks.parquet": 3316,
+    "meta/episodes/chunk-000/file-000.parquet": 87332,
+    "data/chunk-000/file-228.parquet": 46962,
+    "videos/observation.images.image/chunk-000/file-020.mp4": 31507714,
+    "videos/observation.images.image2/chunk-000/file-020.mp4": 28185463
+  },
+  "base_model": {
+    "repo": "lesjie/Llava-Pythia-700M",
+    "revision": "9ac93b5370af5a0b6e66ffa2b60e0316489826d5",
+    "file": "model.safetensors",
+    "size": 1421973152,
+    "sha256": "419f5eb48f555e0debc15b45548862537458ecf10389ee1e3d066f3af7341e09",
+    "tokenizer": {
+      "file": "tokenizer.json",
+      "size": 2113738,
+      "sha256": "3cf430678137c8491ca82fb7092ee49e44ad38857fffe1e4a4a5ed860139a5b8"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "dataset_repo": "lerobot/libero",
+  "dataset_revision": "a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4",
+  "tasks": {
+    "pick up the cream cheese and place it in the basket": {
+      "suite": "libero_object",
+      "task_id": 1,
+      "episodes": [886]
+    }
+  },
+  "train_episodes": [886],
+  "validation_episodes": [892, 894, 900, 903, 913]
+}
