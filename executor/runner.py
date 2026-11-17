@@ -318,7 +318,6 @@ def progress_display(evaluation):
             from rich.console import Console
             from rich.live import Live
             from rich.padding import Padding
-            from rich.progress_bar import ProgressBar
             from rich.table import Table
             from rich.text import Text
         except ImportError:
@@ -327,6 +326,10 @@ def progress_display(evaluation):
             console = Console(file=sys.stdout, markup=False, highlight=False, emoji=False)
             with Live(console=console, auto_refresh=False,
                       redirect_stdout=False, redirect_stderr=False) as live:
+                def gauge(width, completed, total, color):
+                    filled = max(0, min(width, int(width * completed / total)))
+                    return Text.assemble(("▄" * filled, color), ("▂" * (width - filled), "bar.back"))
+
                 def refresh(message, completion, episode):
                     width = max(8, min(22, console.width // 6))
                     gauges = Table.grid(padding=(0, 1))
@@ -335,8 +338,7 @@ def progress_display(evaluation):
                     gauges.add_column()
                     gauges.add_row(
                         Text("•"),
-                        ProgressBar(total=100, completed=completion, width=width,
-                                    complete_style="green", finished_style="green"),
+                        gauge(width, completion, 100, "green"),
                         Text(message),
                     )
                     if evaluation:
@@ -350,8 +352,7 @@ def progress_display(evaluation):
                                 text += f" | Task: {task}"
                         gauges.add_row(
                             Text("•"),
-                            ProgressBar(total=limit, completed=current, width=width,
-                                        complete_style="bright_blue", finished_style="bright_blue"),
+                            gauge(width, current, limit, "bright_blue"),
                             Text(text),
                         )
                     live.update(Padding(gauges, (0, 0, 0, 4), expand=False), refresh=True)

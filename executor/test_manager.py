@@ -392,8 +392,8 @@ class ManagerTests(unittest.TestCase):
     def test_inventory_lists_numbered_entries_and_item_counts(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             show(Inventory(), {"lerobot", "lerobot_tinyvla"})
-        self.assertIn("Conda environments [2 found]\n  1. lerobot\n  2. lerobot_tinyvla", output.getvalue())
-        self.assertIn("\n\nTraining datasets [0 found]", output.getvalue())
+        self.assertIn("Conda Environments [2 found]\n  1. lerobot\n  2. lerobot_tinyvla", output.getvalue())
+        self.assertIn("\n\nTraining Datasets [0 found]", output.getvalue())
 
     def test_estimate_from_first_positive_measurement(self):
         stage = Stage("train", "lerobot", [], (), 8)

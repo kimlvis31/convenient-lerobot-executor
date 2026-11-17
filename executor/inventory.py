@@ -128,12 +128,12 @@ def show(inventory, environments, limit=None):
                 else f"{path} · metadata lists {info.get('total_episodes', '?')} episodes"
                 for path, info in inventory.datasets]
     groups = (
-        ("Conda environments", sorted(environments)),
-        ("Training datasets", datasets),
-        ("Models for evaluation or initialization", [f"{model} · {model_location(inventory, path)}" for path, model in inventory.models]),
-        ("Checkpoints with training state", [model_location(inventory, path) for path in inventory.native_resume + inventory.tiny_resume]),
-        ("Training and evaluation results", [str(path) for path in inventory.results]),
-        ("Previous job settings", [str(path) for path in inventory.settings]),
+        ("Conda Environments", sorted(environments)),
+        ("Training Datasets", datasets),
+        ("Models for Evaluation or Initialization", [f"{model} · {model_location(inventory, path)}" for path, model in inventory.models]),
+        ("Checkpoints with Training State", [model_location(inventory, path) for path in inventory.native_resume + inventory.tiny_resume]),
+        ("Training and Evaluation Results", [str(path) for path in inventory.results]),
+        ("Previous Job Settings", [str(path) for path in inventory.settings]),
     )
     for name, items in groups:
         heading = styled(name, "1;36")
