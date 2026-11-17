@@ -33,6 +33,9 @@ ROLLOUT_STEPS = re.compile(
 )
 
 STAGE_LABELS = {"train": "Training", "eval": "Evaluation"}
+TOTAL_REFRESH_SECONDS = 0.5
+EPISODE_REFRESH_SECONDS = 0.1
+STATUS_SAVE_SECONDS = 2.0
 
 
 def write_json(path, data):
@@ -512,8 +515,9 @@ def run_job(job, run_dir):
             label = STAGE_LABELS[stage.name]
             future_eta = sum(known_future) if None not in known_future else None
             historical_time = previous.get(signatures[index], previous.get(timing_keys[index]))
-            last_print = begin - 5
-            last_episode_print = begin - 1
+            last_print = begin - TOTAL_REFRESH_SECONDS
+            last_episode_print = begin - EPISODE_REFRESH_SECONDS
+            last_progress_save = begin - STATUS_SAVE_SECONDS
             active_episodes = {}
 
             def report(now, completed=False):
@@ -547,7 +551,7 @@ def run_job(job, run_dir):
                     saved["average_seconds_per_episode"] = progress.average()
 
             def update(line):
-                nonlocal last_print, last_episode_print
+                nonlocal last_print, last_episode_print, last_progress_save
                 now = time.monotonic()
                 if show_episode and (rollout := ROLLOUT_STEPS.search(line)):
                     task, current, limit = rollout.groups()
@@ -555,7 +559,7 @@ def run_job(job, run_dir):
                     sample = (current, limit)
                     if limit > 0 and current <= limit and active_episodes.get(task) != sample:
                         active_episodes[task] = sample
-                        if now - last_episode_print >= 0.25 or current == limit:
+                        if now - last_episode_print >= EPISODE_REFRESH_SECONDS or current == limit:
                             last_episode_print = now
                             report(now)
                 if show_episode and (ended := ROLLOUT_ENDED.search(line)):
@@ -565,12 +569,14 @@ def run_job(job, run_dir):
                 if not progress.update(line, now) or progress.count == previous_count:
                     return
                 active_episodes.pop(None, None)
-                if now - last_print < 2 and progress.count != stage.units:
+                if now - last_print < TOTAL_REFRESH_SECONDS and progress.count != stage.units:
                     if progress.rate is None or eta_scope is not None:
                         return
                 last_print = now
                 report(now)
-                save_status()
+                if now - last_progress_save >= STATUS_SAVE_SECONDS or progress.count == stage.units:
+                    save_status()
+                    last_progress_save = now
 
             if index:
                 print()
