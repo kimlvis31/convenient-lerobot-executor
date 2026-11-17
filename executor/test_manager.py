@@ -77,6 +77,9 @@ class ManagerTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
+        hub_cache = patch.dict("os.environ", {"HF_HUB_CACHE": str(self.root / "hub")})
+        hub_cache.start()
+        self.addCleanup(hub_cache.stop)
         self.logs = self.root / "executor/log"
         self.external = self.root / "externals/TinyVLA"
         self.envs = {"native": "lerobot", "tinyvla": "tinyvla_infer", "smolvla": "smolvla_env"}
@@ -352,8 +355,7 @@ class ManagerTests(unittest.TestCase):
             path.mkdir(parents=True)
             (path / "config.json").write_text('{"type": "smolvla"}', encoding="utf-8")
         (snapshot / "model.safetensors").write_bytes(b"weights")
-        with patch.dict("os.environ", {"HF_HUB_CACHE": str(hub)}):
-            inventory = scan(self.root, self.external, self.logs)
+        inventory = scan(self.root, self.external, self.logs)
         self.assertEqual(inventory.models, [(snapshot, "smolvla")])
         self.assertFalse(inventory.native_resume)
         self.assertEqual(inventory.cached_models[snapshot], "lerobot/smolvla-test @ abc12345")
