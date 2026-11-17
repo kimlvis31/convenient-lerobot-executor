@@ -377,7 +377,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot"):
         else:
             cfg["train"] = native_train(operation == "resume", inventory, model)
     evaluate = operation in ("eval", "both") or (
-        operation in ("resume", "warm") and ask("Evaluate after training? (y/N)", "n").lower() == "y"
+        operation in ("resume", "warm") and ask("Evaluate after training? (Y/N)", "N").upper() == "Y"
     )
     if evaluate:
         print("\n" + styled("Evaluation setup", "1;36"))
@@ -622,7 +622,9 @@ def main():
         show_settings(plans, show_commands=not (args.settings or args.queue) or args.dry_run)
         if args.dry_run:
             return 0
-        if not (args.settings or args.queue) and ask(f"Run {len(plans)} job(s)? (y/N)", "n").lower() != "y":
+        count = len(plans)
+        job_label = "job" if count == 1 else "jobs"
+        if not (args.settings or args.queue) and ask(f"Run {count} {job_label}? (Y/N)", "N").upper() != "Y":
             section("Result")
             print("Run canceled.")
             divider()

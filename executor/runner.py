@@ -580,6 +580,7 @@ def run_job(job, run_dir):
                         raise FileExistsError(f"Output path already exists ({stage.output}).")
                     stage.output.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Output directory: {stage.output}", flush=True)
+            print()
             with progress_display(stage.name == "eval") as (show_status, write_message, show_episode):
                 report(begin)
                 save_status()
