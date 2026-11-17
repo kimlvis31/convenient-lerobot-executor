@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from uuid import uuid4
@@ -24,8 +25,9 @@ SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
 def section(title):
-    print("\n" + styled("-" * 60, "36"))
-    print(styled(title, "1;36"))
+    width = shutil.get_terminal_size().columns
+    print("\n" + styled("-" * width, "90"))
+    print(styled(f"<{title}>", "1;95"))
 
 
 def ask(question, default=None, optional=False, *, show_default=True):
