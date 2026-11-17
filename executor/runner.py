@@ -319,7 +319,7 @@ def run_job(job, run_dir):
             saved["started_at"] = datetime.now(timezone.utc).isoformat()
             write_json(status_path, status)
             label = {"train": "Training", "eval": "Evaluation"}[stage.name]
-            print(f"Overall {100*index/len(stages):.0f}% · Starting {label.lower()} · Environment {stage.environment}", flush=True)
+            print(f"\nOverall {100*index/len(stages):.0f}% · Starting {label.lower()} · Environment {stage.environment}", flush=True)
             last_print = begin - 5
 
             def update(line):

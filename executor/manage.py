@@ -24,9 +24,9 @@ SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 
 def ask(question, default=None, optional=False):
-    suffix = f" [{default}]" if default is not None else ""
+    suffix = f" [Default: {default}]" if default is not None else ""
     while True:
-        value = input(f"{question}{suffix}: ").strip()
+        value = input(f"\n{question}{suffix}: ").strip()
         if value:
             return value
         if default is not None:
@@ -57,10 +57,10 @@ def rate(question, default):
         print("Enter a positive number.")
 
 
-def choose(question, options):
-    for index, (_, label) in enumerate(options, 1):
-        print(f"  {index}. {label}")
-    return options[number(question, 1, maximum=len(options)) - 1][0]
+def choose(question, options, default=1):
+    choices = "\n".join(f"  {index}. {label}" for index, (_, label) in enumerate(options, 1))
+    prompt = f"{question}\n{choices}\nSelect an option"
+    return options[number(prompt, default, maximum=len(options)) - 1][0]
 
 
 def path_value(value):
@@ -140,7 +140,7 @@ def tiny_train(warm, inventory, root):
             raise ValueError("The existing run must cover one task or all 40 tasks.")
     else:
         default_dataset = None
-        suite = choose("Training task", [(name, name) for name in SUITES] + [("all", "All 40 tasks across four suites")])
+        suite = choose("Training suite", [(name, name) for name in SUITES] + [("all", "All 40 tasks across four suites")])
         if suite != "all":
             train["task"] = [suite, number("Task ID", 1, 0, 9)]
         train["base_model"] = choose_model(inventory, "tinyvla", optional=True)
@@ -179,19 +179,55 @@ def native_train(resume, inventory):
     return model, train
 
 
-def eval_settings(model, tiny, train, inventory):
-    env_type = "libero" if tiny else ask("Evaluation environment type", "libero")
+def evaluation_suites(train, tiny):
     task = train.get("task") if tiny and train else None
-    default_tasks = task[0] if task else ",".join(SUITES) if tiny and train else "libero_object"
-    default_ids = str(task[1]) if task else None
-    cfg = {"env": env_type, "tasks": [s.strip() for s in ask("Evaluation suites", default_tasks).split(",") if s.strip()],
+    defaults = [task[0]] if task else list(SUITES) if tiny and train else ["libero_object"]
+    options = [(name, name) for name in SUITES] + [
+        ("all", "All four standard LIBERO suites"),
+        ("manual", "Enter suite names manually"),
+    ]
+    default = SUITES.index(defaults[0]) + 1 if len(defaults) == 1 else len(SUITES) + 1
+    choice = choose("Evaluation suite", options, default=default)
+    if choice == "all":
+        return list(SUITES)
+    if choice == "manual":
+        names = ask("Evaluation suites (comma-separated)", ",".join(defaults))
+        return [name.strip() for name in names.split(",") if name.strip()]
+    return [choice]
+
+
+def eval_settings(model, tiny, train, inventory):
+    if tiny:
+        env_type = "libero"
+        print("\nEvaluation benchmark · LIBERO")
+    else:
+        env_type = choose("Evaluation benchmark", [
+            ("libero", "LIBERO"),
+            ("pusht", "PushT"),
+            ("aloha", "ALOHA"),
+            ("metaworld", "Meta-World"),
+            ("manual", "Enter a LeRobot environment type"),
+        ])
+        if env_type == "manual":
+            env_type = ask("LeRobot environment type")
+
+    if env_type == "libero":
+        tasks = evaluation_suites(train, tiny)
+    else:
+        default_task = {"pusht": "PushT-v0", "aloha": "AlohaInsertion-v0", "metaworld": "medium"}.get(env_type)
+        tasks = [task.strip() for task in ask("Evaluation tasks (comma-separated)", default_task).split(",")
+                 if task.strip()]
+
+    cfg = {"env": env_type, "tasks": tasks,
            "episodes": number("Episodes per task", 5), "batch": 1 if tiny else number("Evaluation batch size", 1),
            "seed": number("Random seed", 0, 0), "device": "cpu" if tiny else ask("Evaluation device", "cuda")}
     if train is None:
         cfg["policy"] = choose_model(inventory, model, optional=tiny)
     if env_type == "libero":
-        ids = ask("Task IDs (comma-separated, or all)", default_ids, optional=True) if len(cfg["tasks"]) == 1 else ""
-        cfg.update(task_ids=[int(value) for value in ids.split(",")] if ids and ids != "all" else [],
+        task = train.get("task") if tiny and train else None
+        default_id = str(task[1]) if task and tasks == [task[0]] else "all"
+        ids = ask("Task IDs (comma-separated, or all)", default_id) if len(tasks) == 1 else "all"
+        cfg.update(task_ids=[int(value) for value in ids.split(",")] if ids != "all" else [],
                    episode_length=number("Max control steps per episode (0 uses the environment default)", 0, 0),
                    control="relative" if tiny else ask("Control mode", "absolute" if model == "xvla" else "relative"),
                    size=256 if tiny else number("Camera image width and height", 448 if model == "evo1" else 256))
@@ -251,7 +287,9 @@ def wizard(adapters, inventory, root):
     operation = choose("Job type", choices)
     cfg = {"schema": 1, "adapter": backend, "model": backend}
     if operation != "eval":
+        print("\nTraining setup")
         if tiny:
+            print("\nTraining benchmark · LIBERO")
             cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
         else:
             cfg["model"], cfg["train"] = native_train(operation == "resume", inventory)
@@ -261,6 +299,7 @@ def wizard(adapters, inventory, root):
         operation in ("resume", "warm") and ask("Evaluate after training? (y/N)", "n").lower() == "y"
     )
     if evaluate:
+        print("\nEvaluation setup")
         cfg["eval"] = eval_settings(cfg["model"], tiny, cfg.get("train"), inventory)
     return cfg
 
@@ -391,7 +430,7 @@ def plan(args):
 def run_plans(plans, conda, verbose):
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
         if len(plans) > 1:
-            print(f"Job {index}/{len(plans)} · {cfg.get('label') or cfg['model']}", flush=True)
+            print(f"\nJob {index}/{len(plans)} · {cfg.get('label') or cfg['model']}", flush=True)
         execute(stages, cfg, run_dir, root, conda, verbose)
 
 
@@ -414,6 +453,7 @@ def main():
         if not plans:
             return 0
         if not (args.settings or args.queue) or args.dry_run:
+            print("\nExecution plan")
             for index, (cfg, stages, _, _) in enumerate(plans, 1):
                 if len(plans) > 1:
                     print(f"Job {index}/{len(plans)} · {cfg.get('label') or cfg['model']}")

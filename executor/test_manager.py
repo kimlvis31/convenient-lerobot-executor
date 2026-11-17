@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan
-from manage import normalize_paths, number, plan, run_plans, settings_jobs, wizard
+from manage import eval_settings, normalize_paths, number, plan, run_plans, settings_jobs, wizard
 from runner import Progress, execute, load_settings, resolve_arguments
 
 
@@ -244,7 +244,7 @@ class ManagerTests(unittest.TestCase):
         fixture.write_text(f"JOBS = {[settings, settings]!r}\nraise RuntimeError('must not be executed')\n", encoding="utf-8")
         (directory / "notes.txt").touch()
         (directory / "prepare_examples.py").write_text("SETTINGS = {'steps': 4}\n", encoding="utf-8")
-        with patch("manage.SCRIPT_ROOT", directory), patch("builtins.input", side_effect=["2", "1"]), \
+        with patch("manage.SCRIPT_ROOT", directory), patch("sys.stdin", io.StringIO("2\n1\n")), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
             imported = wizard(load_adapters([]), Inventory(), self.root)
         self.assertIn("evaluate.py", menu.getvalue())
@@ -294,8 +294,24 @@ class ManagerTests(unittest.TestCase):
             adapter.train()
 
     def test_accepts_zero_seed_default(self):
-        with patch("builtins.input", return_value=""):
+        with patch("builtins.input", return_value="") as prompt:
             self.assertEqual(number("seed", 0, 0), 0)
+        prompt.assert_called_once_with("\nseed [Default: 0]: ")
+
+    def test_tinyvla_evaluation_defaults_to_training_suite_and_task(self):
+        answers = io.StringIO("\n1\n\n\n10\n\n\n")
+        with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
+            cfg = eval_settings("tinyvla", True, {"task": ["libero_goal", 7]}, Inventory())
+        self.assertEqual((cfg["env"], cfg["tasks"], cfg["task_ids"]), ("libero", ["libero_goal"], [7]))
+        self.assertIn("Select an option [Default: 3]", menu.getvalue())
+
+    def test_native_evaluation_uses_selected_benchmark(self):
+        answers = io.StringIO("2\n\n1\n\n\n\nlerobot/act_pusht\n\n")
+        with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
+            cfg = eval_settings("act", False, None, Inventory())
+        self.assertEqual((cfg["env"], cfg["tasks"]), ("pusht", ["PushT-v0"]))
+        self.assertIn("\nEvaluation benchmark\n", menu.getvalue())
+        self.assertIn("[Default: PushT-v0]", menu.getvalue())
 
 
 if __name__ == "__main__":
