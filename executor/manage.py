@@ -39,15 +39,18 @@ SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 
 def section(title):
     width = shutil.get_terminal_size().columns
-    print("\n" + styled("-" * width, "90"))
+    print(styled("-" * width, "90"))
     print(styled(f"<{title}>", "1;95"))
 
 
-def ask(question, default=None, optional=False, *, show_default=True):
-    hint = styled(f"[Default: {default}]", "33") if show_default and default is not None else ""
+def ask(question, default=None, optional=False, *, choices=()):
+    hint = styled(f"[Default: {default}]", "33") if not choices and default is not None else ""
     suffix = " " + hint if hint else ""
+    prompt = "\n".join([*choices, styled(question, "1;36") + suffix])
     while True:
-        value = input(f"\n{question}{suffix}: ").strip()
+        value = input(f"\n{prompt}: ").strip()
+        if not sys.stdin.isatty():
+            print()
         if value:
             return value
         if default is not None:
@@ -56,10 +59,10 @@ def ask(question, default=None, optional=False, *, show_default=True):
             return ""
 
 
-def number(question, default, minimum=1, maximum=None, *, show_default=True):
+def number(question, default, minimum=1, maximum=None, *, choices=()):
     while True:
         try:
-            value = int(ask(question, default, show_default=show_default))
+            value = int(ask(question, default, choices=choices))
             if value >= minimum and (maximum is None or value <= maximum):
                 return value
         except ValueError:
@@ -87,8 +90,7 @@ def choose(question, options, default=1, *, details=None):
         if details and value in details:
             row += "  " + styled(details[value], "90")
         choices.append(row)
-    prompt = "\n".join([*choices, styled(question, "1;36")])
-    return options[number(prompt, default, maximum=len(options), show_default=False) - 1][0]
+    return options[number(question, default, maximum=len(options), choices=choices) - 1][0]
 
 
 def path_value(value):
