@@ -12,8 +12,8 @@ The executor runs from this checkout and uses LeRobot from the selected Conda en
 
 ```text
 convLexecutor/
-├── executor/           # Interactive executor and per-job logs
-├── scripts/            # Job queues and example preparation
+├── executor/           # Interactive executor and example preparation
+├── scripts/            # Job queue files
 ├── datasets/           # Local datasets and the LeRobot dataset cache
 ├── externals/TinyVLA/   # TinyVLA adapter and local base model
 └── outputs/
@@ -52,8 +52,8 @@ conda run -n lerobot python -m pip install --no-deps --no-build-isolation \
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate lerobot
-python -B ~/convLexecutor/scripts/prepare_examples.py --dry-run
-python -B ~/convLexecutor/scripts/prepare_examples.py
+python -B ~/convLexecutor/executor/prepare_examples.py --dry-run
+python -B ~/convLexecutor/executor/prepare_examples.py
 python -B ~/convLexecutor/executor/manage.py --inventory
 python -B ~/convLexecutor/executor/manage.py \
   --queue ~/convLexecutor/scripts/example_script.py

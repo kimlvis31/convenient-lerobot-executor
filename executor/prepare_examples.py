@@ -12,10 +12,9 @@ import sys
 import tempfile
 from urllib.request import urlopen
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "executor"))
 from runner import available_environments, conda_command, conda_executable, resolve_environment
 
+REPO = Path(__file__).resolve().parents[1]
 MANIFEST_DIR = REPO / "datasets/example"
 TINYVLA = REPO / "externals/TinyVLA"
 SETTINGS = {"task": ["libero_object", 1], "updates": 4, "batch": 1,

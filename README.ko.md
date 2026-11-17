@@ -38,8 +38,8 @@ LeRobot 기본 모델만 사용한다면 별도 모델 환경과 아래 TinyVLA(
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate lerobot
-python -B ~/convLexecutor/scripts/prepare_examples.py --dry-run
-python -B ~/convLexecutor/scripts/prepare_examples.py
+python -B ~/convLexecutor/executor/prepare_examples.py --dry-run
+python -B ~/convLexecutor/executor/prepare_examples.py
 python -B ~/convLexecutor/executor/manage.py --inventory
 python -B ~/convLexecutor/executor/manage.py \
   --queue ~/convLexecutor/scripts/example_script.py
