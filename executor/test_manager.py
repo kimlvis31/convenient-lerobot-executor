@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json
 from inventory import Inventory, scan, show
-from manage import choose_policy, delete_result_runs, eval_settings, main, model_size, normalize_paths, number, plan, settings_jobs, show_job_result, show_settings, wizard
+from manage import ask, choose_policy, delete_result_runs, eval_settings, main, model_size, normalize_paths, number, plan, settings_jobs, show_job_result, show_settings, wizard
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
 
 
@@ -254,10 +254,12 @@ class ManagerTests(unittest.TestCase):
         fixture.write_text(f"JOBS = {[settings, settings]!r}\nraise RuntimeError('must not be executed')\n", encoding="utf-8")
         (directory / "notes.txt").touch()
         (directory / "prepare_examples.py").write_text("SETTINGS = {'steps': 4}\n", encoding="utf-8")
-        with patch("manage.SCRIPT_ROOT", directory), patch("sys.stdin", io.StringIO("2\n1\n")), \
+        with patch("manage.SCRIPT_ROOT", directory), patch("sys.stdin", io.StringIO("2\n2\nB\n1\n")), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
             imported = wizard(load_adapters([]), Inventory(), self.root)
         self.assertIn("evaluate.py", menu.getvalue())
+        self.assertIn("B. Back", menu.getvalue())
+        self.assertNotIn("[Job ", menu.getvalue())
         self.assertNotIn("notes.txt", menu.getvalue())
         self.assertNotIn("prepare_examples.py", menu.getvalue())
         self.assertEqual(settings_jobs(imported), [settings, settings])
@@ -272,12 +274,38 @@ class ManagerTests(unittest.TestCase):
              patch("manage.configure_job", side_effect=jobs), \
              contextlib.redirect_stdout(io.StringIO()) as menu:
             settings = wizard(load_adapters([]), Inventory(), self.root)
-        self.assertTrue(menu.getvalue().startswith("  1. Configure a new job"))
+        self.assertIn("<Questions>\n  1. Configure a new job", menu.getvalue())
         self.assertIn("What Would You Like to Do?", menu.getvalue())
         self.assertIn("[Job 1]", menu.getvalue())
         self.assertIn("<Questions>\n[Job 2]\n", menu.getvalue())
         self.assertEqual(menu.getvalue().count("Add Another Job? (Y/N) [Default: N]"), 2)
         self.assertEqual(settings_jobs(settings), [{"schema": 1, **job} for job in jobs])
+
+    def test_back_edits_the_previous_question_and_the_add_job_decision(self):
+        def configure(*_):
+            settings = sample_settings()
+            settings["label"] = ask("Job Name")
+            settings["train"]["steps"] = number("Training Steps", 20)
+            return settings
+
+        answers = io.StringIO("1\nfirst\ninvalid\n60\nB\n80\nY\nB\nN\n")
+        with patch("sys.stdin", answers), patch("manage.native_policies", return_value=["smolvla"]), \
+             patch("manage.configure_job", side_effect=configure), contextlib.redirect_stdout(io.StringIO()) as menu:
+            settings = wizard(load_adapters([]), Inventory(), self.root)
+        job, = settings_jobs(settings)
+        self.assertEqual(job["label"], "first")
+        self.assertEqual(job["train"]["steps"], 80)
+        self.assertIn("<Questions>\n[Job 2]\n", menu.getvalue())
+        self.assertEqual(menu.getvalue().count("Enter an integer within the allowed range."), 1)
+
+    def test_run_confirmation_defaults_to_yes(self):
+        plans = [({"model": "tinyvla"}, [], self.logs, self.root)]
+        with patch("sys.argv", ["manage.py"]), patch("sys.stdin", io.StringIO("\n")), \
+             patch("manage.plan", return_value=(plans, "fake")), patch("manage.run_plans") as execute, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(), 0)
+        self.assertIn("Run 1 job? (Y/N) [Default: Y]", output.getvalue())
+        execute.assert_called_once_with(plans, "fake", False)
 
     def test_wizard_deletes_only_confirmed_result_run_folders(self):
         paths = {
@@ -297,9 +325,14 @@ class ManagerTests(unittest.TestCase):
         marker.touch()
         with patch("sys.stdin", io.StringIO("3\n\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
             self.assertIsNone(wizard(load_adapters([]), Inventory(), self.root))
-        self.assertIn("Delete All Evaluation Results", menu.getvalue())
-        self.assertIn("Delete All Training Results", menu.getvalue())
+        self.assertIn("Delete all evaluation results", menu.getvalue())
+        self.assertIn("Delete all training results", menu.getvalue())
         self.assertIn("Deletion Canceled.", menu.getvalue())
+        self.assertTrue(paths["evaluation"].is_dir())
+        with patch("sys.stdin", io.StringIO("3\nB\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            self.assertIsNone(wizard(load_adapters([]), Inventory(), self.root))
+        self.assertIn("[B: Back]", menu.getvalue())
+        self.assertNotIn("[Job ", menu.getvalue())
         self.assertTrue(paths["evaluation"].is_dir())
         with patch("sys.stdin", io.StringIO("3\nY\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
             self.assertIsNone(wizard(load_adapters([]), Inventory(), self.root))

@@ -2,6 +2,7 @@
 """Interactive LeRobot training, evaluation, and resume manager."""
 
 import argparse
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 import json
 import math
@@ -17,6 +18,7 @@ from uuid import uuid4
 
 from adapters import SUITES, load_adapters, native_checkpoint, read_json
 from inventory import model_location, scan, show
+from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
 from runner import ANSI, available_environments, conda_executable, execute, load_settings, native_policies, seconds, stage_title, styled
 
 
@@ -64,21 +66,35 @@ def section(title):
 
 
 def ask(question, default=None, optional=False, *, choices=(), blank_before=True):
+    history = active_history.get()
+    if history is not None and history.position < len(history.answers):
+        answer = history.answers[history.position]
+        history.position += 1
+        return answer
+
     hint = styled(f"[Default: {default}]", "33") if not choices and default is not None else ""
     suffix = " " + hint if hint else ""
+    if history is not None:
+        if choices:
+            choices = [*choices, "  B. Back"]
+        else:
+            suffix += " [B: Back]"
     prompt = "\n".join([*choices, styled(question, "1;36") + suffix])
     if blank_before:
         prompt = "\n" + prompt
+    read = sys.stdout.read if isinstance(sys.stdout, QuestionDisplay) else input
     while True:
-        value = input(f"{prompt}: ").strip()
+        value = read(f"{prompt}: ").strip()
         if not sys.stdin.isatty():
             print()
-        if value:
-            return value
-        if default is not None:
-            return default
-        if optional:
-            return ""
+        if history is not None and value.casefold() == "b":
+            raise PreviousQuestion
+        if value or default is not None or optional:
+            answer = value if value else default if default is not None else ""
+            if history is not None:
+                history.answers.append(answer)
+                history.position += 1
+            return answer
 
 
 def number(question, default, minimum=1, maximum=None, *, choices=(), blank_before=True):
@@ -89,6 +105,7 @@ def number(question, default, minimum=1, maximum=None, *, choices=(), blank_befo
                 return value
         except ValueError:
             pass
+        retry_question()
         print("Enter an integer within the allowed range.")
 
 
@@ -100,6 +117,7 @@ def rate(question, default):
                 return value
         except ValueError:
             pass
+        retry_question()
         print("Enter a positive number.")
 
 
@@ -137,6 +155,7 @@ def extra_flags():
         try:
             return shlex.split(ask("Additional LeRobot Options (optional)", optional=True))
         except ValueError:
+            retry_question()
             print("Check the quotation marks in the options.")
 
 
@@ -359,13 +378,13 @@ def run_in_use(run):
     return not isinstance(status, dict) or status.get("status") not in ("completed", "failed", "interrupted")
 
 
-def delete_result_runs(root, category):
+def delete_result_runs(root, category, *, notice=print):
     label = {"evaluation": "Evaluation", "training": "Training"}[category]
     folder = root.resolve() / "outputs" / category
     if folder.resolve() != folder:
         raise ValueError(f"Refusing to clean a redirected result folder ({folder}).")
     if not folder.is_dir():
-        print(f"No {label} Run Folders Found.")
+        notice(f"No {label} Run Folders Found.")
         return False
 
     selected = []
@@ -381,7 +400,7 @@ def delete_result_runs(root, category):
     if protected:
         print(f"Protected Run Folders: {protected} (active, unreadable, or redirected).")
     if not selected:
-        print(f"No {label} Run Folders Available to Delete.")
+        notice(f"No {label} Run Folders Available to Delete.")
         return False
     print(f"Result Folder: {folder}")
     if category == "training":
@@ -389,7 +408,7 @@ def delete_result_runs(root, category):
     count = len(selected)
     unit = "Run Folder" if count == 1 else "Run Folders"
     if ask(f"Permanently Delete {count} {label} {unit}? (Y/N)", "N").upper() != "Y":
-        print("Deletion Canceled.")
+        notice("Deletion Canceled.")
         return False
 
     deleted = 0
@@ -403,62 +422,83 @@ def delete_result_runs(root, category):
             deleted += 1
         except OSError as error:
             print(f"Could Not Delete {run} ({error}).", file=sys.stderr)
-    print(f"Deleted {deleted} of {count} {label} {unit}.")
+    notice(f"Deleted {deleted} of {count} {label} {unit}.")
     return deleted > 0
 
 
 def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
            external=None, environments=(), allow_delete=True):
-    while True:
-        actions = [("new", "Configure a new job")]
-        if inventory.settings:
-            actions.append(("reuse", "Reuse settings from a previous run"))
-        actions.append(("import", "Import a job queue script"))
-        if inventory.results:
-            actions.append(("results", "View existing results"))
-        if allow_delete:
-            actions.extend((("evaluation", "Delete All Evaluation Results"),
-                            ("training", "Delete All Training Results")))
-        actions.append(("quit", "Exit"))
-        action = choose("What Would You Like to Do?", actions, blank_before=False)
-        if action == "quit":
-            return None
-        if action == "reuse":
-            path = select_path("Settings File", [(p, str(p)) for p in inventory.settings])
-            return load_settings(path)
-        if action == "import":
-            scripts = script_paths()
-            path = select_path("Job Queue Script", [(p, p.name) for p in scripts])
-            return load_settings(path)
-        if action == "new":
-            policies = native_policies(conda, native_env, root)
-            return configure_jobs(adapters, inventory, root, policies, environments)
-        if action in {"evaluation", "training"}:
-            if delete_result_runs(root, action):
-                inventory = scan(root, external or root / "externals/TinyVLA", root / "executor/log")
-                section("Status")
-                show(inventory, environments, limit=5)
-                section("Questions")
-            continue
-        path = select_path("Result File", [(p, str(p)) for p in inventory.results])
-        result = read_json(path)
-        summary = result.get("overall") or {key: result[key] for key in
-                    ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
-        print(json.dumps(summary or result, ensure_ascii=False, indent=2))
+    display = QuestionDisplay(sys.stdout, section)
+    with redirect_stdout(display):
+        while True:
+            display.show()
+            actions = [("new", "Configure a new job")]
+            if inventory.settings:
+                actions.append(("reuse", "Reuse settings from a previous run"))
+            actions.append(("import", "Import a job queue script"))
+            if inventory.results:
+                actions.append(("results", "View existing results"))
+            if allow_delete:
+                actions.extend((("evaluation", "Delete all evaluation results"),
+                                ("training", "Delete all training results")))
+            actions.append(("quit", "Exit"))
+            action = choose("What Would You Like to Do?", actions, blank_before=False)
+            if action == "quit":
+                return None
+
+            history = QuestionHistory(display)
+            try:
+                if action == "new":
+                    policies = native_policies(conda, native_env, root)
+                    return configure_jobs(adapters, inventory, root, policies, display)
+                if action == "reuse":
+                    files = [(p, str(p)) for p in inventory.settings]
+                    path = history.run(lambda: select_path("Settings File", files))
+                    return load_settings(path)
+                if action == "import":
+                    scripts = [(p, p.name) for p in script_paths()]
+                    path = history.run(lambda: select_path("Job Queue Script", scripts))
+                    return load_settings(path)
+                if action in {"evaluation", "training"}:
+                    deleted = history.run(lambda: delete_result_runs(root, action, notice=display.notice))
+                    if deleted:
+                        inventory = scan(root, external or root / "externals/TinyVLA", root / "executor/log")
+                        with redirect_stdout(display.stream):
+                            section("Status")
+                            show(inventory, environments, limit=5)
+                    continue
+                files = [(p, str(p)) for p in inventory.results]
+                path = history.run(lambda: select_path("Result File", files))
+            except PreviousQuestion:
+                continue
+
+            result = read_json(path)
+            summary = result.get("overall") or {key: result[key] for key in
+                        ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
+            display.notice(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
 
-def configure_jobs(adapters, inventory, root, policies, environments):
+def configure_jobs(adapters, inventory, root, policies, display):
+    def configure():
+        job = configure_job(adapters, inventory, root, policies)
+        return job, ask("Add Another Job? (Y/N)", "N").upper() == "Y"
+
     jobs = []
+    histories = [QuestionHistory(display)]
     while True:
-        print(styled(f"[Job {len(jobs) + 1}]", "1;36"), flush=True)
-        jobs.append(configure_job(adapters, inventory, root, policies))
-        if ask("Add Another Job? (Y/N)", "N").upper() != "Y":
+        try:
+            job, another = histories[-1].run(configure, job_number=len(histories))
+        except PreviousQuestion:
+            if not jobs:
+                raise
+            histories.pop()
+            jobs.pop()
+            histories[-1].rewind()
+            continue
+        jobs.append(job)
+        if not another:
             return {"schema": 1, "jobs": jobs}
-        if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
-            print("\x1b[2J\x1b[H", end="", flush=True)
-            section("Status")
-            show(inventory, environments, limit=5)
-        section("Questions")
+        histories.append(QuestionHistory(display))
 
 
 def configure_job(adapters, inventory, root, policies):
@@ -600,7 +640,6 @@ def plan(args):
             return [], conda
         env_map = read_json(args.env_map) if args.env_map else {}
         native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
-        section("Questions")
         settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env,
                           external=external, environments=detected[PROJECT_ROOT], allow_delete=not args.dry_run)
         if settings is None:
@@ -754,7 +793,7 @@ def main():
             return 0
         count = len(plans)
         job_label = "job" if count == 1 else "jobs"
-        if not (args.settings or args.queue) and ask(f"Run {count} {job_label}? (Y/N)", "N").upper() != "Y":
+        if not (args.settings or args.queue) and ask(f"Run {count} {job_label}? (Y/N)", "Y").upper() != "Y":
             section("Result")
             print("Run canceled.")
             divider()
