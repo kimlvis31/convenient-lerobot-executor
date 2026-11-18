@@ -20,6 +20,7 @@ BENCHMARKS = (
     ("metaworld", "Meta-World"),
 )
 DEPENDENCY_CONFLICT = 3
+LEROBOT_RUNTIME_EXTRAS = ("training", "evaluation", "dataset")
 BENCHMARK_MODULES = {
     "libero": "libero", "pusht": "gym_pusht", "aloha": "gym_aloha", "metaworld": "metaworld",
 }
@@ -174,7 +175,10 @@ def environment_catalog():
                     if config.__module__.startswith("lerobot.envs.") and name not in installable
                     and name != "gym_manipulator")
     peft_requirements = optional_requirements(distribution, "peft")
+    runtime = {extra: all(installed(req, versions) for req in optional_requirements(distribution, extra))
+               for extra in LEROBOT_RUNTIME_EXTRAS}
     return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
+            "runtime": runtime,
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
             "peft_ready": "peft" in versions and all(installed(req, versions) for req in peft_requirements),
             "peft_installable": bool(peft_requirements),
@@ -182,7 +186,7 @@ def environment_catalog():
             "policy_issues": issues, "policy_installable": sorted(policy_installable), "training_options": options}
 
 
-def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False, isolated=False):
+def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False, runtime=None, isolated=False):
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
@@ -212,6 +216,10 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False
         if config is None or not config.__module__.startswith("lerobot.policies.") or not declared:
             raise ValueError(f"LeRobot {distribution.version} does not declare installable dependencies for {policy}.")
         requirements.extend(declared)
+    if runtime:
+        if runtime not in LEROBOT_RUNTIME_EXTRAS:
+            raise ValueError(f"Unknown LeRobot runtime extra: {runtime}.")
+        requirements.extend(optional_requirements(distribution, runtime))
     if peft:
         declared = optional_requirements(distribution, "peft")
         if not declared:
@@ -246,16 +254,17 @@ def main():
     parser.add_argument("--policy", help="Install the declared dependencies for a native policy")
     parser.add_argument("--plugin", help="Install a named LeRobot environment plugin")
     parser.add_argument("--peft", action="store_true", help="Install the declared LoRA dependencies")
+    parser.add_argument("--runtime", choices=LEROBOT_RUNTIME_EXTRAS, help="Install the declared LeRobot runtime extra")
     parser.add_argument("--isolated", action="store_true")
     args = parser.parse_args()
-    if sum(map(bool, (args.catalog, args.install or args.policy or args.peft, args.plugin))) != 1:
-        parser.error("Choose --catalog, --install/--policy/--peft, or --plugin.")
+    if sum(map(bool, (args.catalog, args.install or args.policy or args.peft or args.runtime, args.plugin))) != 1:
+        parser.error("Choose --catalog, --install/--policy/--peft/--runtime, or --plugin.")
     try:
         if args.catalog:
             print("MANAGER_CATALOG " + json.dumps(environment_catalog()))
         else:
             return install_dependencies(benchmark=args.install, policy=args.policy, plugin=args.plugin,
-                                        peft=args.peft, isolated=args.isolated)
+                                        peft=args.peft, runtime=args.runtime, isolated=args.isolated)
     except (ImportError, ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"Dependency setup failed ({error}).", file=sys.stderr)
         return 1

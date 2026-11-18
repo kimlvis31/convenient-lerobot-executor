@@ -63,9 +63,11 @@ def available_environments(conda, root):
     if not conda:
         return set()
     try:
-        result = subprocess.run([conda, "env", "list", "--json"], cwd=root, capture_output=True,
+        result = subprocess.run([conda, "info", "--json"], cwd=root, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=15, check=True)
-        return {Path(path).name for path in json.loads(result.stdout)["envs"]}
+        info = json.loads(result.stdout)
+        base = Path(info["root_prefix"]) if info.get("root_prefix") else None
+        return {"base" if path == base else path.name for path in map(Path, info["envs"])}
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         return set()
 
@@ -395,12 +397,17 @@ def progress_display(evaluation):
 
 
 class StageFailure(RuntimeError):
-    def __init__(self, stage, code, logfile):
+    def __init__(self, stage, code, logfile, *, artifact_error=None):
         self.stage = stage
         self.code = code
         self.logfile = logfile
-        self.reason = stage_failure_reason(logfile)
-        message = f"{stage} exited with code {code}."
+        if artifact_error is None:
+            self.description = f"{stage} exited with code {code}"
+            self.reason = stage_failure_reason(logfile)
+        else:
+            self.description = f"{stage} did not produce valid results"
+            self.reason = str(artifact_error)
+        message = f"{self.description}."
         if self.reason:
             message += f" Cause: {self.reason}"
         super().__init__(f"{message} See {logfile}.")
@@ -433,7 +440,11 @@ def stage_failure_reason(logfile):
         match = re.fullmatch(r"((?:[A-Za-z_]\w*\.)*(?:[A-Z]\w*(?:Error|Exception)|Error|Exception)):\s*(.*)", line)
         if match:
             error, detail = match.groups()
-            if error.rsplit(".", 1)[-1] in {"CalledProcessError", "ChildFailedError"}:
+            error_type = error.rsplit(".", 1)[-1]
+            if error_type in {"CalledProcessError", "ChildFailedError"}:
+                continue
+            if error_type in {"BrokenPipeError", "ConnectionResetError"}:
+                diagnostic = compact(line, 320)
                 continue
             if "CUDA out of memory" in detail:
                 requested = re.search(r"Tried to allocate (\d+(?:\.\d+)? [KMG]iB)", detail)
@@ -482,10 +493,13 @@ def run_stage(command, stage, root, logfile, update, write_message=None):
             process.stdout.close()
     if code != 0:
         raise StageFailure(stage.name, code, logfile)
-    for item in stage.artifacts:
-        require(item)
-    if stage.artifacts:
-        read_json(stage.artifacts[0])
+    try:
+        for item in stage.artifacts:
+            require(item)
+        if stage.artifacts and not isinstance(read_json(stage.artifacts[0]), dict):
+            raise ValueError(f"Expected a result object ({stage.artifacts[0]}).")
+    except (OSError, ValueError) as error:
+        raise StageFailure(stage.name, code, logfile, artifact_error=error) from error
 
 
 def load_settings(path):

@@ -13,13 +13,13 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json, training_flags
 from inventory import Inventory, scan, show
-from manage import (LeRobotEnvironments, ask, choose_evaluation_environment, choose_policy,
+from manage import (LeRobotEnvironments, prepare_job_environments, ask, choose_evaluation_environment, choose_policy,
                     choose, command_preview, component_scopes, configure_job, configure_policy_options, configure_training_scope,
                     delete_result_runs, eval_settings,
                     main, native_dataset, model_size, normalize_paths, number, plan,
                     settings_jobs, show_job_result, show_settings, wizard)
 from questions import QuestionDisplay, QuestionHistory
-from runner import (Progress, StageFailure, evaluation_timing_key, execute, history, load_settings,
+from runner import (Progress, StageFailure, available_environments, evaluation_timing_key, execute, history, load_settings,
                     progress_display, resolve_arguments, seconds, status_line)
 
 
@@ -88,6 +88,9 @@ if args[0] == 'lerobot-train':
     state = model.parent / 'training_state'
     state.mkdir()
     (state / 'training_step.json').write_text('{"step":%d}' % steps)
+    (state / 'rng_state.safetensors').write_bytes(b'fixture-rng')
+    (state / 'optimizer_state.safetensors').write_bytes(b'fixture-optimizer')
+    (state / 'optimizer_param_groups.json').write_text('{}')
     print('step:4 smoothed loss:0.2', flush=True)
     print(f'Checkpoint policy after step {steps}', flush=True)
 elif args[0] == 'lerobot-eval':
@@ -188,8 +191,10 @@ class ManagerTests(unittest.TestCase):
         with patch("runner.resolve_environment", return_value=self.environment), \
              patch("runner.conda_command", side_effect=lambda c, e, argv: [sys.executable, "-u", str(self.backend), *argv]), \
              contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaisesRegex(StageFailure, "eval did not produce valid results") as failure:
                 execute([adapter.evaluate(False)], settings, run, self.root, "fake", False)
+        self.assertIn("eval_info.json", failure.exception.reason)
+        self.assertEqual(failure.exception.logfile, run / "eval.log")
         self.assertEqual(read_json(run / "status.json")["status"], "failed")
 
     def test_tinyvla_routes_each_stage_to_its_environment(self):
@@ -495,6 +500,11 @@ class ManagerTests(unittest.TestCase):
             (path / "executor").mkdir(parents=True)
             (path / "executor/status.json").write_text('{"status": "completed"}', encoding="utf-8")
         (paths["active"] / "executor/status.json").write_text('{"status": "running"}', encoding="utf-8")
+        preparing = paths["evaluation"].parent / "preparing"
+        (preparing / "executor").mkdir(parents=True)
+        (preparing / "executor/run.py").touch()
+        starting = paths["evaluation"].parent / "starting"
+        starting.mkdir()
         marker = paths["evaluation"].parent / ".gitkeep"
         marker.touch()
         with patch("sys.stdin", io.StringIO("3\n\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
@@ -508,12 +518,14 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("[B: Back]", menu.getvalue())
         self.assertNotIn("[Job ", menu.getvalue())
         self.assertTrue(paths["evaluation"].is_dir())
-        with patch("sys.stdin", io.StringIO("3\nY\n5\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+        with patch("sys.stdin", io.StringIO("3\nY\n6\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
             self.assertIsNone(wizard(load_adapters([]), Inventory(), self.root))
         self.assertIn("Deleted 1 of 1 Evaluation Run Folder.", menu.getvalue())
         self.assertFalse(paths["evaluation"].exists())
         self.assertTrue(all(paths[name].is_dir() for name in ("active", "training", "example", "dataset")))
         self.assertTrue(marker.is_file())
+        self.assertTrue(preparing.is_dir())
+        self.assertTrue(starting.is_dir())
         with patch("sys.stdin", io.StringIO("Y\n")), contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(delete_result_runs(self.root, "training"))
         self.assertFalse(paths["training"].exists())
@@ -870,6 +882,113 @@ class ManagerTests(unittest.TestCase):
         with patch("manage.subprocess.run") as process:
             self.assertEqual(environments.prepare("preferred", model="act", benchmark="pusht"), "sim_b")
         process.assert_not_called()
+
+    def test_base_uses_its_conda_name(self):
+        prefix = self.root / "miniconda3"
+        listing = {"root_prefix": str(prefix), "envs": [str(prefix), str(prefix / "envs/robot")]}
+        with patch("runner.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(listing))):
+            self.assertEqual(available_environments("conda", self.root), {"base", "robot"})
+
+    def test_native_lora_inventory_requires_weights_and_complete_training_state(self):
+        model = self.root / "outputs/training/run/train/checkpoints/003/pretrained_model"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text('{"type":"smolvla","use_peft":true}')
+        (model / "adapter_config.json").write_text('{"base_model_name_or_path":"lerobot/smolvla_base"}')
+        (model / "train_config.json").write_text('{"policy":{"type":"smolvla","use_peft":true}}')
+        self.assertFalse(scan(self.root, self.external, self.logs).models)
+        (model / "adapter_model.safetensors").write_bytes(b"adapter")
+        state = model.parent / "training_state"
+        state.mkdir()
+        (state / "training_step.json").write_text('{"step":3}')
+        inventory = scan(self.root, self.external, self.logs)
+        self.assertIn((model, "smolvla"), inventory.models)
+        self.assertFalse(inventory.native_resume)
+        for name in ("rng_state.safetensors", "optimizer_state.safetensors", "optimizer_param_groups.json"):
+            (state / name).write_bytes(b"fixture")
+        self.assertIn(model, scan(self.root, self.external, self.logs).native_resume)
+
+    def test_native_lora_prepares_runtime_for_training_and_evaluation(self):
+        environments = LeRobotEnvironments("conda", self.root, "lerobot", set())
+        sessions = {(self.root, "lerobot"): environments}
+        settings = sample_settings()
+        settings["train"].update(pretrained="lerobot/smolvla_base", lora={"rank": 2})
+        adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
+        with patch.object(environments, "prepare", return_value="smolvla_env") as prepare:
+            prepare_job_environments(settings, [adapter.train(), adapter.evaluate(True)], self.root, "conda", sessions)
+        self.assertEqual([(call.kwargs["runtime"], call.kwargs["peft"]) for call in prepare.call_args_list],
+                         [("training", True), ("evaluation", True)])
+        local = self.root / "adapter"
+        local.mkdir()
+        (local / "adapter_config.json").write_text('{"base_model_name_or_path":"lerobot/smolvla_base"}')
+        (local / "adapter_model.safetensors").write_bytes(b"adapter")
+        settings["eval"]["policy"] = str(local)
+        del settings["train"]
+        with patch.object(environments, "prepare", return_value="smolvla_env") as prepare:
+            prepare_job_environments(settings, [adapter.evaluate(False)], self.root, "conda", sessions)
+        self.assertTrue(prepare.call_args.kwargs["peft"])
+
+    def test_dependency_install_tries_an_existing_alternate_before_cloning(self):
+        environments = LeRobotEnvironments("conda", self.root, "preferred", {"alternate"})
+        needs_eval = {"policies": {"act": True}, "runtime": {"evaluation": False}}
+        ready = {"policies": {"act": True}, "runtime": {"evaluation": True}}
+        environments.catalogs = {"preferred": needs_eval, "alternate": needs_eval}
+        results = [subprocess.CompletedProcess([], code, stdout="") for code in (3, 0)]
+        with patch("manage.subprocess.run", side_effect=results) as process, \
+             patch("manage.environment_catalog", return_value=ready), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(environments.prepare("preferred", model="act", runtime="evaluation"), "alternate")
+        commands = [call.args[0] for call in process.call_args_list]
+        self.assertEqual([command[4] for command in commands], ["preferred", "alternate"])
+        self.assertTrue(all(command[-2:] == ["--runtime", "evaluation"] for command in commands))
+
+    def test_dependency_install_removes_its_failed_clone(self):
+        environments = LeRobotEnvironments("conda", self.root, "preferred", set())
+        environments.catalogs = {"preferred": {"policies": {"act": True}, "benchmarks": {"pusht": False}}}
+        results = [subprocess.CompletedProcess([], code, stdout="isolated error") for code in (3, 0, 1, 0)]
+        with patch("manage.subprocess.run", side_effect=results) as process, \
+             patch("manage.available_environments", return_value=set()), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "isolated error"):
+                environments.prepare("preferred", model="act", benchmark="pusht")
+        self.assertEqual(process.call_args.args[0], ["conda", "env", "remove", "--yes", "--name", "preferred_pusht"])
+        self.assertNotIn("preferred_pusht", environments.names)
+
+    def test_single_task_benchmarks_keep_batched_inference_with_sync_workers(self):
+        settings = sample_settings()
+        adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
+        for kind, task in (("pusht", "PushT-v0"), ("aloha", "AlohaTransferCube-v0")):
+            with self.subTest(kind=kind):
+                settings["eval"].update(env=kind, tasks=[task], episodes=5, batch=2, episode_length=10)
+                stage = adapter.evaluate(True)
+                self.assertEqual(stage.units, 5)
+                self.assertEqual(stage.eval_batches, 3)
+                self.assertIn("--eval.batch_size=2", stage.arguments)
+                self.assertIn("--eval.use_async_envs=false", stage.arguments)
+                self.assertEqual(stage.auto_flags, ("eval.use_async_envs",))
+                settings["eval"]["tasks"] = [task, "second"]
+                with self.assertRaisesRegex(ValueError, "one evaluation task"):
+                    adapter.evaluate(True)
+        settings["eval"].update(env="metaworld", tasks=["reach-v3", "push-v3"])
+        with self.assertRaisesRegex(ValueError, "default episode length"):
+            adapter.evaluate(True)
+
+    def test_tinyvla_uses_matching_local_dataset_split_without_network(self):
+        for name in ("training/train_head.py", "training/lerobot_data.py", "runtime/tinyvla_loader.py",
+                     "models/Llava-Pythia-700M/config.json", "models/Llava-Pythia-700M/model.safetensors"):
+            file = self.external / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b"fixture")
+        dataset = self.root / "datasets" / "partial"
+        dataset.mkdir(parents=True)
+        split = dataset / "selection.json"
+        split.write_text('{"train_episodes":[886], "tasks":{"fixture":{"suite":"libero_object","task_id":1}}}')
+        settings = {"model": "tinyvla", "train": {"dataset_root": str(dataset), "task": ["libero_object", 1],
+                    "batch": 1, "updates": 1, "seed": 0, "lr": 0.001, "save_freq": 1}}
+        adapter = TinyVLAAdapter(settings, "run", self.root, self.external, self.envs)
+        stage = adapter.train()
+        self.assertIn(f"--data={split}", stage.arguments)
+        self.assertIn("data", stage.auto_flags)
+        settings["train"]["task"] = ["libero_spatial", 1]
+        with self.assertRaisesRegex(ValueError, "split"):
+            adapter.train()
 
     def test_local_dataset_does_not_ask_for_a_repository_and_limits_episodes(self):
         folder = self.root / "datasets/libero"

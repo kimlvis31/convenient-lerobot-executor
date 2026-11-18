@@ -4,13 +4,16 @@ from dataclasses import dataclass, field
 import importlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import sys
 
 from training_preflight import native_training_preflight
 
 
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+SINGLE_TASK_BENCHMARKS = {"pusht": "PushT-v0", "aloha": "AlohaInsertion-v0"}
 TRAINING_SWITCHES = {
     "train_expert_only": "Action expert",
     "freeze_vision_encoder": "Vision encoder",
@@ -116,6 +119,54 @@ def weights(path):
     else:
         require(path / "model.safetensors")
     return path
+
+
+def native_peft_checkpoint(path):
+    path = Path(path).expanduser()
+    adapter = path / "adapter_config.json"
+    if not adapter.is_file():
+        return False
+    config = read_json(adapter)
+    base_model = config.get("base_model_name_or_path") if isinstance(config, dict) else None
+    if not isinstance(base_model, str) or not base_model.strip():
+        raise ValueError(f"PEFT adapter configuration does not identify its base model ({adapter}).")
+    safe_weights = path / "adapter_model.safetensors"
+    require(safe_weights if safe_weights.is_file() else path / "adapter_model.bin")
+    return True
+
+
+def validate_native_policy(path, model):
+    config = Path(path).expanduser() / "config.json"
+    if config.is_file():
+        data = read_json(config)
+        kind = data.get("type") if isinstance(data, dict) else None
+        if kind and kind != model:
+            raise ValueError(f"The checkpoint uses the {kind} policy, but the job selects {model}.")
+
+
+def native_training_step(model_dir):
+    state_dir = model_dir.parent / "training_state"
+    step_file = require(state_dir / "training_step.json")
+    metadata = read_json(step_file)
+    step = metadata.get("step") if isinstance(metadata, dict) else None
+    if type(step) is not int or step < 0:
+        raise ValueError(f"Invalid checkpoint step ({step_file}).")
+    require(state_dir / "rng_state.safetensors")
+
+    def present(path):
+        return path.is_file() and path.stat().st_size > 0
+
+    optimizer_files = ("optimizer_state.safetensors", "optimizer_param_groups.json")
+    optimizer_dirs = [path for path in state_dir.iterdir() if path.is_dir() and
+                      any((path / name).exists() for name in optimizer_files)]
+    if not all(present(state_dir / name) for name in optimizer_files):
+        sharded = state_dir / "optimizer_0"
+        shards_present = present(sharded / ".metadata") and any(present(path) for path in sharded.glob("*.distcp"))
+        named_optimizers = optimizer_dirs and all(present(path / name) for path in optimizer_dirs
+                                                  for name in optimizer_files)
+        if not (shards_present or named_optimizers):
+            raise FileNotFoundError(f"Complete optimizer state not found ({state_dir}).")
+    return step
 
 
 def training_flags(config, model):
@@ -233,12 +284,8 @@ class NativeAdapter:
                 raise ValueError(f"The checkpoint uses the {old_model} policy.")
             if (old_cfg.get("job") or {}).get("target") not in (None, "local"):
                 raise ValueError("The checkpoint is configured for a remote job. Select a local checkpoint.")
-            state = model_dir.parent / "training_state"
-            if not state.is_dir():
-                raise FileNotFoundError(f"Training state directory not found ({state}).")
-            step_file = state / "training_step.json"
-            start = read_json(step_file)["step"] if step_file.is_file() else None
-            if start is not None and (type(start) is not int or not 0 <= start < steps):
+            start = native_training_step(model_dir)
+            if start >= steps:
                 raise ValueError("The target step count must exceed the checkpoint step.")
             args += [flag("config_path", model_dir / "train_config.json"), "--resume=true"]
         else:
@@ -261,8 +308,11 @@ class NativeAdapter:
                     raise ValueError("Training episodes must be a nonempty list of nonnegative integers.")
                 if "dataset.episodes" not in automatic:
                     args.append(flag("dataset.episodes", episodes))
-            policy_key = "policy.path" if cfg.get("pretrained") else "policy.type"
-            args.append(flag(policy_key, cfg.get("pretrained") or self.settings["model"]))
+            pretrained = cfg.get("pretrained")
+            if pretrained:
+                validate_native_policy(pretrained, self.settings["model"])
+            policy_key = "policy.path" if pretrained else "policy.type"
+            args.append(flag(policy_key, pretrained or self.settings["model"]))
         model = self.settings["model"]
         scope_flags = training_flags(cfg, model)
         explicit = dict(arg[2:].split("=", 1) for arg in (*scope_flags, *extra)
@@ -286,12 +336,21 @@ class NativeAdapter:
     def eval_policy(self, after_training):
         model = (self.train_dir / "train/checkpoints/last/pretrained_model" if after_training
                  else self.settings["eval"]["policy"])
+        if not after_training:
+            validate_native_policy(model, self.settings["model"])
         return [flag("policy.path", model), flag("policy.device", self.settings["eval"]["device"])]
 
     def evaluate(self, after_training):
         cfg = self.settings["eval"]
         output = self.eval_dir
         kind, tasks = cfg["env"], cfg["tasks"]
+        if not isinstance(tasks, (list, tuple)) or not tasks or any(
+            not isinstance(task, str) or not task.strip() for task in tasks
+        ):
+            raise ValueError("Specify a nonempty list of evaluation tasks or suites.")
+        tasks = [task.strip() for task in tasks]
+        if kind in SINGLE_TASK_BENCHMARKS and (len(tasks) != 1 or "," in tasks[0]):
+            raise ValueError(f"The {kind} benchmark supports one evaluation task per job.")
         episodes, batch = cfg["episodes"], cfg["batch"]
         if type(episodes) is not int or type(batch) is not int or min(episodes, batch) < 1:
             raise ValueError("Episode count and evaluation batch size must be positive integers.")
@@ -307,14 +366,16 @@ class NativeAdapter:
         args = [*command, flag("env.type", kind), flag("env.task", ",".join(tasks)),
                 flag("eval.n_episodes", episodes), flag("eval.batch_size", batch),
                 flag("seed", cfg["seed"]), flag("output_dir", output)]
-        units = None
+        units = episodes if kind in SINGLE_TASK_BENCHMARKS else None
         length = cfg.get("episode_length", 0)
         if type(length) is not int or length < 0:
             raise ValueError("Episode length must be a nonnegative integer.")
         if length:
+            if kind == "metaworld":
+                raise ValueError("The LeRobot Meta-World integration uses its default episode length.")
             args.append(flag("env.episode_length", length))
         if kind == "libero":
-            if not tasks or len(set(tasks)) != len(tasks):
+            if len(set(tasks)) != len(tasks):
                 raise ValueError("Specify at least one suite and list each suite once.")
             ids = cfg.get("task_ids", [])
             known_suites = set(tasks) <= set(SUITES)
@@ -333,16 +394,23 @@ class NativeAdapter:
         args += additional_flags(cfg.get("extra", []),
                                  {a[2:].split("=")[0] for a in args if a.startswith("--")} |
                                  {"config_path", "policy.type", "policy.path", "env.max_parallel_tasks",
-                                  "env.task_ids", "env.episode_length", "eval.record_repo_id"})
-        if kind == "libero":
-            env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"}
-        else:
-            env = {}
+                                  "env.task_ids", "env.episode_length", "eval.record_repo_id", "eval.recording_repo_id"})
+        automatic = ()
+        if kind in SINGLE_TASK_BENCHMARKS and min(batch, episodes) > 1 and not any(
+            argument.startswith("--eval.use_async_envs=") for argument in args
+        ):
+            # This still batches policy predictions. The subprocess Gym workers
+            # in these benchmarks do not reliably register their environments.
+            args.append("--eval.use_async_envs=false")
+            automatic = ("eval.use_async_envs",)
+        headless_aloha = (kind == "aloha" and sys.platform == "linux"
+                          and not (os.environ.get("DISPLAY") or os.environ.get("MUJOCO_GL")))
+        env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"} if kind == "libero" or headless_aloha else {}
         environment = cfg.get("environment") or self.environment
         if not isinstance(environment, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", environment):
             raise ValueError("Invalid Conda evaluation environment name.")
         return Stage("eval", environment, args, (output / "eval_info.json",), units,
-                     eval_batches=(episodes + batch - 1) // batch, env=env, output=output)
+                     eval_batches=(episodes + batch - 1) // batch, env=env, output=output, auto_flags=automatic)
 
 
 class TinyVLAAdapter(NativeAdapter):
@@ -389,21 +457,41 @@ class TinyVLAAdapter(NativeAdapter):
         else:
             model = weights(Path(cfg["base_model"]).expanduser().resolve() if cfg.get("base_model") else self.base_model)
             origin = ["--model", str(model)]
-        if cfg.get("selection"):
-            require(Path(cfg["selection"]))
-        selection = cfg.get("selection") or self.train_dir / "new_selection.json"
         task = cfg.get("task")
         if task and (len(task) != 2 or task[0] not in SUITES or type(task[1]) is not int or not 0 <= task[1] < 10):
             raise ValueError("Select a supported TinyVLA training suite and task ID.")
+        dataset = Path(cfg.get("dataset_root") or self.root / "datasets/libero").expanduser()
+        selection = cfg.get("selection")
+        local_selection = dataset / "selection.json"
+        use_local_selection = not selection and local_selection.is_file()
+        if use_local_selection:
+            selection = local_selection
+        if selection:
+            split = read_json(require(Path(selection)))
+            if not isinstance(split, dict):
+                raise ValueError(f"Expected a training split dictionary ({selection}).")
+            split_tasks = split.get("tasks")
+            if use_local_selection and not split_tasks:
+                raise ValueError(f"The local TinyVLA training split needs per-task metadata ({selection}).")
+            if split_tasks:
+                expected = {tuple(task)} if task else {(suite, i) for suite in SUITES for i in range(10)}
+                try:
+                    selected = {(row["suite"], row["task_id"]) for row in split_tasks.values()}
+                except (AttributeError, KeyError, TypeError) as error:
+                    raise ValueError(f"Invalid TinyVLA training split tasks ({selection}).") from error
+                if selected != expected:
+                    raise ValueError(f"The TinyVLA training split does not match the selected tasks ({selection}).")
+        else:
+            selection = self.train_dir / "new_selection.json"
         for name in ("updates", "batch", "save_freq"):
             if type(cfg[name]) is not int or cfg[name] < 1:
                 raise ValueError(f"Enter a positive integer for {name}.")
         if not math.isfinite(cfg["lr"]) or cfg["lr"] <= 0:
             raise ValueError("Learning rate must be positive and finite.")
-        args = ["python", "-u", str(script), "--workspace", str(workspace), "--data", str(selection),
+        args = ["python", "-u", str(script), "--workspace", str(workspace), flag("data", selection),
                 "--loader", str(loader),
                 "--output", str(output), "--dataset-python", f"@python:{self.environment}",
-                "--dataset-root", cfg.get("dataset_root") or str(self.root / "datasets/libero"),
+                "--dataset-root", str(dataset),
                 "--batch_size", str(cfg["batch"]), "--lr", str(cfg["lr"]), "--seed", str(cfg["seed"]),
                 "--updates-per-task", str(cfg["updates"]), "--save-freq", str(cfg["save_freq"]), *origin]
         if task:
@@ -413,7 +501,8 @@ class TinyVLAAdapter(NativeAdapter):
         return Stage("train", self.infer_env, args, (output / "training_result.json",
                      output / "pretrained_model/action_head.safetensors", output / "pretrained_model/model.safetensors",
                      output / "checkpoints/training_state.pt"), cfg["updates"] * (1 if task else 40),
-                     None if cfg.get("resume") else 0, output=output)
+                     None if cfg.get("resume") else 0, output=output,
+                     auto_flags=("data",) if use_local_selection else ())
 
     def eval_policy(self, after_training):
         cfg = self.settings["eval"]

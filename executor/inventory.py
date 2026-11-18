@@ -5,7 +5,7 @@ from itertools import chain
 import os
 from pathlib import Path
 
-from adapters import read_json, weights
+from adapters import native_peft_checkpoint, native_training_step, read_json, require, weights
 from runner import run_log_directories, styled
 
 
@@ -95,9 +95,15 @@ def scan(root, external, log_root):
             if origin and tiny and not {"preprocessor_config.json", "tokenizer.json"} <= names:
                 continue
             try:
-                if tiny or {"model.safetensors", "model.safetensors.index.json"} & names:
+                if not tiny and "adapter_config.json" in names:
+                    if not native_peft_checkpoint(path):
+                        continue
+                    require(path / "config.json")
+                elif tiny or {"model.safetensors", "model.safetensors.index.json"} & names:
                     weights(path)
-                elif not config or not (path / "pytorch_model.bin").is_file():
+                elif config and "pytorch_model.bin" in names:
+                    require(path / "pytorch_model.bin")
+                else:
                     continue
             except (OSError, ValueError, KeyError, TypeError):
                 continue
@@ -106,12 +112,12 @@ def scan(root, external, log_root):
             if origin:
                 result.cached_models[resolved] = origin
             if not tiny and train:
-                state_dir = path.parent / "training_state"
-                state = metadata(state_dir / "training_step.json")
-                if type(state.get("step")) is int and state["step"] >= 0:
-                    required = ("rng_state.safetensors", "optimizer_state.safetensors", "optimizer_param_groups.json")
-                    if origin is None or all((state_dir / name).is_file() for name in required):
-                        result.native_resume.append(resolved)
+                try:
+                    native_training_step(path)
+                except (OSError, ValueError):
+                    pass
+                else:
+                    result.native_resume.append(resolved)
                 if origin is None:
                     latest = path.parent.parent / "last"
                     if not latest.is_dir() or path.parent.resolve() == latest.resolve():

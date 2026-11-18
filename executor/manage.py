@@ -18,7 +18,7 @@ from tempfile import TemporaryDirectory, gettempdir
 from textwrap import indent
 from uuid import uuid4
 
-from adapters import SUITES, TRAINING_SWITCHES, load_adapters, native_checkpoint, read_json
+from adapters import SINGLE_TASK_BENCHMARKS, SUITES, TRAINING_SWITCHES, load_adapters, native_checkpoint, native_peft_checkpoint, read_json
 from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
@@ -528,8 +528,15 @@ def evaluation_suites(train, tiny):
 def eval_settings(model, tiny, train, inventory, env_type):
     if env_type == "libero":
         tasks = evaluation_suites(train, tiny)
+    elif env_type in SINGLE_TASK_BENCHMARKS:
+        while True:
+            task = ask("Evaluation Task", SINGLE_TASK_BENCHMARKS[env_type])
+            if "," not in task:
+                tasks = [task]
+                break
+            retry_question("Enter one evaluation task.")
     else:
-        default_task = {"pusht": "PushT-v0", "aloha": "AlohaInsertion-v0", "metaworld": "medium"}.get(env_type)
+        default_task = "medium" if env_type == "metaworld" else None
         tasks = evaluation_names("Evaluation Tasks (comma-separated)", default_task)
 
     cfg = {"env": env_type, "tasks": tasks,
@@ -543,7 +550,7 @@ def eval_settings(model, tiny, train, inventory, env_type):
         task = train.get("task") if tiny and train else None
         default_id = str(task[1]) if task and tasks == [task[0]] else "all"
         cfg["task_ids"] = evaluation_task_ids(tasks[0], default_id) if len(tasks) == 1 else []
-    if env_type in {"libero", "pusht", "aloha", "metaworld"}:
+    if env_type == "libero" or env_type in SINGLE_TASK_BENCHMARKS:
         cfg["episode_length"] = number("Episode Length (maximum control steps, 0 uses benchmark default)", 0, 0)
     if env_type == "libero":
         cfg.update(control="relative" if tiny else ask("Control Mode", "absolute" if model == "xvla" else "relative"),
@@ -574,7 +581,12 @@ def run_in_use(run):
     try:
         status = read_json(run / "executor/status.json")
     except FileNotFoundError:
-        return False
+        # A new run directory can appear before its status file is written.
+        try:
+            entries = {path.name for path in run.iterdir()}
+        except OSError:
+            return True
+        return not entries or "executor" in entries
     except (OSError, ValueError):
         return True
     return not isinstance(status, dict) or status.get("status") not in ("completed", "failed", "interrupted")
@@ -655,7 +667,7 @@ class LeRobotEnvironments:
                 locations.setdefault(kind, []).append(name)
         return locations
 
-    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False, peft=False):
+    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False, peft=False, runtime=None):
         catalogs = self.lerobot()
         if preferred not in catalogs and (catalog := self.catalog(preferred)):
             catalogs[preferred] = catalog
@@ -667,7 +679,7 @@ class LeRobotEnvironments:
             benchmark in entry.get("benchmarks", {}) or benchmark in entry.get("plugins", ())
             for entry in catalogs.values()
         )
-        if pinned or not check_policy or (benchmark is not None and not check_benchmark):
+        if pinned or (not check_policy and runtime != "dataset") or (benchmark is not None and not check_benchmark):
             catalogs = {preferred: catalogs.get(preferred, {})}
 
         def policy_ready(entry):
@@ -678,6 +690,9 @@ class LeRobotEnvironments:
         def benchmark_ready(entry):
             return (not check_benchmark or entry.get("benchmarks", {}).get(benchmark, False)
                     or benchmark in entry.get("plugins", ()))
+
+        def runtime_ready(entry):
+            return runtime is None or entry.get("runtime", {}).get(runtime, True)
 
         candidates = []
         for name, entry in catalogs.items():
@@ -697,6 +712,8 @@ class LeRobotEnvironments:
                 dependencies.append(("--install", benchmark))
             if needs_peft:
                 dependencies.append(("--peft", None))
+            if not runtime_ready(entry):
+                dependencies.append(("--runtime", runtime))
             candidates.append((len(dependencies), name != preferred, name, dependencies))
 
         if not candidates:
@@ -704,24 +721,43 @@ class LeRobotEnvironments:
             detail = f" ({issue})" if issue else ""
             stage = f"{model} with {benchmark}" if benchmark else model
             raise RuntimeError(f"No Conda environment can be prepared for {stage}{detail}.")
-        _, _, source, dependencies = min(candidates)
-        if not dependencies:
-            return source
-
-        program = ["python", "-B", str(Path(__file__).with_name("benchmarks.py"))]
-        names_to_install = [name or "LoRA" for _, name in dependencies]
-        for option, name in dependencies:
-            program.append(option)
-            if name is not None:
-                program.append(name)
-        description = " and ".join(names_to_install)
         process_options = {"cwd": self.root, "text": True, "encoding": "utf-8", "errors": "replace",
                            "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-        print(f"  Preparing dependencies for {description} in {source}…", flush=True)
-        result = subprocess.run(conda_command(self.conda, source, program), **process_options)
-        target = source
-        if result.returncode == DEPENDENCY_CONFLICT:
-            suffix = re.sub(r"[^a-zA-Z0-9_.-]", "_", "_".join(names_to_install))
+        conflicts = []
+        failures = []
+
+        def verify(target, description):
+            refreshed = self.catalog(target, refresh=True)
+            if (refreshed and policy_ready(refreshed) and benchmark_ready(refreshed) and runtime_ready(refreshed)
+                    and (not peft or refreshed.get("peft_ready"))):
+                print(f"  Dependencies ready in {target}.", flush=True)
+                return True
+            issue = refreshed.get("policy_issues", {}).get(model)
+            detail = f" ({issue})" if issue else ""
+            failures.append(f"Could not verify {description} in {target} after installation{detail}.")
+            return False
+
+        for _, _, source, dependencies in sorted(candidates):
+            if not dependencies:
+                return source
+            program = ["python", "-B", str(Path(__file__).with_name("benchmarks.py"))]
+            names_to_install = [name or "LoRA" for _, name in dependencies]
+            for option, name in dependencies:
+                program.append(option)
+                if name is not None:
+                    program.append(name)
+            description = " and ".join(names_to_install)
+            print(f"  Preparing dependencies for {description} in {source}…", flush=True)
+            result = subprocess.run(conda_command(self.conda, source, program), **process_options)
+            if result.returncode:
+                failures.append(result.stdout.strip() or f"Could not install {description} in {source}.")
+                if result.returncode == DEPENDENCY_CONFLICT:
+                    suffix = re.sub(r"[^a-zA-Z0-9_.-]", "_", "_".join(names_to_install))
+                    conflicts.append((source, suffix, program, description))
+            elif verify(source, description):
+                return source
+
+        for source, suffix, program, description in conflicts:
             stem = f"{source}_{suffix}"
             target = stem
             index = 2
@@ -733,18 +769,28 @@ class LeRobotEnvironments:
             clone = subprocess.run([self.conda, "create", "--yes", "--name", target, "--clone", source],
                                    **process_options)
             if clone.returncode:
-                raise RuntimeError(clone.stdout.strip() or f"Could not clone {source} into {target}.")
+                failures.append(clone.stdout.strip() or f"Could not clone {source} into {target}.")
+                continue
             self.names.add(target)
-            result = subprocess.run(conda_command(self.conda, target, [*program, "--isolated"]), **process_options)
-        if result.returncode:
-            raise RuntimeError(result.stdout.strip() or f"Could not install dependencies for {description} in {target}.")
-        refreshed = self.catalog(target, refresh=True)
-        if not policy_ready(refreshed) or not benchmark_ready(refreshed) or (peft and not refreshed.get("peft_ready")):
-            issue = refreshed.get("policy_issues", {}).get(model)
-            detail = f" ({issue})" if issue else ""
-            raise RuntimeError(f"Could not verify {description} in {target} after installation{detail}.")
-        print(f"  Dependencies ready in {target}.", flush=True)
-        return target
+            ready = False
+            try:
+                result = subprocess.run(conda_command(self.conda, target, [*program, "--isolated"]), **process_options)
+                if result.returncode:
+                    failures.append(result.stdout.strip() or f"Could not install {description} in {target}.")
+                else:
+                    ready = verify(target, description)
+                if ready:
+                    return target
+            finally:
+                if not ready:
+                    removed = subprocess.run([self.conda, "env", "remove", "--yes", "--name", target],
+                                             **process_options)
+                    if removed.returncode:
+                        failures.append(removed.stdout.strip() or f"Could not remove incomplete environment {target}.")
+                    else:
+                        self.names.discard(target)
+                        self.catalogs.pop(target, None)
+        raise RuntimeError(failures[-1])
 
 
 def benchmark_options(kinds):
@@ -812,7 +858,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
     def evaluation_environment(model, tiny):
         preferred = native_env if tiny else mapping.get(model, native_env)
         benchmark, selected = choose_evaluation_environment(environments, preferred, model, tiny)
-        return benchmark, selected, selected != preferred
+        return benchmark, selected, False
 
     with redirect_stdout(display), display:
         show_inventory(display, inventory, environments.names)
@@ -1054,9 +1100,13 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions, temporary_output_di
             # Queue jobs without an override follow the same installed-environment routing as the wizard.
             _, candidates = policy_environments(session, preferred, cfg["model"], tiny)
             ready = session.available(candidates).get(evaluate["env"], [])
-            if ready and preferred not in ready:
-                evaluate["environment"] = ready[0]
-        stages.append(adapter.evaluate(after_training="train" in cfg))
+            detected_target = ready[0] if ready and preferred not in ready else None
+        else:
+            detected_target = None
+        stage = adapter.evaluate(after_training="train" in cfg)
+        if detected_target:
+            stage.environment = detected_target
+        stages.append(stage)
     for stage in stages:
         if not save_outputs:
             paths = (*stage.artifacts, stage.output) if stage.output else stage.artifacts
@@ -1156,8 +1206,7 @@ def job_subheading(title):
 
 def prepare_job_environments(cfg, stages, root, conda, sessions):
     backend = cfg["adapter"]
-    managed = [stage for stage in stages if backend == "native" or (backend == "tinyvla" and stage.name == "eval")]
-    if not managed:
+    if backend not in {"native", "tinyvla"}:
         return
     native = cfg.get("environments", {}).get("native", DEFAULT_ENVIRONMENTS["native"])
     key = (root, native)
@@ -1165,12 +1214,30 @@ def prepare_job_environments(cfg, stages, root, conda, sessions):
         sessions[key] = LeRobotEnvironments(conda, root, native, available_environments(conda, root))
     session = sessions[key]
     model = cfg["model"]
-    for stage in managed:
+    train = cfg.get("train", {})
+    uses_peft = False
+    if backend == "native":
+        source = train.get("pretrained") or cfg.get("eval", {}).get("policy")
+        if train.get("resume"):
+            checkpoint = native_checkpoint(Path(train["resume"]))
+            saved = read_json(checkpoint / "train_config.json")
+            uses_peft = bool(saved.get("peft") or (saved.get("policy") or {}).get("use_peft"))
+            source = checkpoint
+        uses_peft = uses_peft or train.get("lora") is not None or (
+            train.get("policy_training", {}).get("train_mode_vlm") == "lora"
+        ) or bool(source and Path(source).is_dir() and native_peft_checkpoint(Path(source)))
+
+    for stage in stages:
+        if backend == "tinyvla" and stage.name == "train":
+            dataset_python = stage.arguments.index("--dataset-python") + 1
+            target = session.prepare(stage.arguments[dataset_python].removeprefix("@python:"),
+                                     model=model, runtime="dataset")
+            stage.arguments[dataset_python] = f"@python:{target}"
+            continue
         evaluation = cfg["eval"] if stage.name == "eval" else {}
-        train = cfg.get("train", {}) if stage.name == "train" else {}
-        peft = train.get("lora") is not None or train.get("policy_training", {}).get("train_mode_vlm") == "lora"
         target = session.prepare(stage.environment, model=model, tiny=backend == "tinyvla",
-                                 benchmark=evaluation.get("env"), pinned=bool(evaluation.get("environment")), peft=peft)
+                                 benchmark=evaluation.get("env"), pinned=bool(evaluation.get("environment")),
+                                 peft=uses_peft, runtime="evaluation" if stage.name == "eval" else "training")
         if target != stage.environment:
             if stage.name == "eval":
                 evaluation["environment"] = target
@@ -1328,7 +1395,7 @@ def main():
         return 130
     except StageFailure as error:
         temporary = temporary_job_root(error.logfile, temporary_outputs) is not None
-        report_failure(f"Run failed ({error.stage} exited with code {error.code}).", in_job=executing,
+        report_failure(f"Run failed ({error.description}).", in_job=executing,
                        reason=error.reason, logfile=None if temporary else error.logfile, temporary=temporary)
         return 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,

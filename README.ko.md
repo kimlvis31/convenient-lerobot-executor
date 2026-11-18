@@ -49,9 +49,9 @@ python -B ~/convLexecutor/executor/manage.py \
 
 직접 설정하려면 `manage.py`를 실행하고 **Configure a new job**을 선택합니다. 한 목록에서 모델을 고르고 평가 벤치마크나 LIBERO(Lifelong Learning Benchmark on Robot Manipulation, 로봇 조작 평생학습 벤치마크) 스위트를 선택합니다. Enter를 누르면 표시된 기본값이 적용됩니다. 준비된 작업 큐를 실행하려면 **Import a job queue script**를 선택합니다. [예제 설정](scripts/example_script.py)
 
-작업을 시작하면 convLexecutor가 선택한 모델과 벤치마크를 함께 실행할 수 있는 Conda 환경을 찾아 재사용합니다. π 계열의 SentencePiece처럼 현재 LeRobot 버전이 선언한 패키지가 빠져 있으면 필요한 것만 설치합니다. 기존 버전을 유지한 상태에서 의존성이 충돌하면 별도 환경을 만듭니다. 미리보기에서는 설치하지 않습니다. **Manual Setup**으로 표시된 벤치마크는 별도 시뮬레이터 설정이 필요하며, 설치된 LeRobot 환경 플러그인은 자동으로 조회합니다. 체크포인트는 작업 설정에서 선택합니다.
+작업을 시작하면 convLexecutor가 선택한 모델과 벤치마크를 함께 실행할 수 있는 Conda 환경을 찾아 재사용합니다. π 계열의 SentencePiece처럼 현재 LeRobot 버전이 선언한 패키지가 빠져 있으면 필요한 것만 설치합니다. 기존 버전을 유지한 상태에서 의존성이 충돌하면 별도 환경을 만듭니다. 미리보기에서는 설치하지 않습니다. **Manual Setup**으로 표시된 벤치마크는 별도 시뮬레이터 설정이 필요하며, 설치된 LeRobot 환경 플러그인은 자동으로 조회합니다. 체크포인트는 작업 설정에서 선택합니다. PushT와 ALOHA는 작업 하나당 태스크 하나를 평가합니다. 배치 추론은 유지하고 시뮬레이터 단계는 기본적으로 동기 실행합니다. Meta-World는 시뮬레이터의 기본 에피소드 길이를 사용합니다.
 
-로컬 학습 데이터셋은 폴더를 선택하면 됩니다. `selection.json`에 저장소 이름과 학습 에피소드 목록이 있으면 자동으로 사용합니다. **Use a dataset repository**를 고르면 Hugging Face 저장소 이름을 입력합니다.
+로컬 학습 데이터셋은 폴더를 선택하면 됩니다. `selection.json`에 저장소 이름과 학습 에피소드 목록이 있으면 자동으로 사용합니다. TinyVLA는 로컬 학습 분할의 태스크가 선택한 태스크와 일치하면 해당 분할을 자동으로 사용합니다. **Use a dataset repository**를 고르면 Hugging Face 저장소 이름을 입력합니다.
 
 정책 목록은 로컬 체크포인트가 없는 모델을 흐리게 표시합니다. Hugging Face 캐시도 로컬에 포함합니다. 평가에는 선택한 벤치마크에 맞는 체크포인트를 사용합니다. LeRobot 모델은 현재 버전의 정책 설정이 지원하는 학습 범위와 LoRA(Low-Rank Adaptation, 저랭크 적응), 학습 옵션을 보여줍니다. TinyVLA는 행동 헤드만 학습하거나 행동 헤드와 언어 어텐션에 LoRA(Low-Rank Adaptation, 저랭크 적응)를 함께 적용할 수 있습니다. 정확한 재개는 기존 설정과 옵티마이저 상태를 복원합니다.
 
