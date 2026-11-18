@@ -18,7 +18,18 @@ from tempfile import TemporaryDirectory, gettempdir
 from textwrap import indent
 from uuid import uuid4
 
-from adapters import SINGLE_TASK_BENCHMARKS, SUITES, TRAINING_SWITCHES, load_adapters, native_checkpoint, native_peft_checkpoint, read_json
+from adapters import (
+    EPISODE_LENGTH_BENCHMARKS,
+    LIBERO_BENCHMARKS,
+    SINGLE_TASK_BENCHMARKS,
+    SUITES,
+    TASK_ID_BENCHMARKS,
+    TRAINING_SWITCHES,
+    load_adapters,
+    native_checkpoint,
+    native_peft_checkpoint,
+    read_json,
+)
 from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
@@ -311,15 +322,12 @@ def choose_policy(adapters, policies, inventory):
     reasons = {value: "No Local Checkpoint" for value, _ in entries if value[1] and value[1] not in local}
     sizes = {value: model_size(value[1]) for value, _ in entries if value[1]}
     groups = {value: "native" if value[0] == "native" else "external" for value, _ in entries}
-    available = [index for index, (value, _) in enumerate(entries, 1) if value[1] in local]
-    default = next((index for index in available if entries[index - 1][0] == ("native", "smolvla")),
-                   available[0] if available else None)
-    backend, model = choose("Policy Model", entries, default=default, details=sizes,
+    backend, model = choose("Policy Model", entries, default=None, details=sizes,
                             groups=groups, unavailable=reasons, reasons=reasons)
     if not model:
-        model = ask("LeRobot Policy Name", "smolvla")
+        model = ask("LeRobot Policy Name")
     elif backend not in {"native", "tinyvla"}:
-        model = ask("Model Name", model)
+        model = ask("Model Name")
     return backend, model
 
 
@@ -495,18 +503,21 @@ def evaluation_names(question, default=None):
         retry_question("Enter unique names separated by commas.")
 
 
-def evaluation_task_ids(suite, default):
+def evaluation_task_ids(suite, default, env_type, *, allow_all=True):
+    label = "Variant IDs per Suite" if env_type == "libero_plus" else "Task IDs"
+    upper = 10 if env_type == "libero" and suite in SUITES else None
+    hint = "comma-separated, or all" if allow_all else "comma-separated"
     while True:
-        answer = ask("Task IDs (comma-separated, or all)", default)
-        if answer.casefold() == "all":
+        answer = ask(f"{label} ({hint})", default)
+        if allow_all and answer.casefold() == "all":
             return []
         try:
             ids = [int(value) for value in answer.split(",")]
         except ValueError:
             ids = []
-        if ids and len(ids) == len(set(ids)) and all(i >= 0 and (suite not in SUITES or i < 10) for i in ids):
+        if ids and len(ids) == len(set(ids)) and all(i >= 0 and (upper is None or i < upper) for i in ids):
             return ids
-        retry_question("Use unique, in-range task IDs from a single suite.")
+        retry_question(f"Enter unique, in-range {label.lower()}.")
 
 
 def evaluation_suites(train, tiny):
@@ -526,7 +537,7 @@ def evaluation_suites(train, tiny):
 
 
 def eval_settings(model, tiny, train, inventory, env_type):
-    if env_type == "libero":
+    if env_type in LIBERO_BENCHMARKS:
         tasks = evaluation_suites(train, tiny)
     elif env_type in SINGLE_TASK_BENCHMARKS:
         while True:
@@ -536,7 +547,10 @@ def eval_settings(model, tiny, train, inventory, env_type):
                 break
             retry_question("Enter one evaluation task.")
     else:
-        default_task = "medium" if env_type == "metaworld" else None
+        default_task = {
+            "metaworld": "medium", "robocasa": "CloseFridge", "robomme": "PickXtimes",
+            "robotwin": "beat_block_hammer", "vlabench": "select_fruit",
+        }.get(env_type)
         tasks = evaluation_names("Evaluation Tasks (comma-separated)", default_task)
 
     cfg = {"env": env_type, "tasks": tasks,
@@ -546,13 +560,21 @@ def eval_settings(model, tiny, train, inventory, env_type):
         cfg["parallel_tasks"] = number("Parallel Evaluation Tasks", 1)
     if train is None:
         cfg["policy"] = choose_model(inventory, model, optional=tiny)
-    if env_type == "libero":
+    if env_type in TASK_ID_BENCHMARKS:
         task = train.get("task") if tiny and train else None
-        default_id = str(task[1]) if task and tasks == [task[0]] else "all"
-        cfg["task_ids"] = evaluation_task_ids(tasks[0], default_id) if len(tasks) == 1 else []
-    if env_type == "libero" or env_type in SINGLE_TASK_BENCHMARKS:
+        default_id = "all" if env_type == "libero" else "0"
+        if task and tasks == [task[0]]:
+            default_id = str(task[1])
+        # RoboMME's upstream default without an ID filter is episode 0.
+        if env_type == "libero" and len(tasks) != 1:
+            cfg["task_ids"] = []
+        elif env_type == "robomme":
+            cfg["task_ids"] = evaluation_task_ids(tasks[0], default_id, env_type, allow_all=False)
+        else:
+            cfg["task_ids"] = evaluation_task_ids(tasks[0], default_id, env_type)
+    if env_type in EPISODE_LENGTH_BENCHMARKS:
         cfg["episode_length"] = number("Episode Length (maximum control steps, 0 uses benchmark default)", 0, 0)
-    if env_type == "libero":
+    if env_type in LIBERO_BENCHMARKS:
         cfg.update(control="relative" if tiny else ask("Control Mode", "absolute" if model == "xvla" else "relative"),
                    size=256 if tiny else number("Camera Image Width and Height", 448 if model == "evo1" else 256))
     if tiny:

@@ -14,6 +14,11 @@ from training_preflight import native_training_preflight
 
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 SINGLE_TASK_BENCHMARKS = {"pusht": "PushT-v0", "aloha": "AlohaInsertion-v0"}
+LIBERO_BENCHMARKS = frozenset({"libero", "libero_plus"})
+TASK_ID_BENCHMARKS = LIBERO_BENCHMARKS | {"robomme"}
+EPISODE_LENGTH_BENCHMARKS = LIBERO_BENCHMARKS | SINGLE_TASK_BENCHMARKS.keys() | {
+    "robocasa", "robomme", "robotwin", "vlabench", "isaaclab_arena",
+}
 TRAINING_SWITCHES = {
     "train_expert_only": "Action expert",
     "freeze_vision_encoder": "Vision encoder",
@@ -374,22 +379,34 @@ class NativeAdapter:
             if kind == "metaworld":
                 raise ValueError("The LeRobot Meta-World integration uses its default episode length.")
             args.append(flag("env.episode_length", length))
-        if kind == "libero":
-            if len(set(tasks)) != len(tasks):
-                raise ValueError("Specify at least one suite and list each suite once.")
-            ids = cfg.get("task_ids", [])
-            known_suites = set(tasks) <= set(SUITES)
-            if ids and (len(tasks) != 1 or len(set(ids)) != len(ids) or any(
-                type(i) is not int or i < 0 or known_suites and i >= 10 for i in ids
-            )):
-                raise ValueError("Use unique, in-range task IDs from a single suite.")
-            if ids:
-                args.append(flag("env.task_ids", ids))
-            args += [flag("env.max_parallel_tasks", parallel), flag("env.control_mode", cfg["control"]),
-                     "--env.obs_type=pixels_agent_pos", flag("env.observation_width", cfg["size"]),
-                     flag("env.observation_height", cfg["size"])]
-            if known_suites:
-                units = episodes * (len(ids) or 10 * len(tasks))
+        ids = cfg.get("task_ids")
+        if ids is None:
+            ids = []
+        if (not isinstance(ids, (list, tuple)) or any(type(i) is not int or i < 0 for i in ids)
+                or len(set(ids)) != len(ids)):
+            raise ValueError("Use a list of unique, nonnegative task IDs.")
+        if ids and kind not in TASK_ID_BENCHMARKS:
+            raise ValueError(f"The {kind} benchmark does not support task IDs.")
+        if kind in TASK_ID_BENCHMARKS and (len(set(tasks)) != len(tasks) or any("," in task for task in tasks)):
+            raise ValueError("List each evaluation task or suite once.")
+        if kind == "libero" and ids and (len(tasks) != 1 or tasks[0] in SUITES and max(ids) >= 10):
+            raise ValueError("Use unique, in-range task IDs from a single suite.")
+        if ids:
+            args.append(flag("env.task_ids", list(ids)))
+
+        if kind in LIBERO_BENCHMARKS:
+            control, size = cfg.get("control", "relative"), cfg.get("size", 256)
+            if control not in ("absolute", "relative"):
+                raise ValueError("LIBERO control mode must be absolute or relative.")
+            if type(size) is not int or size < 1:
+                raise ValueError("LIBERO camera size must be a positive integer.")
+            args += [flag("env.max_parallel_tasks", parallel), flag("env.control_mode", control),
+                     "--env.obs_type=pixels_agent_pos", flag("env.observation_width", size),
+                     flag("env.observation_height", size)]
+            if ids or kind == "libero" and set(tasks) <= set(SUITES):
+                units = episodes * len(tasks) * (len(ids) or 10)
+        elif kind == "robomme":
+            units = episodes * len(tasks) * (len(ids) or 1)
         args += self.eval_policy(after_training)
         args += additional_flags(cfg.get("extra", []),
                                  {a[2:].split("=")[0] for a in args if a.startswith("--")} |
@@ -403,9 +420,9 @@ class NativeAdapter:
             # in these benchmarks do not reliably register their environments.
             args.append("--eval.use_async_envs=false")
             automatic = ("eval.use_async_envs",)
-        headless_aloha = (kind == "aloha" and sys.platform == "linux"
-                          and not (os.environ.get("DISPLAY") or os.environ.get("MUJOCO_GL")))
-        env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"} if kind == "libero" or headless_aloha else {}
+        headless_mujoco = (kind in {"aloha", "robocasa", "vlabench"} and sys.platform == "linux"
+                           and not (os.environ.get("DISPLAY") or os.environ.get("MUJOCO_GL")))
+        env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"} if kind in LIBERO_BENCHMARKS or headless_mujoco else {}
         environment = cfg.get("environment") or self.environment
         if not isinstance(environment, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", environment):
             raise ValueError("Invalid Conda evaluation environment name.")

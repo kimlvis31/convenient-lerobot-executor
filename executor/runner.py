@@ -15,9 +15,11 @@ import shutil
 import signal
 import sys
 import subprocess
+from tempfile import TemporaryDirectory
 import time
 
 from adapters import Stage, read_json, require
+from checkpoint_compat import RESULT_PREFIX, checkpoint_candidate, validate_processor_states
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -468,9 +470,66 @@ def stage_failure_reason(logfile):
     return diagnostic
 
 
-def run_stage(command, stage, root, logfile, update, write_message=None):
+@contextmanager
+def prepare_stage_checkpoint(command, stage, root, env, logfile, log, native):
+    reference = next((item.partition("=")[2] for item in command if item.startswith("--policy.path=")), None)
+    if not native or not reference:
+        yield command
+        return
+    conda, model = native
+    try:
+        validate_processor_states(reference)
+    except (OSError, ValueError) as error:
+        log.write(f"CheckpointError: {error}\n")
+        log.flush()
+        raise StageFailure(stage.name, 1, logfile) from error
+    if not checkpoint_candidate(reference, model):
+        yield command
+        return
+
+    with TemporaryDirectory(prefix="convlexecutor-checkpoint-") as directory:
+        path = Path(directory) / "pretrained_model"
+        helper = Path(__file__).with_name("checkpoint_compat.py").resolve()
+        revision_flag = "--policy.pretrained_revision="
+        revision = next((item[len(revision_flag):] for item in command if item.startswith(revision_flag)), None)
+        options = ["python", "-B", str(helper), "--policy", reference, "--model", model, "--output", str(path)]
+        if revision:
+            options.extend(("--revision", revision))
+        log.write(f"Checking checkpoint processor format: {reference}\n")
+        log.flush()
+        process = subprocess.Popen(conda_command(conda, stage.environment, options), cwd=root, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                   errors="replace", start_new_session=os.name == "posix")
+        try:
+            output, _ = process.communicate()
+        except BaseException:
+            stop_process(process)
+            raise
+        report = None
+        for line in output.splitlines():
+            if line.startswith(RESULT_PREFIX):
+                report = line[len(RESULT_PREFIX):]
+            else:
+                log.write(line + "\n")
+        if process.returncode:
+            log.flush()
+            raise StageFailure(stage.name, process.returncode, logfile)
+        if report == json.dumps(str(path)) and path.is_dir():
+            log.write("Using a temporary conversion of the legacy checkpoint processors.\n")
+            log.flush()
+            command = [f"--policy.path={path}" if item.startswith("--policy.path=") else item
+                       for item in command if not item.startswith(revision_flag)]
+        elif report != "null":
+            log.write("CheckpointError: No valid result was returned by checkpoint preparation.\n")
+            log.flush()
+            raise StageFailure(stage.name, 1, logfile)
+        yield command
+
+
+def run_stage(command, stage, root, logfile, update, write_message=None, *, native=None):
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", **stage.env}
-    with logfile.open("x", encoding="utf-8") as log:
+    with logfile.open("x", encoding="utf-8") as log, \
+         prepare_stage_checkpoint(command, stage, root, env, logfile, log, native) as command:
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                    start_new_session=os.name == "posix")
@@ -548,7 +607,8 @@ def execute(stages, settings, run_dir, root, conda, verbose):
                     artifacts=[str(p) for p in stage.artifacts], output=str(stage.output) if stage.output else None)
         entries.append(item)
 
-    job = {"root": str(root), "settings": settings, "runtime": runtime, "stages": entries, "verbose": verbose}
+    job = {"root": str(root), "settings": settings, "runtime": runtime, "stages": entries,
+           "verbose": verbose, "conda": str(conda)}
     if stages[0].name == "eval" and stages[0].output and run_dir == stages[0].output / "executor":
         stages[0].output.parent.mkdir(parents=True, exist_ok=True)
         stages[0].output.mkdir()
@@ -704,8 +764,9 @@ def run_job(job, run_dir):
                 report(begin)
                 save_status()
                 try:
+                    native = (job["conda"], settings["model"]) if job.get("conda") and settings["adapter"] == "native" else None
                     run_stage(stage.arguments, stage, root, stage_log / f"{stage.name}.log",
-                              update, write_message if job["verbose"] else None)
+                              update, write_message if job["verbose"] else None, native=native)
                 finally:
                     saved.update(seconds=time.monotonic()-begin, ended_at=datetime.now(timezone.utc).isoformat())
                 saved["status"] = "completed"

@@ -20,7 +20,7 @@ from manage import (LeRobotEnvironments, prepare_job_environments, ask, choose_e
                     settings_jobs, show_job_result, show_settings, wizard)
 from questions import QuestionDisplay, QuestionHistory
 from runner import (Progress, StageFailure, available_environments, evaluation_timing_key, execute, history, load_settings,
-                    progress_display, resolve_arguments, seconds, status_line)
+                    prepare_stage_checkpoint, progress_display, resolve_arguments, seconds, status_line)
 
 
 class RenderedTerminal(io.StringIO):
@@ -811,20 +811,26 @@ class ManagerTests(unittest.TestCase):
         cached = self.root / "hub/act/snapshots/version"
         inventory = Inventory(models=[(cached, "act"), (self.external / "models/base", "tinyvla")],
                               cached_models={cached: "lerobot/act @ version"})
-        answers = io.StringIO("4\n")
+        answers = io.StringIO("\n4\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
             selected = choose_policy(load_adapters([]), ["xvla", "act"], inventory)
         self.assertEqual(selected, ("tinyvla", "tinyvla"))
-        rows = [line.strip() for line in menu.getvalue().splitlines() if "Native]" in line or "External]" in line]
+        output = menu.getvalue()
+        self.assertIn("Enter a response.", output)
+        self.assertEqual(output.count("Policy Model:"), 2)
+        self.assertNotIn("[Default", output)
+        rows = [line.strip() for line in output.splitlines() if "Native]" in line or "External]" in line]
         self.assertTrue(rows[0].startswith("1. [LeRobot Native] act"))
-        self.assertTrue(rows[0].endswith("[51.7 M] [Default]"))
+        self.assertTrue(rows[0].endswith("[51.7 M]"))
         self.assertTrue(rows[1].endswith("[879.7 M] <No Local Checkpoint>"))
         self.assertIn("3. [LeRobot Native] Enter a model name manually", rows[2])
         self.assertTrue(rows[3].endswith("TinyVLA   [740.4 M]"))
         self.assertEqual(rows[0].index("act"), rows[1].index("xvla"))
         self.assertEqual(rows[0].index("[51.7 M]"), rows[1].index("[879.7 M]"))
         self.assertNotEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
-        self.assertIn("Policy Model:", menu.getvalue())
+        with patch("sys.stdin", io.StringIO("3\n\nact\n")), contextlib.redirect_stdout(io.StringIO()) as manual:
+            self.assertEqual(choose_policy(load_adapters([]), ["xvla", "act"], inventory), ("native", "act"))
+        self.assertNotIn("[Default", manual.getvalue())
 
     def test_dependencies_prepared_together_and_catalog_refreshed(self):
         environments = LeRobotEnvironments("conda", self.root, "preferred", {"preferred"})
@@ -882,6 +888,36 @@ class ManagerTests(unittest.TestCase):
         with patch("manage.subprocess.run") as process:
             self.assertEqual(environments.prepare("preferred", model="act", benchmark="pusht"), "sim_b")
         process.assert_not_called()
+
+    def test_legacy_checkpoint_conversion_rewrites_only_the_stage_command(self):
+        stage = Stage("eval", "lerobot", [], (), 1)
+        source = self.root / "legacy"
+        source.mkdir()
+        for name in ("config.json", "model.safetensors"):
+            (source / name).write_bytes(b"source")
+        command = ["lerobot-eval", f"--policy.path={source}", "--policy.pretrained_revision=abc", "--seed=0"]
+        logfile = self.root / "eval.log"
+
+        def helper(arguments, **kwargs):
+            output = Path(arguments[arguments.index("--output") + 1])
+            output.mkdir()
+            self.assertIn("--revision", arguments)
+            process = unittest.mock.Mock()
+            process.communicate.return_value = ("MANAGER_CHECKPOINT " + json.dumps(str(output)) + "\n", None)
+            process.returncode = 0
+            return process
+
+        with patch("runner.subprocess.Popen", side_effect=helper) as launch, logfile.open("w") as log:
+            with prepare_stage_checkpoint(command, stage, self.root, {}, logfile, log, ("conda", "vqbet")) as prepared:
+                self.assertTrue(prepared[1].startswith("--policy.path="))
+                converted = Path(prepared[1].partition("=")[2])
+                self.assertTrue(converted.is_dir())
+                self.assertEqual(prepared[2:], ["--seed=0"])
+        self.assertEqual(launch.call_count, 1)
+        self.assertFalse(converted.exists())
+        self.assertEqual((source / "config.json").read_bytes(), b"source")
+        self.assertIn("--policy.pretrained_revision=abc", command)
+        self.assertIn("temporary conversion", logfile.read_text())
 
     def test_base_uses_its_conda_name(self):
         prefix = self.root / "miniconda3"
@@ -956,7 +992,7 @@ class ManagerTests(unittest.TestCase):
         adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
         for kind, task in (("pusht", "PushT-v0"), ("aloha", "AlohaTransferCube-v0")):
             with self.subTest(kind=kind):
-                settings["eval"].update(env=kind, tasks=[task], episodes=5, batch=2, episode_length=10)
+                settings["eval"].update(env=kind, tasks=[task], task_ids=[], episodes=5, batch=2, episode_length=10)
                 stage = adapter.evaluate(True)
                 self.assertEqual(stage.units, 5)
                 self.assertEqual(stage.eval_batches, 3)
@@ -1140,6 +1176,51 @@ class ManagerTests(unittest.TestCase):
         cfg["episode_length"] = 0
         self.assertFalse(any(arg.startswith("--env.episode_length=") for arg in adapter.evaluate(False).arguments))
         self.assertIn("[Default: PushT-v0]", menu.getvalue())
+
+    def test_libero_plus_routes_selected_variants_and_preserves_manual_environment(self):
+        settings = sample_settings()
+        config = settings["eval"]
+        config.update(env="libero_plus", tasks=["libero_spatial", "libero_object"],
+                      task_ids=[0, 21], control="absolute", size=224, episode_length=5,
+                      policy="lerobot/smolvla_libero", environment="custom_libero_plus")
+        adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
+        stage = adapter.evaluate(False)
+        self.assertEqual(stage.environment, "custom_libero_plus")
+        self.assertEqual(stage.units, 8)
+        self.assertEqual(stage.env["MUJOCO_GL"], "egl")
+        for argument in (
+            "--env.type=libero_plus", "--env.task=libero_spatial,libero_object",
+            "--env.task_ids=[0,21]", "--env.control_mode=absolute", "--env.observation_width=224",
+            "--env.observation_height=224", "--env.episode_length=5",
+        ):
+            self.assertIn(argument, stage.arguments)
+        config["task_ids"] = []
+        self.assertIsNone(adapter.evaluate(False).units)
+        config.update(env="libero", tasks=["libero_spatial"], task_ids=[21])
+        with self.assertRaisesRegex(ValueError, "in-range task IDs"):
+            adapter.evaluate(False)
+
+    def test_libero_plus_wizard_defaults_to_one_variant(self):
+        answers = io.StringIO("1\n\n\n\n\n\n5\n\n224\n\n")
+        with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as screen:
+            config = eval_settings("smolvla", False, {"steps": 4}, Inventory(), "libero_plus")
+        self.assertIn("Variant IDs per Suite", screen.getvalue())
+        self.assertEqual(config["task_ids"], [0])
+        self.assertEqual((config["episode_length"], config["size"]), (5, 224))
+
+    def test_robomme_routes_task_ids_and_episode_length(self):
+        settings = sample_settings()
+        config = settings["eval"]
+        config.update(env="robomme", tasks=["PickXtimes"], task_ids=[3], episode_length=8,
+                      policy="lerobot/smolvla_robomme")
+        adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
+        stage = adapter.evaluate(False)
+        self.assertIn("--env.task_ids=[3]", stage.arguments)
+        self.assertIn("--env.episode_length=8", stage.arguments)
+        self.assertNotIn("--env.control_mode=relative", stage.arguments)
+        config.update(env="pusht", tasks=["PushT-v0"])
+        with self.assertRaisesRegex(ValueError, "does not support task IDs"):
+            adapter.evaluate(False)
 
 
 if __name__ == "__main__":
