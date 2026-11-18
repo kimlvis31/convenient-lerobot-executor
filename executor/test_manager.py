@@ -13,7 +13,7 @@ from unittest.mock import patch
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json, training_flags
 from inventory import Inventory, scan, show
 from manage import (LeRobotEnvironments, ask, choose_evaluation_environment, choose_policy,
-                    choose, command_preview, component_scopes, configure_policy_options, configure_training_scope,
+                    choose, command_preview, component_scopes, configure_job, configure_policy_options, configure_training_scope,
                     delete_result_runs, eval_settings,
                     main, native_dataset, model_size, normalize_paths, number, plan,
                     settings_jobs, show_job_result, show_settings, wizard)
@@ -310,6 +310,72 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(job["train"]["steps"], 80)
         self.assertIn("<Questions>\n[Job 2]\n", menu.getvalue())
         self.assertEqual(menu.getvalue().count("Enter an integer within the allowed range."), 1)
+
+    def test_job_type_menu_defaults_to_evaluation_and_routes_all_native_modes(self):
+        adapters, inventory = load_adapters([]), Inventory()
+        train, evaluation = {"steps": 4}, {"env": "libero"}
+        catalog = {"policies": {"pi05": True}}
+        cases = (("", None, True), ("2", False, False), ("3", False, True),
+                 ("4", True, False), ("5", True, True))
+        for answer, resume, evaluate in cases:
+            with self.subTest(answer=answer):
+                with patch("sys.stdin", io.StringIO(f"{answer}\n\n")), \
+                     patch("manage.choose_policy", return_value=("native", "pi05")), \
+                     patch("manage.native_train", return_value=train) as configure_training, \
+                     patch("manage.eval_settings", return_value=evaluation) as configure_evaluation, \
+                     contextlib.redirect_stdout(io.StringIO()) as menu:
+                    display = QuestionDisplay(menu, lambda title: print(f"<{title}>"))
+                    settings = QuestionHistory(display).run(lambda: configure_job(
+                        adapters, inventory, self.root, ["pi05"], lambda model: (catalog, None),
+                        lambda model, tiny: ("libero", "lerobot", False),
+                    ))
+                self.assertIn(
+                    "  1. Evaluation [Default]\n  2. Training\n  3. Training + Evaluation\n"
+                    "  4. Training Continuation\n  5. Training Continuation + Evaluation\n  B. Back\n",
+                    menu.getvalue(),
+                )
+                if resume is None:
+                    configure_training.assert_not_called()
+                    self.assertNotIn("train", settings)
+                else:
+                    configure_training.assert_called_once_with(resume, inventory, "pi05", catalog)
+                    self.assertEqual(settings["train"], train)
+                if evaluate:
+                    configure_evaluation.assert_called_once_with(
+                        "pi05", False, train if resume is not None else None, inventory, "libero",
+                    )
+                    self.assertEqual(settings["eval"], evaluation)
+                else:
+                    configure_evaluation.assert_not_called()
+                    self.assertNotIn("eval", settings)
+
+    def test_tinyvla_continuation_keeps_restore_and_warm_start(self):
+        adapters, inventory = load_adapters([]), Inventory()
+        state, weights = {"resume": "state.pt"}, {"warm_start": "weights"}
+        cases = (("4\n1\n\n", False), ("4\nB\n5\n2\n\n", True))
+        for answers, warm in cases:
+            with self.subTest(warm=warm):
+                with patch("sys.stdin", io.StringIO(answers)), \
+                     patch("manage.choose_policy", return_value=("tinyvla", "tinyvla")), \
+                     patch("manage.tiny_resume", return_value=state) as restore, \
+                     patch("manage.tiny_train", return_value=weights) as train, \
+                     patch("manage.eval_settings", return_value={"env": "libero"}) as evaluate, \
+                     contextlib.redirect_stdout(io.StringIO()) as menu:
+                    display = QuestionDisplay(menu, lambda title: print(f"<{title}>"))
+                    settings = QuestionHistory(display).run(lambda: configure_job(
+                        adapters, inventory, self.root, [], lambda model: ({}, None),
+                        lambda model, tiny: ("libero", "lerobot", False),
+                    ))
+                self.assertIn("Continuation Method", menu.getvalue())
+                self.assertEqual(settings["train"], weights if warm else state)
+                if warm:
+                    train.assert_called_once_with(True, inventory, self.root)
+                    restore.assert_not_called()
+                    evaluate.assert_called_once_with("tinyvla", True, weights, inventory, "libero")
+                else:
+                    restore.assert_called_once_with(inventory)
+                    train.assert_not_called()
+                    evaluate.assert_not_called()
 
     def test_run_confirmation_defaults_to_yes(self):
         plans = [({"model": "tinyvla"}, [], self.logs, self.root)]

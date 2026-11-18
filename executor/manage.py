@@ -869,29 +869,35 @@ def configure_jobs(adapters, inventory, root, policies, display, training_catalo
 def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment):
     backend, model = choose_policy(adapters, policies, inventory)
     tiny = backend == "tinyvla"
-    choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
-               ("both", "Train, then evaluate")]
-    if tiny:
-        choices.append(("warm", "Start training with existing action-head weights"))
-    operation = choose("Job Type", choices)
+    operation = choose("Job Type", [
+        ("eval", "Evaluation"),
+        ("train", "Training"),
+        ("both", "Training + Evaluation"),
+        ("resume", "Training Continuation"),
+        ("resume_eval", "Training Continuation + Evaluation"),
+    ])
+    continuation = operation in {"resume", "resume_eval"}
     cfg = {"schema": 1, "adapter": backend, "model": model}
     if operation != "eval":
         print("\n" + styled("Training Setup", "1;36"))
         if tiny:
             print("\nTraining benchmark · LIBERO")
-            if operation == "resume":
+            method = choose("Continuation Method", [
+                ("resume", "Resume from a training checkpoint"),
+                ("warm", "Start training with existing action-head weights"),
+            ]) if continuation else "new"
+            if method == "resume":
                 print("Training Scope · Restore checkpoint settings")
-            cfg["train"] = tiny_resume(inventory) if operation == "resume" else tiny_train(operation == "warm", inventory, root)
+                cfg["train"] = tiny_resume(inventory)
+            else:
+                cfg["train"] = tiny_train(method == "warm", inventory, root)
         else:
             catalog, target = training_catalog(model)
             if target:
                 print(f"Training Conda Environment: {target}")
                 cfg["environments"] = {model: target}
-            cfg["train"] = native_train(operation == "resume", inventory, model, catalog)
-    evaluate = operation in ("eval", "both") or (
-        operation in ("resume", "warm") and ask("Evaluate After Training? (Y/N)", "N").upper() == "Y"
-    )
-    if evaluate:
+            cfg["train"] = native_train(continuation, inventory, model, catalog)
+    if operation in {"eval", "both", "resume_eval"}:
         print("\n" + styled("Evaluation Setup", "1;36"))
         benchmark, environment, override = evaluation_environment(model, tiny)
         cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, benchmark)
