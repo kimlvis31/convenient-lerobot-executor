@@ -13,11 +13,13 @@ from unittest.mock import patch
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json, training_flags
 from inventory import Inventory, scan, show
 from manage import (LeRobotEnvironments, ask, choose_evaluation_environment, choose_policy,
-                    choose, configure_policy_options, configure_training_scope, delete_result_runs, eval_settings,
+                    choose, command_preview, component_scopes, configure_policy_options, configure_training_scope,
+                    delete_result_runs, eval_settings,
                     main, native_dataset, model_size, normalize_paths, number, plan,
                     settings_jobs, show_job_result, show_settings, wizard)
 from questions import QuestionDisplay, QuestionHistory
-from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
+from runner import (Progress, StageFailure, evaluation_timing_key, execute, history, load_settings,
+                    resolve_arguments, seconds, status_line)
 
 
 FAKE_BACKEND = r'''
@@ -552,17 +554,20 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("3. libero_goal [Default]", menu.getvalue())
         self.assertNotIn("Select an option", menu.getvalue())
 
-    def test_policy_menu_lists_native_models_before_external_models(self):
+    def test_policy_menu_lists_native_models_before_external_and_marks_missing_checkpoints(self):
+        cached = self.root / "hub/act/snapshots/version"
+        inventory = Inventory(models=[(cached, "act"), (self.external / "models/base", "tinyvla")],
+                              cached_models={cached: "lerobot/act @ version"})
         answers = io.StringIO("4\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
-            selected = choose_policy(load_adapters([]), ["xvla", "act"], {("native", "xvla")})
+            selected = choose_policy(load_adapters([]), ["xvla", "act"], inventory)
         self.assertEqual(selected, ("tinyvla", "tinyvla"))
         rows = [line.strip() for line in menu.getvalue().splitlines() if "Native]" in line or "External]" in line]
         self.assertTrue(rows[0].startswith("1. [LeRobot Native] act"))
         self.assertTrue(rows[0].endswith("[51.7 M] [Default]"))
-        self.assertTrue(rows[1].endswith("[879.7 M] <Not Installed>"))
+        self.assertTrue(rows[1].endswith("[879.7 M] <No Local Checkpoint>"))
         self.assertIn("3. [LeRobot Native] Enter a model name manually", rows[2])
-        self.assertIn("TinyVLA   [740.4 M]", rows[3])
+        self.assertTrue(rows[3].endswith("TinyVLA   [740.4 M]"))
         self.assertEqual(rows[0].index("act"), rows[1].index("xvla"))
         self.assertEqual(rows[0].index("[51.7 M]"), rows[1].index("[879.7 M]"))
         self.assertNotEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
@@ -634,12 +639,14 @@ class ManagerTests(unittest.TestCase):
         with patch("sys.stdin", io.StringIO("2\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
             dataset = native_dataset(Inventory(datasets=[(folder, {})]))
         self.assertNotIn("Dataset Repository Name", menu.getvalue())
-        self.assertEqual(dataset, {"dataset": "lerobot/libero", "dataset_root": str(folder), "episodes": [886]})
+        self.assertEqual(dataset, {"dataset": "lerobot/libero", "dataset_root": str(folder)})
         job = sample_settings()
         job["train"].update(dataset)
         adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
         self.assertIn("--dataset.repo_id=lerobot/libero", adapter.train().arguments)
-        self.assertIn("--dataset.episodes=[886]", adapter.train().arguments)
+        stage = adapter.train()
+        self.assertIn("--dataset.episodes=[886]", stage.arguments)
+        self.assertIn("dataset.episodes", stage.auto_flags)
 
     def test_model_training_options_are_typed_and_preserve_unselected_defaults(self):
         train = {}
@@ -653,7 +660,7 @@ class ManagerTests(unittest.TestCase):
         catalog = {"training": {"smolvla": ["freeze_vision_encoder"]},
                    "peft_policies": ["smolvla"], "peft_ready": True}
         train = {"pretrained": "lerobot/smolvla_base"}
-        with patch("sys.stdin", io.StringIO("3\n8\n16\nq_proj\nnone\n")), \
+        with patch("sys.stdin", io.StringIO("4\n8\n16\nq_proj\nnone\n")), \
              contextlib.redirect_stdout(io.StringIO()):
             configure_training_scope(train, "smolvla", catalog)
         self.assertEqual(train["lora"], {"rank": 8, "alpha": 16, "target_modules": "q_proj",
@@ -665,9 +672,86 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             training_flags({**train, "resume": "checkpoint"}, "smolvla")
         train = {}
-        with patch("sys.stdin", io.StringIO("2\n2\n")), contextlib.redirect_stdout(io.StringIO()):
+        with patch("sys.stdin", io.StringIO("3\n")), contextlib.redirect_stdout(io.StringIO()):
             configure_training_scope(train, "smolvla", catalog)
         self.assertEqual(training_flags(train, "smolvla"), ["--policy.freeze_vision_encoder=true"])
+
+    def test_training_scope_lists_every_distinct_smolvla_combination_together(self):
+        fields = ("train_expert_only", "freeze_vision_encoder", "train_state_proj")
+        choices = component_scopes("smolvla", fields)
+        self.assertEqual(len(choices), 6)
+        self.assertTrue(all(not scope["train_expert_only"] or scope["freeze_vision_encoder"] for scope, _ in choices))
+        self.assertEqual(len({label for _, label in choices}), 6)
+        with patch("sys.stdin", io.StringIO("2\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            configure_training_scope({}, "smolvla", {"training": {"smolvla": fields}})
+        self.assertEqual(menu.getvalue().count("Training Scope"), 1)
+        self.assertIn("State projection trained", menu.getvalue())
+        self.assertIn("State projection frozen", menu.getvalue())
+
+    def test_only_required_scope_arguments_are_marked_as_automatic(self):
+        job = sample_settings()
+        job["model"] = "fineart_vla"
+        job["train"]["policy_training"] = {"train_expert_only": True}
+        stage = NativeAdapter(job, "run", self.root, self.external, self.envs).train()
+        self.assertEqual(set(stage.auto_flags), {"policy.text_loss_weight", "policy.enable_fast_action_loss"})
+        with patch("manage.styled", side_effect=lambda text, style: f"<{style}>{text}</{style}>"):
+            preview = command_preview(stage.arguments, stage.auto_flags)
+        self.assertIn("<32>--policy.enable_fast_action_loss=false</32>", preview)
+        self.assertNotIn("<32>--policy.train_expert_only=true</32>", preview)
+        self.assertIn("--policy.text_loss_weight=0.0", preview)
+
+    def test_training_preflight_reuses_only_an_applicable_saved_camera_map(self):
+        dataset = self.root / "dataset"
+        (dataset / "meta").mkdir(parents=True)
+        source = "observation.images.image"
+        target = "observation.images.camera1"
+        metadata = dataset / "meta/info.json"
+        metadata.write_text(json.dumps({"features": {source: {"dtype": "video", "shape": [3, 16, 16]}}}),
+                            encoding="utf-8")
+        checkpoint = self.root / "model"
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text(json.dumps({
+            "type": "smolvla", "input_features": {target: {"type": "VISUAL", "shape": [3, 16, 16]}},
+        }), encoding="utf-8")
+        (checkpoint / "train_config.json").write_text(json.dumps({
+            "dataset": {"repo_id": "example/dataset"}, "rename_map": {source: target},
+        }), encoding="utf-8")
+        job = sample_settings()
+        job["train"].update(dataset_root=str(dataset), pretrained=str(checkpoint))
+        adapter = NativeAdapter(job, "test", self.root, self.external, self.envs)
+        stage = adapter.train()
+        self.assertIn("rename_map", stage.auto_flags)
+        self.assertIn(f'--rename_map={{"{source}":"{target}"}}', stage.arguments)
+        job["train"]["dataset"] = "another/dataset"
+        with self.assertRaisesRegex(ValueError, "checkpoint camera inputs do not match"):
+            adapter.train()
+
+    def test_failed_stage_keeps_log_and_explains_feature_mismatch(self):
+        logfile = self.root / "train.log"
+        logfile.write_text(
+            "ValueError: Feature mismatch between dataset and policy.\n"
+            "- Missing features: ['camera1']\n- Extra features: ['image']\n"
+            "ERROR conda.cli.main_run:execute(149): runner failed.\n",
+            encoding="utf-8",
+        )
+        failure = StageFailure("train", 1, logfile)
+        self.assertEqual(failure.logfile, logfile)
+        self.assertIn("Feature mismatch", failure.reason)
+        self.assertIn("Missing features: ['camera1']", failure.reason)
+        self.assertIn("Extra features: ['image']", failure.reason)
+        self.assertNotIn("conda", failure.reason)
+
+    def test_cuda_failure_summary_keeps_the_important_memory_figures(self):
+        logfile = self.root / "train.log"
+        logfile.write_text(
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 MiB. "
+            "GPU 0 has a total capacity of 11.61 GiB of which 15.38 MiB is free. "
+            "Additional allocator statistics.\n",
+            encoding="utf-8",
+        )
+        failure = StageFailure("train", 1, logfile)
+        self.assertEqual(failure.reason, "CUDA out of memory. Requested 16.00 MiB with 15.38 MiB free.")
+        self.assertEqual(failure.logfile, logfile)
 
     def test_model_size_uses_parameter_units_or_na(self):
         self.assertEqual(model_size("diffusion"), "[262.7 M]")

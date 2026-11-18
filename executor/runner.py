@@ -362,6 +362,69 @@ def progress_display(evaluation):
     yield status_text, print_status_detail, False
 
 
+class StageFailure(RuntimeError):
+    def __init__(self, stage, code, logfile):
+        self.stage = stage
+        self.code = code
+        self.logfile = logfile
+        self.reason = stage_failure_reason(logfile)
+        message = f"{stage} exited with code {code}."
+        if self.reason:
+            message += f" Cause: {self.reason}"
+        super().__init__(f"{message} See {logfile}.")
+
+
+def stage_failure_reason(logfile):
+    try:
+        with logfile.open("rb") as log:
+            size = log.seek(0, os.SEEK_END)
+            start = max(0, size - 64 * 1024)
+            log.seek(start)
+            data = log.read(64 * 1024)
+    except OSError:
+        return None
+    if start:
+        data = data.partition(b"\n")[2]
+    lines = [
+        re.sub(r"^\[rank\d+\]:\s*", "", line.strip(" │"))
+        for line in ANSI.sub("", data.decode("utf-8", errors="replace")).splitlines()
+    ]
+
+    def compact(value, limit):
+        clean = "".join(char for char in value if char.isprintable() or char.isspace())
+        clean = " ".join(clean.split())
+        return clean if len(clean) <= limit else clean[:limit - 1] + "…"
+
+    diagnostic = None
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        match = re.fullmatch(r"((?:[A-Za-z_]\w*\.)*(?:[A-Z]\w*(?:Error|Exception)|Error|Exception)):\s*(.*)", line)
+        if match:
+            error, detail = match.groups()
+            if error.rsplit(".", 1)[-1] in {"CalledProcessError", "ChildFailedError"}:
+                continue
+            if "CUDA out of memory" in detail:
+                requested = re.search(r"Tried to allocate (\d+(?:\.\d+)? [KMG]iB)", detail)
+                free = re.search(r"of which (\d+(?:\.\d+)? [KMG]iB) is free", detail)
+                if requested and free:
+                    return f"CUDA out of memory. Requested {requested[1]} with {free[1]} free."
+                return "CUDA out of memory."
+            related = []
+            for followup in lines[index + 1:index + 7]:
+                feature = re.match(r"(?:[-*•]\s*)?((?:missing|extra|unexpected)(?: [^:]+)?:\s*.+)",
+                                   followup.strip(), re.IGNORECASE)
+                if feature:
+                    related.append(compact(feature[1], 135))
+            if detail or related:
+                if related:
+                    return " | ".join([compact(line, 145), *related[:2]])
+                return compact(line, 320)
+        elif diagnostic is None and re.match(r"^(?:ERROR:|Fatal:|CUDA error:|\S+: error:)\s*\S",
+                                             line, re.IGNORECASE):
+            diagnostic = compact(line, 320)
+    return diagnostic
+
+
 def run_stage(command, stage, root, logfile, update, write_message=None):
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", **stage.env}
     with logfile.open("x", encoding="utf-8") as log:
@@ -386,7 +449,7 @@ def run_stage(command, stage, root, logfile, update, write_message=None):
         finally:
             process.stdout.close()
     if code != 0:
-        raise RuntimeError(f"{stage.name} exited with code {code}. See {logfile}.")
+        raise StageFailure(stage.name, code, logfile)
     for item in stage.artifacts:
         require(item)
     read_json(stage.artifacts[0])

@@ -4,6 +4,7 @@
 import argparse
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from itertools import product
 import json
 import math
 import os
@@ -20,7 +21,7 @@ from adapters import SUITES, TRAINING_SWITCHES, load_adapters, native_checkpoint
 from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
-from runner import (ANSI, available_environments, conda_command, conda_executable, environment_catalog,
+from runner import (ANSI, StageFailure, available_environments, conda_command, conda_executable, environment_catalog,
                     execute, load_settings, seconds, stage_title, styled)
 
 
@@ -199,10 +200,7 @@ def native_dataset(inventory):
     selection = read_json(split_file) if split_file.is_file() else {}
     name = re.sub(r"[^a-zA-Z0-9]+", "-", folder.name).strip("-")[:80].rstrip("-") or "dataset"
     repo = selection.get("dataset_repo") or info.get("repo_id") or f"local/{name}"
-    config = {"dataset": repo, "dataset_root": root}
-    if "train_episodes" in selection:
-        config["episodes"] = selection["train_episodes"]
-    return config
+    return {"dataset": repo, "dataset_root": root}
 
 
 def choose_model(inventory, model, optional=False):
@@ -281,7 +279,7 @@ def model_size(model):
     return f"[{amount} {unit}]"
 
 
-def choose_policy(adapters, policies, unavailable=(), *, inventory=None, reasons=None):
+def choose_policy(adapters, policies, inventory):
     native_tag = "[LeRobot Native]"
     external_tag = "[External]"
     native = styled(native_tag, "38;5;75")
@@ -291,23 +289,15 @@ def choose_policy(adapters, policies, unavailable=(), *, inventory=None, reasons
     entries = [(("native", model), f"{native} {model}") for model in sorted(policies)]
     entries.append((("native", ""), f"{native} Enter a model name manually"))
     entries += [((key, key), f"{external} {adapters[key].label}") for key in sorted(adapters) if key != "native"]
-    unavailable = set(unavailable)
-    reasons = dict(reasons or {})
-    if inventory is not None:
-        local = {kind for _, kind in inventory.models}
-        for value, _ in entries:
-            _, model = value
-            if model and model not in local:
-                reason = reasons.get(value)
-                reasons[value] = f"{reason} · No Local Checkpoint" if reason else "No Local Checkpoint"
-                unavailable.add(value)
-        print("Bright policies have a checked runtime and local weights. Declared dependencies can be installed when a job starts.")
+    local = {kind for _, kind in inventory.models}
+    reasons = {value: "No Local Checkpoint" for value, _ in entries if value[1] and value[1] not in local}
     sizes = {value: model_size(value[1]) for value, _ in entries if value[1]}
     groups = {value: "native" if value[0] == "native" else "external" for value, _ in entries}
-    enabled = [index for index, (value, _) in enumerate(entries, 1) if value not in unavailable]
-    default = next((index for index in enabled if entries[index - 1][0] == ("native", "smolvla")), enabled[0])
+    available = [index for index, (value, _) in enumerate(entries, 1) if value[1] in local]
+    default = next((index for index in available if entries[index - 1][0] == ("native", "smolvla")),
+                   available[0] if available else None)
     backend, model = choose("Policy Model", entries, default=default, details=sizes,
-                            groups=groups, unavailable=unavailable, reasons=reasons)
+                            groups=groups, unavailable=reasons, reasons=reasons)
     if not model:
         model = ask("LeRobot Policy Name", "smolvla")
     elif backend not in {"native", "tinyvla"}:
@@ -315,45 +305,92 @@ def choose_policy(adapters, policies, unavailable=(), *, inventory=None, reasons
     return backend, model
 
 
+def component_scopes(model, fields, pretrained=None):
+    if not fields:
+        return []
+    if "train_mode_vlm" in fields:
+        choices = [
+            ({"train_mode_vlm": "fft", "freeze_embedding": False}, "Action expert + full vision-language model"),
+            ({"train_mode_vlm": "fft", "freeze_embedding": True}, "Action expert + vision-language model (embeddings frozen)"),
+            ({"train_mode_vlm": "lora"}, "Action expert + vision-language LoRA"),
+        ]
+        checkpoint = Path(pretrained or ".") / "config.json"
+        if not pretrained or (checkpoint.is_file() and read_json(checkpoint).get("action_mode", "continuous") == "continuous"):
+            choices.append(({"train_mode_vlm": "freeze"}, "Action expert only"))
+        if "freeze_embedding" not in fields:
+            choices = [(scope, label) for scope, label in choices if not scope.get("freeze_embedding")]
+            for scope, _ in choices:
+                scope.pop("freeze_embedding", None)
+        return choices
+
+    partial = {"groot": "tune_llm", "lawam": "freeze_llm_backbone"}.get(model)
+    fields = [name for name in fields if name in TRAINING_SWITCHES]
+    combinations = []
+    for values in product(*((False, True, "partial") if field == partial else (False, True) for field in fields)):
+        if not fields:
+            break
+        scope = dict(zip(fields, values))
+        expert = scope.get("train_expert_only")
+        if expert and scope.get("freeze_vision_encoder") is False:
+            continue
+        if model in {"groot", "evo1"} and not any(values):
+            continue
+        if model == "lawam" and scope.get("freeze_vision_backbone") is False and scope.get("unfreeze_vision_merger") is False:
+            continue
+
+        if expert:
+            title = "Action expert"
+            if model == "fineart_vla":
+                title += " (flow loss only)"
+        elif "train_expert_only" in scope:
+            title = ("Action expert + non-vision backbone" if scope.get("freeze_vision_encoder")
+                     else "Action expert + full backbone")
+        else:
+            title = ""
+        labels = [title] if title else []
+        for field, value in scope.items():
+            if field == "train_expert_only" or field == "freeze_vision_encoder" and "train_expert_only" in scope:
+                continue
+            if field == "unfreeze_vision_merger" and scope.get("freeze_vision_backbone") is False:
+                continue
+            component = TRAINING_SWITCHES[field]
+            if value == "partial":
+                labels.append(f"{component} top layers trained")
+            else:
+                trained = not value if field.startswith("freeze_") else value
+                labels.append(f"{component} {'trained' if trained else 'frozen'}")
+        combinations.append((scope, " · ".join(labels)))
+    return combinations
+
+
 def configure_training_scope(train, model, catalog):
     fields = catalog.get("training", {}).get(model, ())
-    methods = [("default", "Use policy or checkpoint defaults")]
-    if fields:
-        methods.append(("parts", "Choose trainable components"))
-    if train.get("pretrained") and model in catalog.get("peft_policies", ()):
-        methods.append(("lora", "Train LoRA adapters"))
-    if len(methods) == 1:
+    scopes = [({}, "Use policy or checkpoint defaults"), *component_scopes(model, fields, train.get("pretrained"))]
+    peft = bool(train.get("pretrained") and model in catalog.get("peft_policies", ()))
+    if len(scopes) == 1 and not peft:
         print("Training Scope · Policy or checkpoint defaults")
         return
-    missing = {"lora"} if not catalog.get("peft_ready") else set()
-    mode = choose("Training Scope", methods, unavailable=missing)
-    if mode == "parts":
-        scope = {}
-        for field in fields:
-            if field == "train_mode_vlm":
-                vlm_mode = choose("Vision-Language Training Mode", [
-                    ("default", "Keep the policy or checkpoint setting"),
-                    ("fft", "Train the vision-language model"),
-                    ("freeze", "Freeze the vision-language model"),
-                    ("lora", "Train vision-language LoRA adapters"),
-                ])
-                if vlm_mode != "default":
-                    scope[field] = vlm_mode
-                if vlm_mode == "lora":
-                    scope["lora_rank"] = number("LoRA Rank", 64)
-                    scope["lora_alpha"] = number("LoRA Alpha", 16)
-                    scope["lora_dropout"] = number("LoRA Dropout Percent", 5, 0, 100) / 100
-                continue
-            value = choose(TRAINING_SWITCHES[field], [
-                (None, "Keep the policy or checkpoint setting"), (True, "Yes"), (False, "No"),
-            ])
-            if value is not None:
-                scope[field] = value
+    options = [(index, label) for index, (_, label) in enumerate(scopes)]
+    if peft:
+        options.append(("lora", "LoRA adapters with checkpoint training scope"))
+    choice = choose("Training Scope", options)
+    if choice != "lora":
+        scope = scopes[choice][0]
+        if model == "groot" and "tune_llm" in scope:
+            language = scope["tune_llm"]
+            scope["tune_llm"] = language is True
+            scope["tune_top_llm_layers"] = number("Trainable Top Language Layers", 1) if language == "partial" else 0
+        if model == "lawam" and "freeze_llm_backbone" in scope:
+            language = scope["freeze_llm_backbone"]
+            scope["freeze_llm_backbone"] = language is not False
+            scope["unfreeze_llm_last_n_layers"] = number("Trainable Top Language Layers", 1) if language == "partial" else -1
+        if scope.get("train_mode_vlm") == "lora":
+            scope["lora_rank"] = number("LoRA Rank", 64)
+            scope["lora_alpha"] = number("LoRA Alpha", 16)
+            scope["lora_dropout"] = number("LoRA Dropout Percent", 5, 0, 100) / 100
         if scope:
             train["policy_training"] = scope
-    if mode == "lora":
-        if "lora" in missing:
-            print("Install the LeRobot peft extra in the model's Conda environment before running.")
+    else:
         lora = {"rank": number("LoRA Rank", 16), "alpha": number("LoRA Alpha", 16)}
         targets = ask("LoRA Target Modules (regular expression, blank uses model defaults)", optional=True)
         if targets:
@@ -423,7 +460,10 @@ def native_train(resume, inventory, model, catalog=None):
                  "batch": number("Training Batch Size", 8), "device": ask("Training Device", "cuda"),
                  "seed": number("Random Seed", 0, 0)}
         configure_training_scope(train, model, catalog or {})
-        configure_policy_options(train, (catalog or {}).get("training_options", {}).get(model, {}))
+        policy_options = (catalog or {}).get("training_options", {}).get(model, {})
+        if model == "fineart_vla" and train.get("policy_training", {}).get("train_expert_only"):
+            policy_options = {key: value for key, value in policy_options.items() if key != "text_loss_weight"}
+        configure_policy_options(train, policy_options)
     train.update(steps=number("Target Training Step Count", old_steps),
                  save_freq=number("Checkpoint Interval in Steps", 100), extra=extra_flags())
     return train
@@ -578,7 +618,7 @@ class LeRobotEnvironments:
                 locations.setdefault(kind, []).append(name)
         return locations
 
-    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False):
+    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False, peft=False):
         catalogs = self.lerobot()
         if preferred not in catalogs and (catalog := self.catalog(preferred)):
             catalogs[preferred] = catalog
@@ -610,11 +650,16 @@ class LeRobotEnvironments:
                 continue
             if needs_benchmark and benchmark not in entry.get("benchmarks", {}):
                 continue
+            needs_peft = peft and not entry.get("peft_ready", False)
+            if needs_peft and not entry.get("peft_installable", False):
+                continue
             dependencies = []
             if needs_policy:
                 dependencies.append(("--policy", model))
             if needs_benchmark:
                 dependencies.append(("--install", benchmark))
+            if needs_peft:
+                dependencies.append(("--peft", None))
             candidates.append((len(dependencies), name != preferred, name, dependencies))
 
         if not candidates:
@@ -627,9 +672,11 @@ class LeRobotEnvironments:
             return source
 
         program = ["python", "-B", str(Path(__file__).with_name("benchmarks.py"))]
-        names_to_install = [name for _, name in dependencies]
+        names_to_install = [name or "LoRA" for _, name in dependencies]
         for option, name in dependencies:
-            program.extend((option, name))
+            program.append(option)
+            if name is not None:
+                program.append(name)
         description = " and ".join(names_to_install)
         process_options = {"cwd": self.root, "text": True, "encoding": "utf-8", "errors": "replace",
                            "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
@@ -655,7 +702,7 @@ class LeRobotEnvironments:
         if result.returncode:
             raise RuntimeError(result.stdout.strip() or f"Could not install dependencies for {description} in {target}.")
         refreshed = self.catalog(target, refresh=True)
-        if not policy_ready(refreshed) or not benchmark_ready(refreshed):
+        if not policy_ready(refreshed) or not benchmark_ready(refreshed) or (peft and not refreshed.get("peft_ready")):
             issue = refreshed.get("policy_issues", {}).get(model)
             detail = f" ({issue})" if issue else ""
             raise RuntimeError(f"Could not verify {description} in {target} after installation{detail}.")
@@ -751,41 +798,21 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             history = QuestionHistory(display)
             try:
                 if action == "new":
-                    catalog = catalog_for(native_env)
                     catalogs = environments.lerobot()
                     policies = {model for details in catalogs.values() for model in details.get("policies", {})}
-                    unavailable, reasons = set(), {}
-                    targets = {}
-                    for model in policies:
-                        preferred = mapping.get(model, native_env)
-                        details = catalog_for(preferred)
-                        ready = [name for name, entry in catalogs.items() if entry.get("policies", {}).get(model)]
-                        if details.get("policies", {}).get(model):
-                            targets[model] = preferred
-                        elif ready:
-                            targets[model] = ready[0]
-                        else:
-                            value = ("native", model)
-                            unavailable.add(value)
-                            reasons[value] = details.get("policy_issues", {}).get(model, "Runtime Not Verified")
-                    tiny_env = mapping.get("tinyvla", DEFAULT_ENVIRONMENTS["tinyvla"])
-                    if tiny_env == "tinyvla_infer" and "lerobot_tinyvla" in environments.names and tiny_env not in environments.names:
-                        tiny_env = "lerobot_tinyvla"
-                    bridge_ready = any(details.get("tinyvla_bridge") for details in catalogs.values())
-                    if catalog and (not bridge_ready or environments.names and tiny_env not in environments.names):
-                        value = ("tinyvla", "tinyvla")
-                        unavailable.add(value)
-                        reasons[value] = "Missing TinyVLA Runtime"
-                    elif not catalog:
-                        unavailable.add(("tinyvla", "tinyvla"))
-                        reasons[("tinyvla", "tinyvla")] = "Runtime Not Verified"
+
                     def training_catalog(model):
                         preferred = mapping.get(model, native_env)
-                        target = targets.get(model, preferred)
-                        return catalog_for(target), target if target != preferred else None
+                        details = catalog_for(preferred)
+                        if details.get("policies", {}).get(model):
+                            return details, None
+                        for name, catalog in catalogs.items():
+                            if catalog.get("policies", {}).get(model):
+                                return catalog, name
+                        return details, None
 
                     return configure_jobs(adapters, inventory, root, policies, display, training_catalog,
-                                          evaluation_environment, unavailable, reasons)
+                                          evaluation_environment)
                 if action == "reuse":
                     files = [(p, str(p)) for p in inventory.settings]
                     path = history.run(lambda: select_path("Settings File", files))
@@ -815,9 +842,9 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             display.notice(json.dumps(summary or result, ensure_ascii=False, indent=2))
 
 
-def configure_jobs(adapters, inventory, root, policies, display, training_catalog, evaluation_environment, unavailable, reasons):
+def configure_jobs(adapters, inventory, root, policies, display, training_catalog, evaluation_environment):
     def configure():
-        job = configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment, unavailable, reasons)
+        job = configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment)
         return job, ask("Add Another Job? (Y/N)", "N").upper() == "Y"
 
     jobs = []
@@ -838,8 +865,8 @@ def configure_jobs(adapters, inventory, root, policies, display, training_catalo
         histories.append(QuestionHistory(display))
 
 
-def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment, unavailable, reasons):
-    backend, model = choose_policy(adapters, policies, unavailable, inventory=inventory, reasons=reasons)
+def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment):
+    backend, model = choose_policy(adapters, policies, inventory)
     tiny = backend == "tinyvla"
     choices = [("train", "Start training"), ("eval", "Evaluate"), ("resume", "Resume training from a checkpoint"),
                ("both", "Train, then evaluate")]
@@ -1018,13 +1045,19 @@ def plan(args):
     return plans, conda
 
 
-def command_preview(arguments):
+def command_preview(arguments, auto_flags=()):
     groups = []
     for argument in arguments:
         if not groups or argument.startswith("--"):
             groups.append([])
         groups[-1].append(argument)
-    return " \\\n".join(f"    {shlex.join(group)}" for group in groups)
+    commands = []
+    for group in groups:
+        command = shlex.join(group)
+        if group[0].removeprefix("--").partition("=")[0] in auto_flags:
+            command = styled(command, "32")
+        commands.append(command)
+    return " \\\n".join(f"    {command}" for command in commands)
 
 
 def job_title(index, cfg):
@@ -1040,7 +1073,10 @@ def show_settings(plans, show_commands):
         for stage in stages:
             print("  " + stage_title(stage, cfg["model"]))
             if show_commands:
-                print(command_preview(stage.arguments))
+                print(command_preview(stage.arguments, stage.auto_flags))
+            elif stage.auto_flags:
+                automatic = [arg for arg in stage.arguments if arg.removeprefix("--").partition("=")[0] in stage.auto_flags]
+                print(command_preview(automatic, stage.auto_flags))
         evaluation = cfg.get("eval")
         if evaluation and evaluation["batch"] > evaluation["episodes"]:
             print(f"  Effective evaluation batch size: {evaluation['episodes']} "
@@ -1064,8 +1100,10 @@ def prepare_job_environments(cfg, stages, root, conda, sessions):
     model = cfg["model"]
     for stage in managed:
         evaluation = cfg["eval"] if stage.name == "eval" else {}
+        train = cfg.get("train", {}) if stage.name == "train" else {}
+        peft = train.get("lora") is not None or train.get("policy_training", {}).get("train_mode_vlm") == "lora"
         target = session.prepare(stage.environment, model=model, tiny=backend == "tinyvla",
-                                 benchmark=evaluation.get("env"), pinned=bool(evaluation.get("environment")))
+                                 benchmark=evaluation.get("env"), pinned=bool(evaluation.get("environment")), peft=peft)
         if target != stage.environment:
             if stage.name == "eval":
                 evaluation["environment"] = target
@@ -1149,10 +1187,14 @@ def show_job_result(stages):
     divider()
 
 
-def report_failure(message, in_job):
+def report_failure(message, in_job, *, reason=None, logfile=None):
     result_heading(in_job)
     prefix = "    • " if in_job else ""
     print(f"{prefix}{message}", file=sys.stderr, flush=True)
+    if reason:
+        print(f"{prefix}Cause: {reason}", file=sys.stderr, flush=True)
+    if logfile:
+        print(f"{prefix}Full log: {logfile}", file=sys.stderr, flush=True)
     divider()
 
 
@@ -1194,6 +1236,10 @@ def main():
     except (KeyboardInterrupt, EOFError):
         report_failure("Run interrupted.", in_job=executing)
         return 130
+    except StageFailure as error:
+        report_failure(f"Run failed ({error.stage} exited with code {error.code}).", in_job=executing,
+                       reason=error.reason, logfile=error.logfile)
+        return 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.TimeoutExpired) as error:
         report_failure(f"Run failed ({error})", in_job=executing)

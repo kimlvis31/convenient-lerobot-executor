@@ -67,7 +67,9 @@ When a job starts, convLexecutor reuses a Conda environment for the selected pol
 
 For a local training dataset, select its directory. If its `selection.json` records a repository and a training split, convLexecutor uses both. Enter a Hugging Face repository name if you select **Use a dataset repository**.
 
-The policy list uses dim text for missing runtime dependencies or local checkpoints. Weight availability is checked by policy type. Choose a checkpoint trained for the selected benchmark. Native training shows supported scope, LoRA (Low-Rank Adaptation), and training options from the selected LeRobot version. TinyVLA can train the action head or combine it with language-attention LoRA. Omitting the LoRA settings selects action-head training. Exact resume restores the prior settings and optimizer state.
+The policy list marks models without a local checkpoint as <No Local Checkpoint>. The Hugging Face cache counts as local. Choose a checkpoint trained for the selected benchmark. Native training shows supported scope, LoRA (Low-Rank Adaptation), and training options from the selected LeRobot version. TinyVLA can train the action head or combine it with language-attention LoRA. Omitting the LoRA settings selects action-head training. Exact resume restores the prior settings and optimizer state.
+
+Training Scope lists the compatible component combinations together. The executor checks local dataset and checkpoint inputs before training, preserves the original dataset, and shows required arguments it added in green in Settings. Failed subprocesses show a short cause and the full log path in Result.
 
 Each result has an `executor/` subdirectory with its executed `run.py`, reusable `script.py`, job status, and the stage console log. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
 

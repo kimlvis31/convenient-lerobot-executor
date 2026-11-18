@@ -7,26 +7,39 @@ import math
 from pathlib import Path
 import re
 
+from training_preflight import native_training_preflight
+
 
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 TRAINING_SWITCHES = {
-    "train_expert_only": "Train Action Expert Only",
-    "freeze_vision_encoder": "Freeze Vision Encoder",
-    "freeze_vision_backbone": "Freeze Vision Backbone",
-    "freeze_language_encoder": "Freeze Language Encoder",
-    "freeze_llm_backbone": "Freeze Language Backbone",
-    "freeze_embedding": "Freeze Embeddings",
-    "freeze_vlm_embedding": "Freeze Vision-Language Embeddings",
-    "freeze_video_expert": "Freeze Video Expert",
-    "freeze_qwen": "Freeze Qwen",
-    "tune_llm": "Train Language Model",
-    "tune_visual": "Train Vision Model",
-    "tune_projector": "Train Projector",
-    "tune_diffusion_model": "Train Diffusion Model",
-    "tune_vlln": "Train Vision-Language Normalization",
+    "train_expert_only": "Action expert",
+    "freeze_vision_encoder": "Vision encoder",
+    "freeze_vision_backbone": "Vision backbone",
+    "freeze_language_encoder": "Language encoder",
+    "freeze_llm_backbone": "Language backbone",
+    "freeze_embedding": "Embeddings",
+    "freeze_vlm_embedding": "Vision-language embeddings",
+    "freeze_video_expert": "Video expert",
+    "freeze_qwen": "Qwen",
+    "train_state_proj": "State projection",
+    "train_policy_transformer": "Policy transformer",
+    "train_soft_prompts": "Soft prompts",
+    "tune_llm": "Language model",
+    "tune_visual": "Vision model",
+    "tune_projector": "Projector",
+    "tune_diffusion_model": "Diffusion model",
+    "tune_vlln": "Vision-language normalization",
+    "finetune_language_model": "Language model",
+    "finetune_vision_model": "Vision model",
+    "finetune_action_head": "Action head",
+    "unfreeze_vision_merger": "Vision merger",
+    "unfreeze_lam_decoder": "Latent action decoder",
 }
 PEFT_POLICIES = frozenset({"smolvla", "pi0", "pi05", "lingbot_vla_v2", "flux3"})
-SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {"train_mode_vlm", "lora_rank", "lora_alpha", "lora_dropout"}
+SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {
+    "train_mode_vlm", "lora_rank", "lora_alpha", "lora_dropout",
+    "tune_top_llm_layers", "unfreeze_llm_last_n_layers",
+}
 
 
 def is_policy_training_option(name):
@@ -51,6 +64,7 @@ class Stage:
     eval_batches: int = 0
     env: dict[str, str] = field(default_factory=dict)
     output: Path | None = None
+    auto_flags: tuple[str, ...] = ()
 
 
 def flag(name, value):
@@ -116,6 +130,10 @@ def training_flags(config, model):
     args = []
     for name, value in scope.items():
         valid = name in TRAINING_SWITCHES and type(value) is bool
+        if model == "groot" and name == "tune_top_llm_layers":
+            valid = type(value) is int and value >= 0
+        if model == "lawam" and name == "unfreeze_llm_last_n_layers":
+            valid = type(value) is int and value >= -1
         if model == "molmoact2":
             valid = valid or name == "train_mode_vlm" and value in ("fft", "lora", "freeze")
             valid = valid or name in {"lora_rank", "lora_alpha"} and type(value) is int and value > 0
@@ -125,7 +143,9 @@ def training_flags(config, model):
         args.append(flag(f"policy.{name}", value))
 
     for name, value in options.items():
-        if (not isinstance(name, str) or not is_policy_training_option(name)
+        legacy = name in {"train_state_proj", "train_policy_transformer", "train_soft_prompts"} and type(value) is bool
+        legacy = legacy or name == "tune_top_llm_layers" and type(value) is int and value >= 0
+        if (not isinstance(name, str) or not (is_policy_training_option(name) or legacy) or name in scope
                 or type(value) not in (bool, int, float, str)
                 or type(value) is float and not math.isfinite(value)):
             raise ValueError(f"Invalid policy option ({name}).")
@@ -155,6 +175,29 @@ def training_flags(config, model):
     return args
 
 
+def required_scope_flags(cfg, model, explicit):
+    scope = cfg.get("policy_training", {})
+    required = {}
+    if model == "fineart_vla" and scope.get("train_expert_only") is True:
+        required = {"policy.text_loss_weight": 0.0, "policy.enable_fast_action_loss": False}
+    branches = ("finetune_language_model", "finetune_vision_model", "finetune_action_head")
+    if model == "evo1" and all(name in scope for name in branches):
+        required = {"policy.apply_training_stage_defaults": False,
+                    "policy.finetune_vlm": scope[branches[0]] or scope[branches[1]]}
+    additional = {}
+    for name, value in required.items():
+        if name in explicit:
+            try:
+                selected = json.loads(explicit[name])
+            except ValueError:
+                selected = explicit[name]
+            if selected != value:
+                raise ValueError(f"Selected training scope requires {flag(name, value)}.")
+        else:
+            additional[name] = value
+    return additional
+
+
 class NativeAdapter:
     key = "native"
     label = "Native LeRobot policy"
@@ -180,6 +223,8 @@ class NativeAdapter:
             raise ValueError("Training steps must be a positive integer.")
         start = 0
         args = ["lerobot-train"]
+        extra = cfg.get("extra", [])
+        automatic = {}
         if cfg.get("resume"):
             model_dir = native_checkpoint(Path(cfg["resume"]).expanduser())
             old_cfg = read_json(model_dir / "train_config.json")
@@ -202,24 +247,39 @@ class NativeAdapter:
             if cfg.get("dataset_root"):
                 args.append(flag("dataset.root", cfg["dataset_root"]))
             episodes = cfg.get("episodes")
+            explicit_episodes = any(arg.startswith("--dataset.episodes=") for arg in extra)
+            if episodes is None and cfg.get("dataset_root") and not explicit_episodes:
+                split = Path(cfg["dataset_root"]) / "selection.json"
+                if split.is_file():
+                    episodes = read_json(split).get("train_episodes")
+                    if episodes is not None:
+                        automatic["dataset.episodes"] = episodes
             if episodes is not None:
                 if not isinstance(episodes, list) or not episodes or any(
                     type(episode) is not int or episode < 0 for episode in episodes
                 ):
                     raise ValueError("Training episodes must be a nonempty list of nonnegative integers.")
-                args.append(flag("dataset.episodes", json.dumps(episodes)))
+                if "dataset.episodes" not in automatic:
+                    args.append(flag("dataset.episodes", episodes))
             policy_key = "policy.path" if cfg.get("pretrained") else "policy.type"
             args.append(flag(policy_key, cfg.get("pretrained") or self.settings["model"]))
-        args += training_flags(cfg, self.settings["model"])
+        model = self.settings["model"]
+        scope_flags = training_flags(cfg, model)
+        explicit = dict(arg[2:].split("=", 1) for arg in (*scope_flags, *extra)
+                        if arg.startswith("--") and "=" in arg)
+        automatic.update(required_scope_flags(cfg, model, explicit))
+        automatic.update(native_training_preflight(self.settings))
+        args += scope_flags + [flag(name, value) for name, value in automatic.items()]
         args += [flag("output_dir", output), flag("job_name", self.run_name), flag("steps", steps),
                  flag("log_freq", min(track_frequency(steps), cfg["save_freq"])),
                  flag("save_freq", cfg["save_freq"]), "--save_checkpoint=true", "--policy.push_to_hub=false"]
-        args += additional_flags(cfg.get("extra", []),
+        args += additional_flags(extra,
                                  {a[2:].split("=")[0] for a in args if a.startswith("--")} |
                                  {"config_path", "resume", "policy.path", "policy.type",
                                   "save_checkpoint_to_hub", "output_dir"}, ("job.",))
         expected = output / "checkpoints/last/pretrained_model/train_config.json"
-        return Stage("train", self.environment, args, (expected,), steps, start, output=output)
+        return Stage("train", self.environment, args, (expected,), steps, start,
+                     output=output, auto_flags=tuple(automatic))
 
     def eval_policy(self, after_training):
         model = (self.train_dir / "train/checkpoints/last/pretrained_model" if after_training

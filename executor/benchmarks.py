@@ -173,14 +173,16 @@ def environment_catalog():
     manual = sorted(name for name, config in env_types.items()
                     if config.__module__.startswith("lerobot.envs.") and name not in installable
                     and name != "gym_manipulator")
+    peft_requirements = optional_requirements(distribution, "peft")
     return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
-            "peft_ready": "peft" in versions,
+            "peft_ready": "peft" in versions and all(installed(req, versions) for req in peft_requirements),
+            "peft_installable": bool(peft_requirements),
             "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable,
             "policy_issues": issues, "policy_installable": sorted(policy_installable), "training_options": options}
 
 
-def install_dependencies(*, benchmark=None, policy=None, plugin=None, isolated=False):
+def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False, isolated=False):
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
@@ -210,6 +212,11 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, isolated=F
         if config is None or not config.__module__.startswith("lerobot.policies.") or not declared:
             raise ValueError(f"LeRobot {distribution.version} does not declare installable dependencies for {policy}.")
         requirements.extend(declared)
+    if peft:
+        declared = optional_requirements(distribution, "peft")
+        if not declared:
+            raise ValueError(f"LeRobot {distribution.version} does not declare LoRA dependencies.")
+        requirements.extend(declared)
     needed = sorted({str(req) for req in requirements if not installed(req, versions)})
     if not needed:
         print("Requested dependencies are already installed.")
@@ -238,16 +245,17 @@ def main():
     parser.add_argument("--install", help="Install the declared dependencies for a benchmark")
     parser.add_argument("--policy", help="Install the declared dependencies for a native policy")
     parser.add_argument("--plugin", help="Install a named LeRobot environment plugin")
+    parser.add_argument("--peft", action="store_true", help="Install the declared LoRA dependencies")
     parser.add_argument("--isolated", action="store_true")
     args = parser.parse_args()
-    if sum(map(bool, (args.catalog, args.install or args.policy, args.plugin))) != 1:
-        parser.error("Choose --catalog, --install/--policy, or --plugin.")
+    if sum(map(bool, (args.catalog, args.install or args.policy or args.peft, args.plugin))) != 1:
+        parser.error("Choose --catalog, --install/--policy/--peft, or --plugin.")
     try:
         if args.catalog:
             print("MANAGER_CATALOG " + json.dumps(environment_catalog()))
         else:
             return install_dependencies(benchmark=args.install, policy=args.policy, plugin=args.plugin,
-                                        isolated=args.isolated)
+                                        peft=args.peft, isolated=args.isolated)
     except (ImportError, ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"Dependency setup failed ({error}).", file=sys.stderr)
         return 1
