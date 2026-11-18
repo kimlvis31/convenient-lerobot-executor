@@ -2,7 +2,7 @@
 """Interactive LeRobot training, evaluation, and resume manager."""
 
 import argparse
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout
 from datetime import datetime, timezone
 from itertools import product
 import json
@@ -87,15 +87,19 @@ def ask(question, default=None, optional=False, *, choices=(), blank_before=True
             answer = history.answers[position]
             history.position += 1
             if not history.replaying:
-                history.marks[position] = history.display.rows
+                history.marks[position] = history.display.position
                 print(f"{prompt}: {answer}", flush=True)
             return answer
         history.replaying = False
 
     read = sys.stdout.read if isinstance(sys.stdout, QuestionDisplay) else input
     while True:
-        mark = history.display.rows if history is not None else None
-        value = read(f"{prompt}: ").strip()
+        mark = history.display.position if history is not None else None
+        try:
+            value = read(f"{prompt}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise
         if not sys.stdin.isatty():
             print()
         if history is not None and value.casefold() == "b":
@@ -108,6 +112,19 @@ def ask(question, default=None, optional=False, *, choices=(), blank_before=True
                 history.position += 1
             return answer
         retry_question("Enter a response.", accepted=False)
+
+
+def confirm(question, default):
+    active = isinstance(sys.stdout, QuestionDisplay)
+    display = sys.stdout if active else QuestionDisplay(sys.stdout, section)
+    with redirect_stdout(display), (nullcontext() if active else display):
+        while True:
+            answer = ask(question, default).casefold()
+            if answer in {"y", "yes"}:
+                return True
+            if answer in {"n", "no"}:
+                return False
+            retry_question("Enter Y or N.")
 
 
 def number(question, default, minimum=1, maximum=None, *, choices=(), blank_before=True):
@@ -470,6 +487,28 @@ def native_train(resume, inventory, model, catalog=None):
     return train
 
 
+def evaluation_names(question, default=None):
+    while True:
+        names = [name.strip() for name in ask(question, default).split(",")]
+        if all(names) and len(names) == len(set(names)):
+            return names
+        retry_question("Enter unique names separated by commas.")
+
+
+def evaluation_task_ids(suite, default):
+    while True:
+        answer = ask("Task IDs (comma-separated, or all)", default)
+        if answer.casefold() == "all":
+            return []
+        try:
+            ids = [int(value) for value in answer.split(",")]
+        except ValueError:
+            ids = []
+        if ids and len(ids) == len(set(ids)) and all(i >= 0 and (suite not in SUITES or i < 10) for i in ids):
+            return ids
+        retry_question("Use unique, in-range task IDs from a single suite.")
+
+
 def evaluation_suites(train, tiny):
     task = train.get("task") if tiny and train else None
     defaults = [task[0]] if task else list(SUITES) if tiny and train else ["libero_object"]
@@ -482,8 +521,7 @@ def evaluation_suites(train, tiny):
     if choice == "all":
         return list(SUITES)
     if choice == "manual":
-        names = ask("Evaluation Suites (comma-separated)", ",".join(defaults))
-        return [name.strip() for name in names.split(",") if name.strip()]
+        return evaluation_names("Evaluation Suites (comma-separated)", ",".join(defaults))
     return [choice]
 
 
@@ -492,8 +530,7 @@ def eval_settings(model, tiny, train, inventory, env_type):
         tasks = evaluation_suites(train, tiny)
     else:
         default_task = {"pusht": "PushT-v0", "aloha": "AlohaInsertion-v0", "metaworld": "medium"}.get(env_type)
-        tasks = [task.strip() for task in ask("Evaluation Tasks (comma-separated)", default_task).split(",")
-                 if task.strip()]
+        tasks = evaluation_names("Evaluation Tasks (comma-separated)", default_task)
 
     cfg = {"env": env_type, "tasks": tasks,
            "episodes": number("Episodes per Task", 5), "batch": number("Evaluation Batch Size", 1),
@@ -505,8 +542,7 @@ def eval_settings(model, tiny, train, inventory, env_type):
     if env_type == "libero":
         task = train.get("task") if tiny and train else None
         default_id = str(task[1]) if task and tasks == [task[0]] else "all"
-        ids = ask("Task IDs (comma-separated, or all)", default_id) if len(tasks) == 1 else "all"
-        cfg["task_ids"] = [int(value) for value in ids.split(",")] if ids != "all" else []
+        cfg["task_ids"] = evaluation_task_ids(tasks[0], default_id) if len(tasks) == 1 else []
     if env_type in {"libero", "pusht", "aloha", "metaworld"}:
         cfg["episode_length"] = number("Episode Length (maximum control steps, 0 uses benchmark default)", 0, 0)
     if env_type == "libero":
@@ -564,7 +600,7 @@ def delete_result_runs(root, category, *, notice=print):
         selected.append((run, run.stat()))
 
     if protected:
-        print(f"Protected Run Folders: {protected} (active, unreadable, or redirected).")
+        notice(f"Protected Run Folders: {protected} (active, unreadable, or redirected).")
     if not selected:
         notice(f"No {label} Run Folders Available to Delete.")
         return False
@@ -573,7 +609,7 @@ def delete_result_runs(root, category, *, notice=print):
         print("This Also Deletes Checkpoints Stored in the Selected Run Folders.")
     count = len(selected)
     unit = "Run Folder" if count == 1 else "Run Folders"
-    if ask(f"Permanently Delete {count} {label} {unit}? (Y/N)", "N").upper() != "Y":
+    if not confirm(f"Permanently Delete {count} {label} {unit}? (Y/N)", "N"):
         notice("Deletion Canceled.")
         return False
 
@@ -582,12 +618,12 @@ def delete_result_runs(root, category, *, notice=print):
         try:
             if (folder.resolve() != folder or run.resolve() != run or not os.path.samestat(run.stat(), original)
                     or run_in_use(run)):
-                print(f"Skipped Changed Run Folder: {run}")
+                notice(f"Skipped Changed Run Folder: {run}")
                 continue
             shutil.rmtree(run)
             deleted += 1
         except OSError as error:
-            print(f"Could Not Delete {run} ({error}).", file=sys.stderr)
+            notice(f"Could Not Delete {run} ({error}).")
     notice(f"Deleted {deleted} of {count} {label} {unit}.")
     return deleted > 0
 
@@ -778,7 +814,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
         benchmark, selected = choose_evaluation_environment(environments, preferred, model, tiny)
         return benchmark, selected, selected != preferred
 
-    with redirect_stdout(display):
+    with redirect_stdout(display), display:
         show_inventory(display, inventory, environments.names)
         while True:
             display.show()
@@ -829,24 +865,26 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
                         inventory = scan(root, external or root / "externals/TinyVLA", root / "executor/log")
                         if display.terminal:
                             show_inventory(display, inventory, environments.names)
-                    for message in messages:
-                        display.notice(message)
+                    display.notice("\n".join(messages))
                     continue
                 files = [(p, str(p)) for p in inventory.results]
                 path = history.run(lambda: select_path("Result File", files))
+                result = read_json(path)
+                if not isinstance(result, dict):
+                    raise ValueError("Expected a result dictionary.")
+                summary = result.get("overall") or {key: result[key] for key in
+                            ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
+                display.notice(json.dumps(summary or result, ensure_ascii=False, indent=2))
             except PreviousQuestion:
                 continue
-
-            result = read_json(path)
-            summary = result.get("overall") or {key: result[key] for key in
-                        ("status", "steps", "batch_size", "resumed_from_step", "checkpoint") if key in result}
-            display.notice(json.dumps(summary or result, ensure_ascii=False, indent=2))
+            except (OSError, ValueError, SyntaxError, KeyError, TypeError) as error:
+                display.notice(f"Could not complete the selection ({error}).")
 
 
 def configure_jobs(adapters, inventory, root, policies, display, training_catalog, evaluation_environment):
     def configure():
         job = configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment)
-        return job, ask("Add Another Job? (Y/N)", "N").upper() == "Y"
+        return job, confirm("Add Another Job? (Y/N)", "N")
 
     jobs = []
     histories = [QuestionHistory(display)]
@@ -903,12 +941,8 @@ def configure_job(adapters, inventory, root, policies, training_catalog, evaluat
         cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, benchmark)
         if override:
             cfg["eval"]["environment"] = environment
-    while True:
-        saving = ask("Save Job Outputs? (Y/N)", "Y").upper()
-        if saving in {"Y", "N"}:
-            cfg["save_outputs"] = saving == "Y"
-            return cfg
-        retry_question("Enter Y or N.")
+    cfg["save_outputs"] = confirm("Save Job Outputs? (Y/N)", "Y")
+    return cfg
 
 
 def paths_for(args, cfg):
@@ -1279,7 +1313,7 @@ def main():
             return 0
         count = len(plans)
         job_label = "job" if count == 1 else "jobs"
-        if not (args.settings or args.queue) and ask(f"Run {count} {job_label}? (Y/N)", "Y").upper() != "Y":
+        if not (args.settings or args.queue) and not confirm(f"Run {count} {job_label}? (Y/N)", "Y"):
             section("Result")
             print("Run canceled.")
             divider()

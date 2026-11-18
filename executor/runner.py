@@ -317,7 +317,7 @@ def progress_display(evaluation):
             pass
         else:
             console = Console(file=sys.stdout, markup=False, highlight=False, emoji=False)
-            with Live(console=console, auto_refresh=False,
+            with Live(console=console, auto_refresh=False, transient=True,
                       redirect_stdout=False, redirect_stderr=False) as live:
                 def gauge(width, completed, total, color):
                     filled = max(0, min(width, int(width * completed / total)))
@@ -355,6 +355,38 @@ def progress_display(evaluation):
 
                 yield refresh, note, evaluation
             return
+
+        current = None
+        erase = "\r\x1b[2K"
+
+        def clear_status():
+            nonlocal current
+            if current is not None:
+                print(erase, end="", flush=True)
+                current = None
+
+        def refresh_text(message, _completion, _episode):
+            nonlocal current
+            width = max(1, shutil.get_terminal_size().columns - 1)
+            line = f"    • {message}"
+            if len(line) > width:
+                line = line[:width - 1] + "…"
+            prefix = erase if current is not None else ""
+            current = message
+            print(prefix + line, end="", flush=True)
+
+        def note_text(message):
+            previous = current
+            clear_status()
+            print_status_detail(message)
+            if previous is not None:
+                refresh_text(previous, None, None)
+
+        try:
+            yield refresh_text, note_text, False
+        finally:
+            clear_status()
+        return
 
     def status_text(message, _completion, _episode):
         print_status_detail(message)

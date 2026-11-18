@@ -2,6 +2,7 @@ import contextlib
 from dataclasses import asdict
 import io
 import json
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -19,7 +20,37 @@ from manage import (LeRobotEnvironments, ask, choose_evaluation_environment, cho
                     settings_jobs, show_job_result, show_settings, wizard)
 from questions import QuestionDisplay, QuestionHistory
 from runner import (Progress, StageFailure, evaluation_timing_key, execute, history, load_settings,
-                    resolve_arguments, seconds, status_line)
+                    progress_display, resolve_arguments, seconds, status_line)
+
+
+class RenderedTerminal(io.StringIO):
+    # Render the cursor-up and erase commands used by QuestionDisplay.
+    def __init__(self):
+        super().__init__()
+        self.lines = [""]
+        self.row = 0
+
+    def isatty(self):
+        return True
+
+    def write(self, text):
+        for chunk in re.split(r"(\x1b\[[0-?]*[ -/]*[@-~])", text):
+            if move := re.fullmatch(r"\x1b\[(\d+)F", chunk):
+                self.row = max(0, self.row - int(move[1]))
+            elif chunk == "\x1b[J":
+                self.lines[self.row:] = [""]
+            elif not chunk.startswith("\x1b["):
+                for char in chunk:
+                    if char == "\n":
+                        self.row += 1
+                        if self.row == len(self.lines):
+                            self.lines.append("")
+                    elif char != "\r":
+                        self.lines[self.row] += char
+        return len(text)
+
+    def screen(self):
+        return "\n".join(self.lines)
 
 
 FAKE_BACKEND = r'''
@@ -377,13 +408,13 @@ class ManagerTests(unittest.TestCase):
                     train.assert_not_called()
                     evaluate.assert_not_called()
 
-    def test_run_confirmation_defaults_to_yes(self):
+    def test_run_confirmation_retries_and_defaults_to_yes(self):
         plans = [({"model": "tinyvla"}, [], self.logs, self.root)]
-        with patch("sys.argv", ["manage.py"]), patch("sys.stdin", io.StringIO("\n")), \
+        with patch("sys.argv", ["manage.py"]), patch("sys.stdin", io.StringIO("maybe\n\n")), \
              patch("manage.plan", return_value=(plans, "fake")), patch("manage.run_plans") as execute, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(), 0)
-        self.assertIn("Run 1 job? (Y/N) [Default: Y]", output.getvalue())
+        self.assertEqual(output.getvalue().count("Run 1 job? (Y/N) [Default: Y]"), 2)
         execute.assert_called_once_with(plans, "fake", False, {})
 
     def test_temporary_native_jobs_clean_outputs_after_summary_or_failure(self):
@@ -656,30 +687,104 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.train()
 
-    def test_interactive_retry_erases_only_current_question_and_previous_error(self):
+    def test_interactive_retry_and_back_clear_only_the_old_prompt_and_warning(self):
+        terminal = RenderedTerminal()
+        answers = iter(("kept", "invalid", "99", "4", "B", "5", "done"))
+        snapshots = []
+
+        def input_with_echo():
+            snapshots.append(terminal.screen())
+            answer = next(answers)
+            terminal.write(answer + "\n")
+            return answer
+
+        with patch("sys.stdin", terminal), patch.dict("os.environ", {"TERM": "xterm"}), \
+             patch("builtins.input", side_effect=input_with_echo):
+            display = QuestionDisplay(terminal, lambda title: print(f"<{title}>"))
+            with contextlib.redirect_stdout(display):
+                def configure():
+                    start = ask("Earlier")
+                    value = number("Count", 3, maximum=9)
+                    return start, value, ask("Later")
+
+                settings = QuestionHistory(display).run(configure)
+        warning = "Enter an integer within the allowed range."
+        self.assertEqual(settings, ("kept", 5, "done"))
+        for failed_attempt in snapshots[2:4]:
+            self.assertEqual(failed_attempt.count(warning), 1)
+            self.assertEqual(failed_attempt.count("Count"), 1)
+            self.assertIn("kept", failed_attempt)
+        self.assertNotIn(warning, snapshots[4])
+        self.assertNotIn(warning, terminal.screen())
+        self.assertEqual(terminal.screen().count("Count"), 1)
+        self.assertIn("kept", terminal.screen())
+
+    def test_progress_fallback_clears_one_row_on_success_failure_and_interrupt(self):
         class Terminal(io.StringIO):
             def isatty(self):
                 return True
 
-        stdin, terminal = Terminal(), Terminal()
-        with patch("sys.stdin", stdin), patch.dict("os.environ", {"TERM": "xterm"}), \
-             patch("builtins.input", side_effect=["kept", "8", "9", "1"]):
-            display = QuestionDisplay(terminal, lambda title: print(f"<{title}>"))
-            with contextlib.redirect_stdout(display):
-                def configure():
-                    return ask("Earlier", optional=True), choose("Job Type", [("train", "Start training")])
+        original_import = __import__
 
-                self.assertEqual(QuestionHistory(display).run(configure), ("kept", "train"))
-        output = terminal.getvalue()
-        self.assertEqual(output.count("Earlier"), 1)
-        self.assertIn("\x1b[4F\x1b[J", output)
-        self.assertIn("\x1b[5F\x1b[J", output)
-        self.assertNotIn("\x1b[6F\x1b[J", output)
+        def no_rich(name, *args, **kwargs):
+            if name.startswith("rich"):
+                raise ImportError(name)
+            return original_import(name, *args, **kwargs)
+
+        for error in (None, RuntimeError, KeyboardInterrupt):
+            with self.subTest(error=error):
+                terminal = Terminal()
+                with contextlib.redirect_stdout(terminal), patch.dict("os.environ", {"TERM": "xterm"}), \
+                     patch("builtins.__import__", side_effect=no_rich):
+                    try:
+                        with progress_display(True) as (refresh, note, _):
+                            refresh("First progress", 10, None)
+                            note("Verbose diagnostic")
+                            refresh("Last progress", 100, None)
+                            if error:
+                                raise error()
+                    except (RuntimeError, KeyboardInterrupt):
+                        pass
+                    print("(Result)")
+                display = terminal.getvalue()
+                self.assertIn("\r\x1b[2K    • Verbose diagnostic\n", display)
+                self.assertTrue(display.endswith("\r\x1b[2K(Result)\n"))
+
+    def test_question_notice_has_one_slot_and_is_cleared_on_redraw_and_exit(self):
+        terminal = RenderedTerminal()
+        with patch("sys.stdin", terminal), patch.dict("os.environ", {"TERM": "xterm"}):
+            display = QuestionDisplay(terminal, lambda title: print(f"<{title}>"))
+            with contextlib.redirect_stdout(display), display:
+                print("Inventory")
+                display.mark()
+                display.show()
+                display.notice("Old notice")
+                display.notice("Latest notice")
+                display.show()
+                screen = terminal.screen()
+                self.assertNotIn("Old notice", screen)
+                self.assertEqual(screen.count("Latest notice"), 1)
+                self.assertLess(screen.index("Latest notice"), screen.index("<Questions>"))
+                display.show()
+                self.assertNotIn("Latest notice", terminal.screen())
+                display.notice("Last notice")
+                display.show()
+            self.assertEqual(terminal.screen(), "Inventory\n")
 
     def test_accepts_zero_seed_default(self):
         with patch("builtins.input", return_value="") as prompt:
             self.assertEqual(number("seed", 0, 0), 0)
         prompt.assert_called_once_with("\nseed [Default: 0]: ")
+
+    def test_invalid_task_ids_retry_and_all_is_case_insensitive(self):
+        cases = ((("x", "0,0", "-1", "10", "0,9"), [0, 9]), (("ALL",), []))
+        for answers, expected in cases:
+            with self.subTest(answers=answers):
+                inputs = "\n".join(("1", "", "", "", "", *answers, "", "", "", "", ""))
+                with patch("sys.stdin", io.StringIO(inputs)), contextlib.redirect_stdout(io.StringIO()) as menu:
+                    cfg = eval_settings("act", False, {"steps": 4}, Inventory(), "libero")
+                self.assertEqual(cfg["task_ids"], expected)
+                self.assertEqual(menu.getvalue().count("Task IDs (comma-separated, or all)"), len(answers))
 
     def test_tinyvla_evaluation_defaults_to_training_suite_and_task(self):
         answers = io.StringIO("\n3\n2\n\n\n\n10\n\n\n")

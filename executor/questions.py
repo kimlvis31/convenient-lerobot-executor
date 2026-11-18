@@ -4,7 +4,7 @@ from contextvars import ContextVar
 import os
 import shutil
 import sys
-from unicodedata import combining, east_asian_width
+from unicodedata import category, combining, east_asian_width
 
 from runner import ANSI, styled
 
@@ -16,34 +16,56 @@ class PreviousQuestion(Exception):
     """Return to the preceding interactive prompt."""
 
 
+def cursor_after(text, width, row=0, column=0):
+    for char in ANSI.sub("", text):
+        if char == "\n":
+            row += 1
+            column = 0
+        elif char == "\r":
+            column = 0
+        elif char == "\t":
+            column = min(width - 1, (column // 8 + 1) * 8)
+        elif not combining(char) and category(char) not in {"Cc", "Cf"}:
+            cells = min(width, 2 if east_asian_width(char) in "WF" else 1)
+            if column + cells > width:
+                row += 1
+                column = 0
+            column += cells
+    return row, column
+
+
 class QuestionDisplay:
     def __init__(self, stream, section):
         self.stream = stream
         self.section = section
         self.terminal = stream.isatty() and sys.stdin.isatty() and os.environ.get("TERM") != "dumb"
+        self.size = shutil.get_terminal_size()
+        self.resized = False
+        self.transcript = ""
         self.rows = 0
         self.column = 0
         self.boundary = 0
         self.prompt_start = 0
-        self.retrying = False
+        self.pending_error = None
+        self.pending_notice = None
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.clear()
+
+    @property
+    def position(self):
+        return len(self.transcript)
+
     def _record(self, text):
-        width = shutil.get_terminal_size().columns
-        for char in ANSI.sub("", text):
-            if char == "\n":
-                self.rows += 1
-                self.column = 0
-            elif char == "\r":
-                self.column = 0
-            elif not combining(char):
-                cells = 2 if east_asian_width(char) in "WF" else 1
-                if self.column + cells > width:
-                    self.rows += 1
-                    self.column = 0
-                self.column += cells
+        self.resized = self.resized or shutil.get_terminal_size() != self.size
+        self.transcript += text
+        self.rows, self.column = cursor_after(text, self.size.columns, self.rows, self.column)
 
     def write(self, text):
         history = active_history.get()
@@ -56,43 +78,58 @@ class QuestionDisplay:
     def read(self, prompt):
         if not self.terminal:
             return input(prompt)
-        if not self.retrying:
-            self.prompt_start = self.rows
-        self.retrying = False
+        self.prompt_start = self.position
+        error, self.pending_error = self.pending_error, None
+        if error:
+            print(error)
         print(prompt, end="", flush=True)
         value = input()
         self._record(value + "\n")
+        if error:
+            self.clear(self.prompt_start)
+            print(prompt + value, flush=True)
         return value
 
     def mark(self):
-        self.boundary = self.rows
+        self.boundary = self.position
 
     def clear(self, start=None):
+        if not self.terminal:
+            return
         start = self.boundary if start is None else start
-        distance = self.rows - start
-        if self.terminal and (distance or self.column):
+        prefix = self.transcript[:start]
+        size = shutil.get_terminal_size()
+        rows, column = cursor_after(prefix, size.columns)
+        distance = self.rows - rows
+        if self.resized or size != self.size or distance >= size.lines:
+            # Relative cursor movement cannot reach a question that has scrolled off screen.
+            self.stream.write("\x1b[2J\x1b[H" + prefix)
+        elif distance or self.column != column or self.transcript != prefix:
             up = f"\x1b[{distance}F" if distance else "\r"
-            self.stream.write(up + "\x1b[J")
-            self.stream.flush()
-        self.rows = start
-        self.column = 0
+            horizontal = f"\x1b[{column + 1}G" if column else ""
+            self.stream.write(up + horizontal + "\x1b[J")
+        self.stream.flush()
+        self.size = size
+        self.resized = False
+        self.transcript = prefix
+        self.rows, self.column = rows, column
 
     def reject(self, message):
-        self.clear(start=self.prompt_start)
-        print(message, flush=True)
-        self.retrying = True
+        self.clear(self.prompt_start)
+        self.pending_error = message
 
     def show(self, job_number=None):
-        self.retrying = False
+        self.pending_error = None
         self.clear()
+        if self.pending_notice:
+            print(self.pending_notice, flush=True)
+            self.pending_notice = None
         self.section("Questions")
         if job_number is not None:
             print(styled(f"[Job {job_number}]", "1;36"), flush=True)
 
     def notice(self, message):
-        self.clear()
-        print(message, file=self, flush=True)
-        self.mark()
+        self.pending_notice = message
 
 
 class QuestionHistory:
