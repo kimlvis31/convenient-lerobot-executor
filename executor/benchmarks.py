@@ -1,4 +1,4 @@
-"""Inspect and install simulation dependencies using the selected LeRobot Python."""
+"""Inspect and install policy and simulation dependencies in the selected LeRobot environment."""
 
 import argparse
 from dataclasses import fields, is_dataclass
@@ -19,7 +19,7 @@ BENCHMARKS = (
     ("aloha", "ALOHA"),
     ("metaworld", "Meta-World"),
 )
-BENCHMARK_DEPENDENCY_CONFLICT = 3
+DEPENDENCY_CONFLICT = 3
 BENCHMARK_MODULES = {
     "libero": "libero", "pusht": "gym_pusht", "aloha": "gym_aloha", "metaworld": "metaworld",
 }
@@ -51,6 +51,14 @@ def optional_requirements(distribution, extra):
             selected.marker = None
             requirements[str(selected)] = selected
     return list(requirements.values())
+
+
+def policy_requirements(distribution, name):
+    from packaging.utils import canonicalize_name
+
+    extra = POLICY_EXTRAS.get(name, canonicalize_name(name))
+    extras = {canonicalize_name(value) for value in distribution.metadata.get_all("Provides-Extra") or ()}
+    return optional_requirements(distribution, extra) if extra in extras else []
 
 
 def installed_versions():
@@ -116,8 +124,6 @@ def policy_training_options(config):
 
 
 def environment_catalog():
-    from packaging.utils import canonicalize_name
-
     distribution = metadata.distribution("lerobot")
     from lerobot.configs import PreTrainedConfig
     from lerobot.envs.configs import EnvConfig
@@ -126,16 +132,17 @@ def environment_catalog():
     from lerobot.utils.import_utils import register_third_party_plugins
 
     register_third_party_plugins()
-    extras = set(distribution.metadata.get_all("Provides-Extra") or ())
     versions = installed_versions()
-    policies, trainable, options, issues = {}, {}, {}, {}
+    policies, trainable, options, issues, policy_installable = {}, {}, {}, {}, []
     for name, config in PreTrainedConfig.get_known_choices().items():
         if config.__module__.startswith("lerobot.policies."):
-            extra = POLICY_EXTRAS.get(name, canonicalize_name(name))
-            missing = sorted({req.name for req in optional_requirements(distribution, extra)
-                              if not installed(req, versions)}) if extra in extras else []
+            missing = sorted({req.name for req in policy_requirements(distribution, name)
+                              if not installed(req, versions)})
             if name == "flux3" and "natten" not in versions:
-                missing.append("natten")
+                if "natten" not in missing:
+                    missing.append("natten")
+            elif missing:
+                policy_installable.append(name)
             if missing:
                 issues[name] = f"Missing: {', '.join(missing)}"
             else:
@@ -170,35 +177,45 @@ def environment_catalog():
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
             "peft_ready": "peft" in versions,
             "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable,
-            "policy_issues": issues, "training_options": options}
+            "policy_issues": issues, "policy_installable": sorted(policy_installable), "training_options": options}
 
 
-def install_benchmark(name, *, plugin=False, isolated=False):
+def install_dependencies(*, benchmark=None, policy=None, plugin=None, isolated=False):
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
     distribution = metadata.distribution("lerobot")
     versions = installed_versions()
+    requirements = []
     if plugin:
-        requirement = Requirement(name)
+        requirement = Requirement(plugin)
         if not canonicalize_name(requirement.name).startswith("lerobot-env-"):
             raise ValueError("Use a LeRobot environment plugin package named lerobot-env-*.")
-        requirements = [requirement]
-    else:
+        requirements.append(requirement)
+    if benchmark:
         from lerobot.envs.configs import EnvConfig
 
-        extra = benchmark_extras(distribution, EnvConfig.get_known_choices()).get(name)
+        extra = benchmark_extras(distribution, EnvConfig.get_known_choices()).get(benchmark)
         if extra is None:
-            raise ValueError(f"LeRobot {distribution.version} does not provide the {name} benchmark extra.")
-        if not supported_here(name):
+            raise ValueError(f"LeRobot {distribution.version} does not provide the {benchmark} benchmark extra.")
+        if not supported_here(benchmark):
             raise ValueError("LIBERO requires Linux.")
-        requirements = optional_requirements(distribution, extra)
-    needed = [str(req) for req in requirements if not installed(req, versions)]
-    if not needed:
-        print("Benchmark requirements are already installed.")
-        return
+        requirements.extend(optional_requirements(distribution, extra))
+    if policy:
+        from lerobot.configs import PreTrainedConfig
+        import lerobot.policies
 
-    with tempfile.TemporaryDirectory(prefix="convlexecutor-benchmark-") as directory:
+        config = PreTrainedConfig.get_known_choices().get(policy)
+        declared = policy_requirements(distribution, policy)
+        if config is None or not config.__module__.startswith("lerobot.policies.") or not declared:
+            raise ValueError(f"LeRobot {distribution.version} does not declare installable dependencies for {policy}.")
+        requirements.extend(declared)
+    needed = sorted({str(req) for req in requirements if not installed(req, versions)})
+    if not needed:
+        print("Requested dependencies are already installed.")
+        return 0
+
+    with tempfile.TemporaryDirectory(prefix="convlexecutor-dependencies-") as directory:
         constraints = Path(directory) / "installed.txt"
         core = {"lerobot", "numpy", "torch", "torchvision", "torchcodec", "transformers"}
         pins = ((name, version) for name, version in sorted(versions.items()) if not isolated or name in core)
@@ -211,25 +228,28 @@ def install_benchmark(name, *, plugin=False, isolated=False):
         if result.stdout:
             print(result.stdout, end="")
         if result.returncode:
-            return BENCHMARK_DEPENDENCY_CONFLICT if "ResolutionImpossible" in result.stdout else 1
+            return DEPENDENCY_CONFLICT if "ResolutionImpossible" in result.stdout else 1
     return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    operation = parser.add_mutually_exclusive_group(required=True)
-    operation.add_argument("--catalog", action="store_true")
-    operation.add_argument("--install")
-    operation.add_argument("--plugin")
+    parser.add_argument("--catalog", action="store_true")
+    parser.add_argument("--install", help="Install the declared dependencies for a benchmark")
+    parser.add_argument("--policy", help="Install the declared dependencies for a native policy")
+    parser.add_argument("--plugin", help="Install a named LeRobot environment plugin")
     parser.add_argument("--isolated", action="store_true")
     args = parser.parse_args()
+    if sum(map(bool, (args.catalog, args.install or args.policy, args.plugin))) != 1:
+        parser.error("Choose --catalog, --install/--policy, or --plugin.")
     try:
         if args.catalog:
             print("MANAGER_CATALOG " + json.dumps(environment_catalog()))
         else:
-            return install_benchmark(args.plugin or args.install, plugin=args.plugin is not None, isolated=args.isolated) or 0
+            return install_dependencies(benchmark=args.install, policy=args.policy, plugin=args.plugin,
+                                        isolated=args.isolated)
     except (ImportError, ValueError, OSError, subprocess.CalledProcessError) as error:
-        print(f"Benchmark setup failed ({error}).", file=sys.stderr)
+        print(f"Dependency setup failed ({error}).", file=sys.stderr)
         return 1
     return 0
 

@@ -17,7 +17,7 @@ from textwrap import indent
 from uuid import uuid4
 
 from adapters import SUITES, TRAINING_SWITCHES, load_adapters, native_checkpoint, read_json
-from benchmarks import BENCHMARKS, BENCHMARK_DEPENDENCY_CONFLICT
+from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
 from runner import (ANSI, available_environments, conda_command, conda_executable, environment_catalog,
@@ -187,6 +187,24 @@ def choose_dataset(inventory, default=None, optional=False):
     return select_path("Training Dataset Directory", [(p, str(p)) for p, _ in inventory.datasets], default, optional)
 
 
+def native_dataset(inventory):
+    options = [("", "Use a dataset repository"), *((path, str(path)) for path, _ in inventory.datasets)]
+    root = select_path("Training Dataset", options)
+    if not root:
+        return {"dataset": ask("Dataset Repository Name"), "dataset_root": ""}
+
+    folder = Path(root)
+    info = read_json(folder / "meta/info.json")
+    split_file = folder / "selection.json"
+    selection = read_json(split_file) if split_file.is_file() else {}
+    name = re.sub(r"[^a-zA-Z0-9]+", "-", folder.name).strip("-")[:80].rstrip("-") or "dataset"
+    repo = selection.get("dataset_repo") or info.get("repo_id") or f"local/{name}"
+    config = {"dataset": repo, "dataset_root": root}
+    if "train_episodes" in selection:
+        config["episodes"] = selection["train_episodes"]
+    return config
+
+
 def choose_model(inventory, model, optional=False):
     options = [(p, model_location(inventory, p)) for p, kind in inventory.models if kind == model]
     if optional:
@@ -283,7 +301,7 @@ def choose_policy(adapters, policies, unavailable=(), *, inventory=None, reasons
                 reason = reasons.get(value)
                 reasons[value] = f"{reason} · No Local Checkpoint" if reason else "No Local Checkpoint"
                 unavailable.add(value)
-        print("Bright policies have a checked runtime and local weights. Checkpoints can be used for evaluation or initialization.")
+        print("Bright policies have a checked runtime and local weights. Declared dependencies can be installed when a job starts.")
     sizes = {value: model_size(value[1]) for value, _ in entries if value[1]}
     groups = {value: "native" if value[0] == "native" else "external" for value, _ in entries}
     enabled = [index for index, (value, _) in enumerate(entries, 1) if value not in unavailable]
@@ -400,11 +418,7 @@ def native_train(resume, inventory, model, catalog=None):
         train = {"resume": str(checkpoint)}
     else:
         old_steps = 1000
-        options = [("", "Use a dataset repository")] + [(p, str(p)) for p, _ in inventory.datasets]
-        dataset_root = select_path("Training Dataset", options, optional=True)
-        info = next((info for p, info in inventory.datasets if str(p) == dataset_root), {})
-        train = {"dataset": ask("Dataset Repository Name", info.get("repo_id")),
-                 "dataset_root": dataset_root,
+        train = {**native_dataset(inventory),
                  "pretrained": choose_model(inventory, model, optional=True),
                  "batch": number("Training Batch Size", 8), "device": ask("Training Device", "cuda"),
                  "seed": number("Random Seed", 0, 0)}
@@ -537,7 +551,7 @@ def delete_result_runs(root, category, *, notice=print):
     return deleted > 0
 
 
-class BenchmarkEnvironments:
+class LeRobotEnvironments:
     def __init__(self, conda, root, preferred, names):
         self.conda = conda
         self.root = root
@@ -564,49 +578,89 @@ class BenchmarkEnvironments:
                 locations.setdefault(kind, []).append(name)
         return locations
 
-    def ensure(self, kind, candidates, preferred, *, plugin=None):
-        locations = self.available(candidates).get(kind, [])
-        if locations:
-            name = preferred if preferred in locations else locations[0]
-            return name, f"{kind} is already installed in {name}."
+    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False):
+        catalogs = self.lerobot()
+        if preferred not in catalogs and (catalog := self.catalog(preferred)):
+            catalogs[preferred] = catalog
+        if not catalogs:
+            return preferred
 
-        targets = [name for name, catalog in candidates.items() if plugin or kind in catalog.get("benchmarks", {})]
-        if not targets:
-            return None, f"No suitable LeRobot environment provides an installer for {kind}."
-        source = preferred if preferred in targets else targets[0]
-        program = ["python", "-B", str(Path(__file__).with_name("benchmarks.py")),
-                   "--plugin" if plugin else "--install", plugin or kind]
+        check_policy = tiny or any(model in entry.get("policies", {}) for entry in catalogs.values())
+        check_benchmark = benchmark is not None and any(
+            benchmark in entry.get("benchmarks", {}) or benchmark in entry.get("plugins", ())
+            for entry in catalogs.values()
+        )
+        if pinned or not check_policy or (benchmark is not None and not check_benchmark):
+            catalogs = {preferred: catalogs.get(preferred, {})}
+
+        def policy_ready(entry):
+            if tiny:
+                return entry.get("tinyvla_bridge", False)
+            return not check_policy or entry.get("policies", {}).get(model, False)
+
+        def benchmark_ready(entry):
+            return (not check_benchmark or entry.get("benchmarks", {}).get(benchmark, False)
+                    or benchmark in entry.get("plugins", ()))
+
+        candidates = []
+        for name, entry in catalogs.items():
+            needs_policy = not policy_ready(entry)
+            needs_benchmark = not benchmark_ready(entry)
+            if needs_policy and (tiny or model not in entry.get("policy_installable", ())):
+                continue
+            if needs_benchmark and benchmark not in entry.get("benchmarks", {}):
+                continue
+            dependencies = []
+            if needs_policy:
+                dependencies.append(("--policy", model))
+            if needs_benchmark:
+                dependencies.append(("--install", benchmark))
+            candidates.append((len(dependencies), name != preferred, name, dependencies))
+
+        if not candidates:
+            issue = catalogs.get(preferred, {}).get("policy_issues", {}).get(model)
+            detail = f" ({issue})" if issue else ""
+            stage = f"{model} with {benchmark}" if benchmark else model
+            raise RuntimeError(f"No Conda environment can be prepared for {stage}{detail}.")
+        _, _, source, dependencies = min(candidates)
+        if not dependencies:
+            return source
+
+        program = ["python", "-B", str(Path(__file__).with_name("benchmarks.py"))]
+        names_to_install = [name for _, name in dependencies]
+        for option, name in dependencies:
+            program.extend((option, name))
+        description = " and ".join(names_to_install)
         process_options = {"cwd": self.root, "text": True, "encoding": "utf-8", "errors": "replace",
                            "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-        print(f"Installing {plugin or kind} in {source}…", flush=True)
+        print(f"  Preparing dependencies for {description} in {source}…", flush=True)
         result = subprocess.run(conda_command(self.conda, source, program), **process_options)
         target = source
-        if result.returncode == BENCHMARK_DEPENDENCY_CONFLICT:
-            stem = f"{source}_{re.sub(r'[^a-zA-Z0-9_.-]', '_', kind)}"
+        if result.returncode == DEPENDENCY_CONFLICT:
+            suffix = re.sub(r"[^a-zA-Z0-9_.-]", "_", "_".join(names_to_install))
+            stem = f"{source}_{suffix}"
             target = stem
             index = 2
             names = self.names | available_environments(self.conda, self.root)
             while target in names:
                 target = f"{stem}_{index}"
                 index += 1
-            print(f"Dependency conflict in {source}. Creating {target}…", flush=True)
+            print(f"  Dependency conflict in {source}. Creating {target}…", flush=True)
             clone = subprocess.run([self.conda, "create", "--yes", "--name", target, "--clone", source],
                                    **process_options)
             if clone.returncode:
-                return None, clone.stdout.strip() or f"Could not clone {source} into {target}."
+                raise RuntimeError(clone.stdout.strip() or f"Could not clone {source} into {target}.")
             self.names.add(target)
             result = subprocess.run(conda_command(self.conda, target, [*program, "--isolated"]), **process_options)
-        refreshed = self.catalog(target, refresh=True)
         if result.returncode:
-            return None, result.stdout.strip() or f"Could not install {plugin or kind} in {target}."
-        if plugin:
-            new_types = sorted(set(refreshed.get("plugins", ())) - set(candidates[source].get("plugins", ())))
-            if new_types:
-                return target, f"Installed {plugin} in {target}. Available environments: {', '.join(new_types)}."
-            return target, f"Package ready in {target}. Confirm the environment type registered by the plugin."
-        if not refreshed.get("benchmarks", {}).get(kind):
-            return None, f"Installation finished in {target}, but {kind} could not be verified."
-        return target, f"Installed {kind} in {target}."
+            raise RuntimeError(result.stdout.strip() or f"Could not install dependencies for {description} in {target}.")
+        refreshed = self.catalog(target, refresh=True)
+        if not policy_ready(refreshed) or not benchmark_ready(refreshed):
+            issue = refreshed.get("policy_issues", {}).get(model)
+            detail = f" ({issue})" if issue else ""
+            raise RuntimeError(f"Could not verify {description} in {target} after installation{detail}.")
+        print(f"  Dependencies ready in {target}.", flush=True)
+        return target
 
 
 def benchmark_options(kinds):
@@ -626,7 +680,7 @@ def policy_environments(environments, preferred, model, tiny=False):
     return catalogs, ready
 
 
-def choose_evaluation_environment(environments, preferred, model, tiny, *, allow_changes=True):
+def choose_evaluation_environment(environments, preferred, model, tiny):
     catalogs, eligible = policy_environments(environments, preferred, model, tiny)
     available = environments.available(eligible)
     installed = environments.available(catalogs)
@@ -647,32 +701,14 @@ def choose_evaluation_environment(environments, preferred, model, tiny, *, allow
     if kind == "manual":
         kind = ask("LeRobot Environment Type")
     names = available.get(kind, [])
-    if not names and kind in installable and allow_changes and environments.conda:
-        name, message = environments.ensure(kind, eligible, preferred)
-        if name is None:
-            raise ValueError(message)
-        print(message)
-        names = [name]
     if not names and kind in missing:
-        print(f"No Conda environment is verified for {model} with {kind}.")
+        if kind in manual:
+            print(f"{kind} requires separate simulator setup.")
+        else:
+            print("The executor will check for installable dependencies when the job starts.")
     target = preferred if preferred in names or not names else names[0]
     print(f"Evaluation Conda Environment: {target}")
     return kind, target
-
-
-def install_benchmark_menu(environments):
-    catalogs = environments.lerobot()
-    if not catalogs:
-        return "No Conda environment with LeRobot could be inspected."
-    locations = environments.available(catalogs)
-    supported = {kind for catalog in catalogs.values() for kind in catalog.get("benchmarks", {})}
-    options = [(kind, f"{label} [{', '.join(locations[kind])}]" if kind in locations else label)
-               for kind, label in benchmark_options(supported)]
-    options.append(("plugin", "Install a LeRobot environment plugin"))
-    selection = choose("Benchmark to Install", options, default=None, unavailable=supported - locations.keys())
-    plugin = ask("LeRobot Environment Plugin Package") if selection == "plugin" else None
-    _, message = environments.ensure(selection, catalogs, environments.preferred, plugin=plugin)
-    return message
 
 
 def show_inventory(display, inventory, environments):
@@ -686,12 +722,12 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
            external=None, environments=(), env_map=None, allow_changes=True, environment_session=None):
     display = QuestionDisplay(sys.stdout, section)
     mapping = env_map or {}
-    environments = environment_session or BenchmarkEnvironments(conda, root, native_env, environments)
+    environments = environment_session or LeRobotEnvironments(conda, root, native_env, environments)
     catalog_for = environments.catalog
 
     def evaluation_environment(model, tiny):
         preferred = native_env if tiny else mapping.get(model, native_env)
-        benchmark, selected = choose_evaluation_environment(environments, preferred, model, tiny, allow_changes=allow_changes)
+        benchmark, selected = choose_evaluation_environment(environments, preferred, model, tiny)
         return benchmark, selected, selected != preferred
 
     with redirect_stdout(display):
@@ -707,8 +743,6 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
             if allow_changes:
                 actions.extend((("evaluation", "Delete all evaluation results"),
                                 ("training", "Delete all training results")))
-                if conda and environments.names:
-                    actions.append(("install", "Install a benchmark"))
             actions.append(("quit", "Exit"))
             action = choose("What Would You Like to Do?", actions, blank_before=False)
             if action == "quit":
@@ -752,12 +786,6 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
 
                     return configure_jobs(adapters, inventory, root, policies, display, training_catalog,
                                           evaluation_environment, unavailable, reasons)
-                if action == "install":
-                    message = history.run(lambda: install_benchmark_menu(environments))
-                    if display.terminal:
-                        show_inventory(display, inventory, environments.names)
-                    display.notice(message)
-                    continue
                 if action == "reuse":
                     files = [(p, str(p)) for p in inventory.settings]
                     path = history.run(lambda: select_path("Settings File", files))
@@ -933,7 +961,7 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions):
         if conda and not evaluate.get("environment") and cfg["adapter"] in {"native", "tinyvla"}:
             native = environments["native"]
             if native not in benchmark_sessions:
-                benchmark_sessions[native] = BenchmarkEnvironments(conda, PROJECT_ROOT, native, installed)
+                benchmark_sessions[native] = LeRobotEnvironments(conda, PROJECT_ROOT, native, installed)
             session = benchmark_sessions[native]
             preferred = adapter.environment
             tiny = cfg["adapter"] == "tinyvla"
@@ -972,7 +1000,7 @@ def plan(args):
             return [], conda
         env_map = read_json(args.env_map) if args.env_map else {}
         native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
-        session = BenchmarkEnvironments(conda, PROJECT_ROOT, native_env, detected[PROJECT_ROOT])
+        session = LeRobotEnvironments(conda, PROJECT_ROOT, native_env, detected[PROJECT_ROOT])
         benchmark_sessions[native_env] = session
         settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env,
                           external=external, env_map=env_map, allow_changes=not args.dry_run,
@@ -1023,12 +1051,37 @@ def job_subheading(title):
     print(styled(f"  ({title})", "1;94"), flush=True)
 
 
+def prepare_job_environments(cfg, stages, root, conda, sessions):
+    backend = cfg["adapter"]
+    managed = [stage for stage in stages if backend == "native" or (backend == "tinyvla" and stage.name == "eval")]
+    if not managed:
+        return
+    native = cfg.get("environments", {}).get("native", DEFAULT_ENVIRONMENTS["native"])
+    key = (root, native)
+    if key not in sessions:
+        sessions[key] = LeRobotEnvironments(conda, root, native, available_environments(conda, root))
+    session = sessions[key]
+    model = cfg["model"]
+    for stage in managed:
+        evaluation = cfg["eval"] if stage.name == "eval" else {}
+        target = session.prepare(stage.environment, model=model, tiny=backend == "tinyvla",
+                                 benchmark=evaluation.get("env"), pinned=bool(evaluation.get("environment")))
+        if target != stage.environment:
+            if stage.name == "eval":
+                evaluation["environment"] = target
+            else:
+                cfg.setdefault("environments", {})[model] = target
+            stage.environment = target
+
+
 def run_plans(plans, conda, verbose):
+    sessions = {}
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
         if index > 1:
             print()
         print(job_title(index, cfg), flush=True)
         job_subheading("Status")
+        prepare_job_environments(cfg, stages, root, conda, sessions)
         execute(stages, cfg, run_dir, root, conda, verbose)
         show_job_result(stages)
 

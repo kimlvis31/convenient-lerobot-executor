@@ -12,9 +12,9 @@ from unittest.mock import patch
 
 from adapters import NativeAdapter, Stage, TinyVLAAdapter, load_adapters, read_json, training_flags
 from inventory import Inventory, scan, show
-from manage import (BenchmarkEnvironments, ask, choose_evaluation_environment, choose_policy,
+from manage import (LeRobotEnvironments, ask, choose_evaluation_environment, choose_policy,
                     choose, configure_policy_options, configure_training_scope, delete_result_runs, eval_settings,
-                    install_benchmark_menu, main, model_size, normalize_paths, number, plan,
+                    main, native_dataset, model_size, normalize_paths, number, plan,
                     settings_jobs, show_job_result, show_settings, wizard)
 from questions import QuestionDisplay, QuestionHistory
 from runner import Progress, evaluation_timing_key, execute, history, load_settings, resolve_arguments, seconds, status_line
@@ -568,50 +568,48 @@ class ManagerTests(unittest.TestCase):
         self.assertNotEqual(rows[1].index("[879.7 M]"), rows[3].index("[740.4 M]"))
         self.assertIn("Policy Model:", menu.getvalue())
 
-    def test_benchmark_installs_in_preferred_environment_and_refreshes_catalog(self):
-        environments = BenchmarkEnvironments("conda", self.root, "preferred", {"preferred"})
-        environments.catalogs = {"preferred": {"benchmarks": {"libero": True, "pusht": False}}}
-        refreshed = {"benchmarks": {"libero": True, "pusht": True}}
-        with patch("sys.stdin", io.StringIO("2\n")), patch("manage.subprocess.run") as process, \
+    def test_dependencies_prepared_together_and_catalog_refreshed(self):
+        environments = LeRobotEnvironments("conda", self.root, "preferred", {"preferred"})
+        environments.catalogs = {"preferred": {"benchmarks": {"pusht": False},
+                                               "policies": {"pi05": False}, "policy_installable": ["pi05"]}}
+        refreshed = {"benchmarks": {"pusht": True}, "policies": {"pi05": True}}
+        with patch("manage.subprocess.run") as process, \
              patch("manage.environment_catalog", return_value=refreshed), \
-             contextlib.redirect_stdout(io.StringIO()) as menu:
+             contextlib.redirect_stdout(io.StringIO()):
             process.return_value.returncode = 0
-            message = install_benchmark_menu(environments)
+            selected = environments.prepare("preferred", model="pi05", benchmark="pusht")
         command = process.call_args.args[0]
         self.assertEqual(command[:5], ["conda", "run", "--no-capture-output", "-n", "preferred"])
-        self.assertEqual(command[-2:], ["--install", "pusht"])
-        self.assertIn("PushT <Not Installed>", menu.getvalue())
-        self.assertNotIn("[Default]", menu.getvalue())
-        self.assertEqual(message, "Installed pusht in preferred.")
-        self.assertTrue(environments.catalog("preferred")["benchmarks"]["pusht"])
+        self.assertEqual(command[-4:], ["--policy", "pi05", "--install", "pusht"])
+        self.assertEqual(selected, "preferred")
+        self.assertEqual(environments.catalog("preferred"), refreshed)
 
     def test_benchmark_clones_automatically_on_dependency_conflict(self):
-        environments = BenchmarkEnvironments("conda", self.root, "preferred", {"preferred", "preferred_pusht"})
-        environments.catalogs = {"preferred": {"benchmarks": {"pusht": False}},
+        environments = LeRobotEnvironments("conda", self.root, "preferred", {"preferred", "preferred_pusht"})
+        environments.catalogs = {"preferred": {"benchmarks": {"pusht": False}, "policies": {"act": True}},
                                  "preferred_pusht": {}}
-        refreshed = {"benchmarks": {"pusht": True}}
+        refreshed = {"benchmarks": {"pusht": True}, "policies": {"act": True}}
         results = [subprocess.CompletedProcess([], code, stdout="") for code in (3, 0, 0)]
-        with patch("sys.stdin", io.StringIO("1\n")), \
-             patch("manage.subprocess.run", side_effect=results) as process, \
+        with patch("manage.subprocess.run", side_effect=results) as process, \
              patch("manage.available_environments", return_value=set()), \
              patch("manage.environment_catalog", return_value=refreshed), \
              contextlib.redirect_stdout(io.StringIO()):
-            message = install_benchmark_menu(environments)
+            selected = environments.prepare("preferred", model="act", benchmark="pusht")
         first, clone, retry = [call.args[0] for call in process.call_args_list]
         self.assertIn("preferred", first)
         self.assertEqual(clone, ["conda", "create", "--yes", "--name", "preferred_pusht_2", "--clone", "preferred"])
         self.assertIn("preferred_pusht_2", retry)
         self.assertEqual(retry[-3:], ["--install", "pusht", "--isolated"])
         self.assertIn("preferred_pusht_2", environments.names)
-        self.assertEqual(message, "Installed pusht in preferred_pusht_2.")
+        self.assertEqual(selected, "preferred_pusht_2")
         job = sample_settings()
-        job["eval"]["environment"] = "preferred_pusht_2"
+        job["eval"]["environment"] = selected
         adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
-        self.assertEqual(adapter.evaluate(after_training=True).environment, "preferred_pusht_2")
+        self.assertEqual(adapter.evaluate(after_training=True).environment, selected)
         self.assertEqual(adapter.train().environment, "smolvla_env")
 
     def test_benchmark_selection_uses_runtime_capabilities_instead_of_environment_names(self):
-        environments = BenchmarkEnvironments("conda", self.root, "preferred", {"sim_a", "sim_b", "inference"})
+        environments = LeRobotEnvironments("conda", self.root, "preferred", {"sim_a", "sim_b", "inference"})
         catalogs = {
             "preferred": {"benchmarks": {"libero": True, "pusht": False}, "policies": {"act": True}},
             "sim_a": {"benchmarks": {"pusht": True}, "policies": {"act": False}},
@@ -623,13 +621,25 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(choose_evaluation_environment(environments, "preferred", "act", False), ("pusht", "sim_b"))
         self.assertIn("PushT [sim_b]", menu.getvalue())
         self.assertEqual(probe.call_count, 4)
-        with patch("manage.subprocess.run") as process, patch("sys.stdin", io.StringIO("2\n")), \
-             contextlib.redirect_stdout(io.StringIO()) as menu:
-            self.assertEqual(install_benchmark_menu(environments), "pusht is already installed in sim_a.")
-        self.assertIn("PushT [sim_a, sim_b]", menu.getvalue())
-        self.assertNotIn("inference", menu.getvalue())
-        self.assertNotIn("[Default]", menu.getvalue())
+        with patch("manage.subprocess.run") as process:
+            self.assertEqual(environments.prepare("preferred", model="act", benchmark="pusht"), "sim_b")
         process.assert_not_called()
+
+    def test_local_dataset_does_not_ask_for_a_repository_and_limits_episodes(self):
+        folder = self.root / "datasets/libero"
+        (folder / "meta").mkdir(parents=True)
+        (folder / "meta/info.json").write_text("{}", encoding="utf-8")
+        split = {"dataset_repo": "lerobot/libero", "train_episodes": [886]}
+        (folder / "selection.json").write_text(json.dumps(split), encoding="utf-8")
+        with patch("sys.stdin", io.StringIO("2\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            dataset = native_dataset(Inventory(datasets=[(folder, {})]))
+        self.assertNotIn("Dataset Repository Name", menu.getvalue())
+        self.assertEqual(dataset, {"dataset": "lerobot/libero", "dataset_root": str(folder), "episodes": [886]})
+        job = sample_settings()
+        job["train"].update(dataset)
+        adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
+        self.assertIn("--dataset.repo_id=lerobot/libero", adapter.train().arguments)
+        self.assertIn("--dataset.episodes=[886]", adapter.train().arguments)
 
     def test_model_training_options_are_typed_and_preserve_unselected_defaults(self):
         train = {}

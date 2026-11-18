@@ -201,6 +201,13 @@ class NativeAdapter:
                      flag("policy.device", cfg["device"]), flag("seed", cfg["seed"])]
             if cfg.get("dataset_root"):
                 args.append(flag("dataset.root", cfg["dataset_root"]))
+            episodes = cfg.get("episodes")
+            if episodes is not None:
+                if not isinstance(episodes, list) or not episodes or any(
+                    type(episode) is not int or episode < 0 for episode in episodes
+                ):
+                    raise ValueError("Training episodes must be a nonempty list of nonnegative integers.")
+                args.append(flag("dataset.episodes", json.dumps(episodes)))
             policy_key = "policy.path" if cfg.get("pretrained") else "policy.type"
             args.append(flag(policy_key, cfg.get("pretrained") or self.settings["model"]))
         args += training_flags(cfg, self.settings["model"])
