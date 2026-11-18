@@ -2,7 +2,9 @@
 
 import argparse
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
+import shutil
 import re
 
 
@@ -15,12 +17,27 @@ NORMALIZER_PREFIXES = (
 )
 
 
-def checkpoint_candidate(reference, model):
+def checkpoint_candidate(reference, model, stage=None):
     """Filter explicit native policy references without network or model imports."""
-    if model not in LEGACY_POLICIES:
+    molmo_eval = model == "molmoact2" and stage == "eval"
+    wallx_eval = model == "wall_x" and stage == "eval"
+    if model not in LEGACY_POLICIES and not (molmo_eval or wallx_eval):
         return False
     path = Path(reference).expanduser()
     if path.is_dir():
+        if wallx_eval:
+            from wallx_compat import is_legacy_processor
+
+            try:
+                processor = json.loads((path / PROCESSORS[0]).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return False
+            return is_legacy_processor(processor)
+        if molmo_eval:
+            from molmo_compat import LEGACY_FIELDS
+
+            config = _read_config(path / "config.json", model)
+            return config is not None and LEGACY_FIELDS <= config.keys()
         return (path / "config.json").is_file() and (path / WEIGHTS).is_file() and not any(
             (path / name).exists() for name in PROCESSORS
         )
@@ -130,10 +147,59 @@ def _check_normalization(config, stats):
                 raise ValueError(f"Legacy checkpoint has incomplete or unsupported normalization for {name}.")
 
 
-def prepare_checkpoint(reference, model, destination, revision=None):
+def write_processor_view(destination, fetch, replacements):
+    """Build a private checkpoint view while retaining the published weights and processor state."""
+    destination = Path(destination)
+    inputs = {}
+    for name in ("config.json", *PROCESSORS):
+        if name in replacements:
+            document = replacements[name]
+        else:
+            source = fetch(name)
+            inputs[name] = source
+            document = json.loads(source.read_text(encoding="utf-8"))
+        if name in PROCESSORS:
+            for step in document["steps"]:
+                state = step.get("state_file")
+                if state is None:
+                    continue
+                if not isinstance(state, str):
+                    raise ValueError(f"Invalid processor state filename: {state!r}")
+                parts = PurePosixPath(state)
+                if (parts.suffix != ".safetensors" or state == WEIGHTS or parts.is_absolute()
+                        or ".." in parts.parts or chr(92) in state or ":" in state):
+                    raise ValueError(f"Invalid processor state filename: {state!r}")
+                inputs[state] = fetch(state)
+    inputs[WEIGHTS] = fetch(WEIGHTS)
+    destination.mkdir(mode=0o700)
+    for name, document in replacements.items():
+        (destination / name).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    for name, source in inputs.items():
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = source.resolve(strict=True)
+        try:
+            os.link(source, target)
+        except OSError:
+            try:
+                target.symlink_to(source)
+            except OSError:
+                shutil.copyfile(source, target)
+    return destination
+
+
+def prepare_checkpoint(reference, model, destination, revision=None, stage=None):
     """Return an adapted local path, or None when the original should be used."""
-    if not checkpoint_candidate(reference, model):
+    if not checkpoint_candidate(reference, model, stage):
         return None
+    if model == "wall_x":
+        from wallx_compat import prepare_wallx_evaluation
+
+        return prepare_wallx_evaluation(reference, destination, revision)
+    if model == "molmoact2":
+        from molmo_compat import prepare_molmo_evaluation
+
+        return prepare_molmo_evaluation(reference, destination, revision)
     directory = Path(reference).expanduser()
     source = _local_source(directory, model) if directory.is_dir() else _hub_source(reference, model, revision)
     if source is None:
@@ -169,11 +235,12 @@ def prepare_checkpoint(reference, model, destination, revision=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True)
-    parser.add_argument("--model", required=True, choices=sorted(LEGACY_POLICIES))
+    parser.add_argument("--model", required=True, choices=sorted(LEGACY_POLICIES | {"molmoact2", "wall_x"}))
+    parser.add_argument("--stage", choices=["train", "eval"])
     parser.add_argument("--revision")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    result = prepare_checkpoint(args.policy, args.model, args.output, args.revision)
+    result = prepare_checkpoint(args.policy, args.model, args.output, args.revision, args.stage)
     print(RESULT_PREFIX + json.dumps(str(result) if result is not None else None))
 
 

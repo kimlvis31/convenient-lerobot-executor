@@ -20,6 +20,7 @@ import time
 
 from adapters import Stage, read_json, require
 from checkpoint_compat import RESULT_PREFIX, checkpoint_candidate, validate_processor_states
+from pinned_policy import REVISION_FLAG, pinned_command, requested_revision
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -434,12 +435,87 @@ def stage_failure_reason(logfile):
     def compact(value, limit):
         clean = "".join(char for char in value if char.isprintable() or char.isspace())
         clean = " ".join(clean.split())
+        clean = re.sub(r"(?i)(https?://)[^/\s'\"<>]+@", r"\1", clean)
+        clean = re.sub(r"(?i)(https?://[^\s?'\"<>#]+)[?#][^\s'\"<>]*", r"\1", clean)
+        clean = re.sub(r"(?i)\bBearer\s+[^\s'\",;)\]]+", "Bearer [redacted]", clean)
+        clean = re.sub(r"\bhf_[A-Za-z0-9]{8,}\b", "[redacted]", clean)
         return clean if len(clean) <= limit else clean[:limit - 1] + "…"
+
+    exception_line = re.compile(
+        r"((?:[A-Za-z_]\w*\.)*(?:[A-Z]\w*(?:Error|Exception)|Error|Exception|OfflineModeIsEnabled)):\s*(.*)"
+    )
+    chain_markers = {
+        "The above exception was the direct cause of the following exception:",
+        "During handling of the above exception, another exception occurred:",
+    }
+
+    def chained_cause(index):
+        linked = False
+        for position in range(index - 1, -1, -1):
+            previous = lines[position]
+            if previous in chain_markers:
+                linked = True
+            elif exception_line.fullmatch(previous):
+                return position if linked else None
+        return None
+
+    def hub_page(context):
+        # Keep the repository only. Resolve URLs can carry signed query strings.
+        slug = r"[A-Za-z0-9_-][A-Za-z0-9_.-]*"
+        for path in re.findall(r"https?://(?:huggingface\.co|hf\.co)/([^\s?'\"<>#]+)", context, re.IGNORECASE):
+            path = path.rstrip(".,;:)/]")
+            path = re.split(r"/(?:resolve|raw|blob|tree|commit|commits|revision|discussions|auth-check)(?:/|$)", path, 1)[0]
+            parts = path.split("/")
+            if parts[0] == "api":
+                if len(parts) < 3 or parts[1] not in {"datasets", "spaces", "models"}:
+                    continue
+                parts = parts[1:]
+            prefix = ""
+            if parts[0] in {"datasets", "spaces", "models"}:
+                kind, *parts = parts
+                prefix = "" if kind == "models" else f"{kind}/"
+            if (1 <= len(parts) <= 2 and parts[0] not in {"api", "docs", "settings", "login", "join"}
+                    and all(re.fullmatch(slug, part) for part in parts)):
+                return "https://huggingface.co/" + prefix + "/".join(parts)
+        named = re.search(rf"\baccess to (model|dataset|space) ['\"]?({slug}/{slug})['\"]? is restricted", context, re.I)
+        if named:
+            kind, name = named.groups()
+            prefix = "" if kind.lower() == "model" else f"{kind.lower()}s/"
+            return f"https://huggingface.co/{prefix}{name}"
+        return None
+
+    def hub_access_reason(index, error_type, detail):
+        if error_type not in {"GatedRepoError", "HfHubHTTPError", "RepositoryNotFoundError",
+                              "HTTPError", "HTTPStatusError", "OSError"}:
+            return None
+        context = [detail]
+        for following in lines[index + 1:index + 8]:
+            if following in chain_markers or following.startswith("Traceback ") or exception_line.fullmatch(following):
+                break
+            context.append(following)
+        context = " ".join(context)
+        page = hub_page(context)
+        gated = (error_type == "GatedRepoError" or "you are trying to access a gated repo" in detail.lower()
+                 or re.search(r"\bcannot access (?:a |the )?gated repo", context, re.I)
+                 or re.search(r"\baccess to (?:model|dataset|space) \S+ is restricted", context, re.I))
+        status = re.search(r"\b(401|403)\s+(?:Client Error|Unauthorized|Forbidden)\b", context, re.I)
+        if gated:
+            if not page and (previous := chained_cause(index)) is not None:
+                page = hub_page(" ".join(lines[previous:min(previous + 8, index)]))
+            where = page or "its Hugging Face repository page"
+            return compact(f"Gated repository. Open {where} with the Hugging Face account used on this server. "
+                           "Review the terms and request access. If already approved, check the token's read permissions.", 320)
+        if status and (page or error_type in {"HfHubHTTPError", "RepositoryNotFoundError"}):
+            meaning = "could not authenticate the request" if status[1] == "401" else "denied the request"
+            where = f" Open {page} to verify the repository." if page else " Verify the repository ID."
+            return compact(f"Hugging Face {meaning} ({status[1]}).{where} "
+                           "Check the signed-in server account and the token's read permissions.", 320)
+        return None
 
     diagnostic = None
     for index in range(len(lines) - 1, -1, -1):
         line = lines[index]
-        match = re.fullmatch(r"((?:[A-Za-z_]\w*\.)*(?:[A-Z]\w*(?:Error|Exception)|Error|Exception)):\s*(.*)", line)
+        match = exception_line.fullmatch(line)
         if match:
             error, detail = match.groups()
             error_type = error.rsplit(".", 1)[-1]
@@ -448,6 +524,19 @@ def stage_failure_reason(logfile):
             if error_type in {"BrokenPipeError", "ConnectionResetError"}:
                 diagnostic = compact(line, 320)
                 continue
+            loading_wrapper = error_type in {"RuntimeError", "OSError"} and re.match(
+                r"(?:Failed|Unable) to (?:load|initialize) (?:the |required )?"
+                r"(?:tokenizers?|processors?|models?|policy|checkpoints?)\b", detail, re.IGNORECASE,
+            )
+            hub_wrapper = (error_type == "OSError" and detail.startswith("We couldn't connect to ")
+                           and "cached files" in detail)
+            if (loading_wrapper or hub_wrapper) and chained_cause(index) is not None:
+                diagnostic = compact(line, 320)
+                continue
+            if error_type == "LocalEntryNotFoundError" and "outgoing traffic has been disabled" in detail:
+                return "Required files are missing from the Hugging Face cache and network access is disabled."
+            if access := hub_access_reason(index, error_type, detail):
+                return access
             if "CUDA out of memory" in detail:
                 requested = re.search(r"Tried to allocate (\d+(?:\.\d+)? [KMG]iB)", detail)
                 free = re.search(r"of which (\d+(?:\.\d+)? [KMG]iB) is free", detail)
@@ -478,21 +567,25 @@ def prepare_stage_checkpoint(command, stage, root, env, logfile, log, native):
         return
     conda, model = native
     try:
+        revision = requested_revision(command)
+        original = pinned_command(command, stage.name, reference, revision, root)
+        if revision is not None and original is command:
+            log.write(f"Using the selected local checkpoint {reference}. Hub revision {revision} applies only to a repository ID.\n")
         validate_processor_states(reference)
     except (OSError, ValueError) as error:
         log.write(f"CheckpointError: {error}\n")
         log.flush()
         raise StageFailure(stage.name, 1, logfile) from error
-    if not checkpoint_candidate(reference, model):
-        yield command
+    if not checkpoint_candidate(reference, model, stage.name):
+        yield original
         return
 
     with TemporaryDirectory(prefix="convlexecutor-checkpoint-") as directory:
         path = Path(directory) / "pretrained_model"
         helper = Path(__file__).with_name("checkpoint_compat.py").resolve()
-        revision_flag = "--policy.pretrained_revision="
-        revision = next((item[len(revision_flag):] for item in command if item.startswith(revision_flag)), None)
         options = ["python", "-B", str(helper), "--policy", reference, "--model", model, "--output", str(path)]
+        if model in {"molmoact2", "wall_x"}:
+            options.extend(("--stage", stage.name))
         if revision:
             options.extend(("--revision", revision))
         log.write(f"Checking checkpoint processor format: {reference}\n")
@@ -515,14 +608,16 @@ def prepare_stage_checkpoint(command, stage, root, env, logfile, log, native):
             log.flush()
             raise StageFailure(stage.name, process.returncode, logfile)
         if report == json.dumps(str(path)) and path.is_dir():
-            log.write("Using a temporary conversion of the legacy checkpoint processors.\n")
+            log.write("Using a temporary conversion of the legacy checkpoint.\n")
             log.flush()
             command = [f"--policy.path={path}" if item.startswith("--policy.path=") else item
-                       for item in command if not item.startswith(revision_flag)]
+                       for item in command if not item.startswith(REVISION_FLAG)]
         elif report != "null":
             log.write("CheckpointError: No valid result was returned by checkpoint preparation.\n")
             log.flush()
             raise StageFailure(stage.name, 1, logfile)
+        else:
+            command = original
         yield command
 
 

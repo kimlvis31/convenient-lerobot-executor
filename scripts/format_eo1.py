@@ -44,6 +44,8 @@ JOBS = [
                 # "scheduler_decay_lr": 0,
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
+                # Matches the LeRobot revision above. Remove this pin when switching to your own checkpoint.
+                "--policy.pretrained_revision=811f93d4501cd41c3fc6d66ca1a5fcf1a387ac2e",
                 "--policy.dtype=bfloat16",
             ],
         },

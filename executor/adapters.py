@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 
+from evaluation_cameras import camera_mapping
 from training_preflight import native_training_preflight
 
 
@@ -423,6 +424,15 @@ class NativeAdapter:
             # in these benchmarks do not reliably register their environments.
             args.append("--eval.use_async_envs=false")
             automatic = ("eval.use_async_envs",)
+        if self.key == "native":
+            mapping = camera_mapping(args)
+            if mapping:
+                args.append(flag("rename_map", mapping))
+                automatic += ("rename_map",)
+            elif mapping is None:
+                # The checkpoint may be trained in a preceding stage or downloaded at launch.
+                helper = Path(__file__).with_name("evaluation_cameras.py").resolve()
+                args[:len(command)] = ["python", "-u", str(helper)]
         headless_mujoco = (kind in {"aloha", "robocasa", "vlabench"} and sys.platform == "linux"
                            and not (os.environ.get("DISPLAY") or os.environ.get("MUJOCO_GL")))
         env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"} if kind in LIBERO_BENCHMARKS or headless_mujoco else {}

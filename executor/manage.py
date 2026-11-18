@@ -685,6 +685,7 @@ class LeRobotEnvironments:
         for name, catalog in catalogs.items():
             ready = {kind for kind, installed in catalog.get("benchmarks", {}).items() if installed}
             ready.update(catalog.get("plugins", ()))
+            ready.update(kind for kind, issue in catalog.get("manual_status", {}).items() if issue is None)
             for kind in ready:
                 locations.setdefault(kind, []).append(name)
         return locations
@@ -699,6 +700,7 @@ class LeRobotEnvironments:
         check_policy = tiny or any(model in entry.get("policies", {}) for entry in catalogs.values())
         check_benchmark = benchmark is not None and any(
             benchmark in entry.get("benchmarks", {}) or benchmark in entry.get("plugins", ())
+            or benchmark in entry.get("manual_status", {})
             for entry in catalogs.values()
         )
         if pinned or (not check_policy and runtime != "dataset") or (benchmark is not None and not check_benchmark):
@@ -711,7 +713,8 @@ class LeRobotEnvironments:
 
         def benchmark_ready(entry):
             return (not check_benchmark or entry.get("benchmarks", {}).get(benchmark, False)
-                    or benchmark in entry.get("plugins", ()))
+                    or benchmark in entry.get("plugins", ())
+                    or (benchmark in entry.get("manual_status", {}) and entry["manual_status"][benchmark] is None))
 
         def runtime_ready(entry):
             return runtime is None or entry.get("runtime", {}).get(runtime, True)
@@ -741,6 +744,10 @@ class LeRobotEnvironments:
         if not candidates:
             issue = catalogs.get(preferred, {}).get("policy_issues", {}).get(model)
             detail = f" ({issue})" if issue else ""
+            issues = dict.fromkeys(entry.get("manual_status", {}).get(benchmark) for entry in catalogs.values())
+            diagnostics = [reason for reason in issues if reason]
+            if diagnostics:
+                detail += " " + " ".join(diagnostics)
             stage = f"{model} with {benchmark}" if benchmark else model
             raise RuntimeError(f"No Conda environment can be prepared for {stage}{detail}.")
         process_options = {"cwd": self.root, "text": True, "encoding": "utf-8", "errors": "replace",
@@ -856,6 +863,9 @@ def choose_evaluation_environment(environments, preferred, model, tiny):
     if not names and kind in missing:
         if kind in manual:
             print(f"{kind} requires separate simulator setup.")
+            issue = catalogs.get(preferred, {}).get("manual_status", {}).get(kind)
+            if issue:
+                print(issue)
         else:
             print("The executor will check for installable dependencies when the job starts.")
     target = preferred if preferred in names or not names else names[0]
@@ -1202,6 +1212,44 @@ def job_title(index, cfg):
     return f"{title} {cfg.get('label') or cfg['model']}"
 
 
+def hub_access_hints(model, stages):
+    """Report known download gates without probing the network or the user's credentials."""
+    paligemma = "google/paligemma-3b-pt-224"
+    cosmos = "nvidia/Cosmos-Reason2-2B"
+    flux_base = "black-forest-labs/flux-3-action-base"
+    known = {paligemma, cosmos, flux_base, "black-forest-labs/flux-3-action-so101"}
+    found = set()
+    for stage in stages:
+        flags = dict(token[2:].split("=", 1) for token in stage.arguments
+                     if token.startswith("--policy.") and "=" in token)
+        source = flags.get("policy.path")
+        config = {}
+        if source:
+            path = Path(source).expanduser() / "config.json"
+            if path.is_file():
+                try:
+                    config = read_json(path)
+                except (OSError, ValueError):
+                    pass
+                if not isinstance(config, dict):
+                    config = {}
+        # Explicit flags take precedence over checkpoint metadata.
+        fields = {**config, **{key.removeprefix("policy."): value for key, value in flags.items()}}
+        candidates = [source]
+        if model in {"pi0", "pi05", "pi0_fast", "fineart_vla"}:
+            candidates.append(fields.get("text_tokenizer_name", paligemma))
+        if model == "flux3":
+            candidates.extend(fields.get(key, flux_base) for key in ("video_vae_id", "text_encoder_id"))
+        if model == "groot" and (not source or str(source).startswith("nvidia/gr00t17-")
+                                  or str(fields.get("base_model_path", "")).lower().startswith("nvidia/gr00t-n1.7")
+                                  or str(fields.get("model_version", "")).lower() == "n1.7"):
+            candidates.append(cosmos)
+        for value in [*candidates, *fields.values()]:
+            if isinstance(value, str) and value.split(":", 1)[0] in known:
+                found.add(value.split(":", 1)[0])
+    return sorted(found)
+
+
 def show_settings(plans, show_commands):
     for index, (cfg, stages, _, _) in enumerate(plans, 1):
         if index > 1:
@@ -1216,6 +1264,12 @@ def show_settings(plans, show_commands):
             elif stage.auto_flags:
                 automatic = [arg for arg in stage.arguments if arg.removeprefix("--").partition("=")[0] in stage.auto_flags]
                 print(command_preview(automatic, stage.auto_flags))
+        access = hub_access_hints(cfg["model"], stages) if cfg.get("adapter") == "native" else []
+        if access:
+            print("  Hugging Face access for downloads (if needed):")
+            for repo in access:
+                print(f"    https://huggingface.co/{repo}")
+            print("    Use the same account as the executor to review the terms and request access.")
         evaluation = cfg.get("eval")
         if evaluation and evaluation["batch"] > evaluation["episodes"]:
             print(f"  Effective evaluation batch size: {evaluation['episodes']} "

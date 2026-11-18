@@ -129,6 +129,10 @@ def native_training_preflight(config):
             return {}
         if policy.get("type") and policy["type"] != model:
             raise ValueError(f"The selected checkpoint uses policy {policy['type']}, but this job uses {model}.")
+        if model == "wall_oss_05":
+            # Wall-OSS derives its input features from the target dataset and resolves
+            # physical camera slots using its own camera_key_mapping overrides.
+            return {}
         inputs = policy.get("input_features")
         if inputs and isinstance(inputs, dict):
             expected = _policy_cameras(inputs)

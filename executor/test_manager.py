@@ -1125,6 +1125,22 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checkpoint camera inputs do not match"):
             adapter.train()
 
+    def test_wall_oss_native_camera_slots_accept_dataset_feature_names(self):
+        from training_preflight import native_training_preflight
+
+        root = self.root / "wall_dataset"
+        (root / "meta").mkdir(parents=True)
+        (root / "meta/info.json").write_text(json.dumps({"features": {
+            "observation.images.image": {"dtype": "video", "shape": [224, 224, 3],
+                                         "names": ["height", "width", "channels"]}}}))
+        base = self.root / "wall_checkpoint"
+        base.mkdir()
+        (base / "config.json").write_text(json.dumps({"type": "wall_oss_05", "input_features": {
+            "observation.images.face_view": {"type": "VISUAL", "shape": [3, 448, 448]}}}))
+        config = {"model": "wall_oss_05", "train": {"dataset_root": str(root), "pretrained": str(base),
+                  "extra": ['--policy.camera_key_mapping={"observation.images.image":"face_view"}']}}
+        self.assertEqual(native_training_preflight(config), {})
+
     def test_failed_stage_keeps_log_and_explains_feature_mismatch(self):
         logfile = self.root / "train.log"
         logfile.write_text(
@@ -1151,6 +1167,116 @@ class ManagerTests(unittest.TestCase):
         failure = StageFailure("train", 1, logfile)
         self.assertEqual(failure.reason, "CUDA out of memory. Requested 16.00 MiB with 15.38 MiB free.")
         self.assertEqual(failure.logfile, logfile)
+
+    def test_tokenizer_wrapper_shows_the_chained_cause_and_full_log_path(self):
+        logfile = self.root / "eval.log"
+        wrapper = "RuntimeError: Failed to load required tokenizers for PI0FastPolicy initialization"
+        for cause, expected in (
+            ("OSError: Can't load tokenizer for 'example/exact-tokenizer'.",
+             "OSError: Can't load tokenizer for 'example/exact-tokenizer'."),
+            ("huggingface_hub.errors.OfflineModeIsEnabled: Network access to example/tokenizer is disabled.",
+             "huggingface_hub.errors.OfflineModeIsEnabled: Network access to example/tokenizer is disabled."),
+            ("huggingface_hub.errors.LocalEntryNotFoundError: Cannot find the requested files in the disk cache "
+             "and outgoing traffic has been disabled.\n\n"
+             "The above exception was the direct cause of the following exception:\n\n"
+             "Traceback (most recent call last):\n"
+             "OSError: We couldn't connect to 'https://huggingface.co' to load the files, "
+             "and couldn't find them in the cached files.",
+             "Required files are missing from the Hugging Face cache and network access is disabled."),
+        ):
+            with self.subTest(expected=expected):
+                logfile.write_text(cause + "\n\nThe above exception was the direct cause of the following exception:"
+                                   "\n\nTraceback (most recent call last):\n  File \"policy.py\", line 42\n" + wrapper,
+                                   encoding="utf-8")
+                failure = StageFailure("eval", 1, logfile)
+                self.assertEqual(failure.reason, expected)
+                self.assertIn(str(logfile), str(failure))
+
+    def test_gated_hub_errors_name_the_model_or_dataset_that_needs_access(self):
+        logfile = self.root / "eval.log"
+        for location, page in (
+            ("https://huggingface.co/nvidia/Cosmos-Reason2-2B/resolve/main/config.json?token=secret",
+             "https://huggingface.co/nvidia/Cosmos-Reason2-2B"),
+            ("https://huggingface.co/api/models/example/private-base/auth-check", "https://huggingface.co/example/private-base"),
+            ("https://huggingface.co/api/datasets/example/tasks/revision/abc", "https://huggingface.co/datasets/example/tasks"),
+            ("https://hf.co/datasets/example/tasks/resolve/main/data.parquet", "https://huggingface.co/datasets/example/tasks"),
+            ("https://huggingface.co/spaces/example/demo/resolve/main/config.json", "https://huggingface.co/spaces/example/demo"),
+        ):
+            with self.subTest(location=location):
+                logfile.write_text("Loading GR00T from a separate checkpoint.\n"
+                                   "huggingface_hub.errors.GatedRepoError: 403 Client Error.\n"
+                                   f"Cannot access gated repo for url {location}.\n\n"
+                                   "The above exception was the direct cause of the following exception:\n\n"
+                                   "Traceback (most recent call last):\n"
+                                   "OSError: You are trying to access a gated repo.\n", encoding="utf-8")
+                failure = StageFailure("eval", 1, logfile)
+                self.assertIn(f"Open {page} with the Hugging Face account used on this server", failure.reason)
+                self.assertIn("request access", failure.reason)
+                self.assertIn("already approved", failure.reason)
+                self.assertIn("read permissions", failure.reason)
+                self.assertNotIn("secret", failure.reason)
+                self.assertIn(str(logfile), str(failure))
+        logfile.write_text("huggingface_hub.errors.GatedRepoError: 403 Client Error.", encoding="utf-8")
+        reason = StageFailure("eval", 1, logfile).reason
+        self.assertIn("its Hugging Face repository page", reason)
+        self.assertNotIn("https://", reason)
+
+    def test_hub_http_status_alone_does_not_imply_a_gated_repository(self):
+        logfile = self.root / "eval.log"
+        for status, expected in (("401 Unauthorized", "could not authenticate"), ("403 Forbidden", "denied the request")):
+            with self.subTest(status=status):
+                logfile.write_text(f"huggingface_hub.errors.RepositoryNotFoundError: {status}.\n"
+                                   "Repository Not Found for url: https://huggingface.co/api/models/example/job.\n"
+                                   "If you are trying to access a private or gated repo, make sure you are authenticated.",
+                                   encoding="utf-8")
+                reason = StageFailure("eval", 1, logfile).reason
+                self.assertIn(expected, reason)
+                self.assertIn("https://huggingface.co/example/job", reason)
+                self.assertNotIn("Gated repository", reason)
+        logfile.write_text("huggingface_hub.errors.RepositoryNotFoundError: 404 Client Error. Repository Not Found.",
+                           encoding="utf-8")
+        self.assertIn("Repository Not Found", StageFailure("eval", 1, logfile).reason)
+        logfile.write_text("HTTPError: 403 Forbidden for https://another.example/project", encoding="utf-8")
+        self.assertNotIn("Hugging Face", StageFailure("eval", 1, logfile).reason)
+
+    def test_tokenizer_wrapper_does_not_pick_an_unrelated_earlier_error(self):
+        logfile = self.root / "eval.log"
+        wrapper = "RuntimeError: Failed to load required tokenizers for PI0FastPolicy initialization"
+        logfile.write_text("FileNotFoundError: An unrelated earlier warning.\n"
+                           "Traceback (most recent call last):\n" + wrapper, encoding="utf-8")
+        self.assertEqual(StageFailure("eval", 1, logfile).reason, wrapper)
+
+    def test_failure_summary_omits_credentials_and_signed_download_queries(self):
+        logfile = self.root / "eval.log"
+        logfile.write_text(
+            "OSError: Download failed for https://user:secret@example.com/files/tokenizer.json?X-Amz-Signature=secret "
+            "Authorization: Bearer private-value; token hf_secretABCDEF123456.", encoding="utf-8",
+        )
+        reason = StageFailure("eval", 1, logfile).reason
+        self.assertIn("https://example.com/files/tokenizer.json", reason)
+        self.assertIn("[redacted]", reason)
+        for credential in ("secret", "Signature", "private-value", "user:"):
+            self.assertNotIn(credential, reason)
+
+    def test_download_access_links_are_per_job_and_respect_selected_tokenizer(self):
+        from manage import hub_access_hints
+        from types import SimpleNamespace
+
+        def stage(*flags):
+            return SimpleNamespace(arguments=["lerobot-eval", *flags])
+
+        groot = stage("--policy.path=nvidia/gr00t17-lerobot-libero_object-640")
+        self.assertEqual(hub_access_hints("groot", [groot, groot]), ["nvidia/Cosmos-Reason2-2B"])
+        self.assertEqual(hub_access_hints("pi0_fast", [stage()]), ["google/paligemma-3b-pt-224"])
+        custom = stage("--policy.text_tokenizer_name=/local/text")
+        self.assertEqual(hub_access_hints("pi0_fast", [custom]), [])
+        checkpoint = self.root / "custom-config"
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text('{"text_tokenizer_name": "private/custom"}')
+        self.assertEqual(hub_access_hints("pi05", [stage(f"--policy.path={checkpoint}")]), [])
+        self.assertEqual(hub_access_hints("act", [stage()]), [])
+        self.assertEqual(hub_access_hints("flux3", [stage("--policy.path=black-forest-labs/flux-3-action-so101")]),
+                         ["black-forest-labs/flux-3-action-base", "black-forest-labs/flux-3-action-so101"])
 
     def test_model_size_uses_parameter_units_or_na(self):
         self.assertEqual(model_size("diffusion"), "[262.7 M]")

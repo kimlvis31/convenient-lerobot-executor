@@ -3,7 +3,9 @@
 import argparse
 from dataclasses import fields, is_dataclass
 from importlib import metadata, util
+from importlib.machinery import PathFinder
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -98,6 +100,80 @@ def local_benchmark_ready(name, requirements, versions):
     )
 
 
+def libero_plus_issue():
+    """Probe the effective fork without importing LIBERO (which can prompt or write a config)."""
+    outer = util.find_spec("libero")
+    paths = outer.submodule_search_locations if outer else None
+    inner = PathFinder.find_spec("libero.libero", paths) if paths else None
+    roots = inner.submodule_search_locations if inner else None
+    root = Path(next(iter(roots))) if roots else None
+    if root is None or not (root / "benchmark/task_classification.json").is_file():
+        return "The active libero package is not the LIBERO-plus fork."
+
+    settings = Path(os.environ.get("LIBERO_CONFIG_PATH", "~/.libero")).expanduser() / "config.yaml"
+    try:
+        import yaml
+
+        config = yaml.safe_load(settings.read_text(encoding="utf-8"))
+    except (ImportError, OSError, ValueError) as error:
+        return f"Cannot read {settings}: {error}"
+    except yaml.YAMLError as error:
+        return f"Invalid LIBERO config {settings}: {error}"
+    if not isinstance(config, dict):
+        return f"Invalid LIBERO config: {settings}"
+    for key in ("bddl_files", "init_states"):
+        if not isinstance(config.get(key), str) or not Path(config[key]).is_dir():
+            return f"Set {key} to a LIBERO-plus directory in {settings}."
+    if not (Path(config["init_states"]) / "libero_newobj").is_dir():
+        return f"The init_states directory in {settings} does not contain the LIBERO-plus variants."
+    if not (root / "assets/scenes/libero_tabletop_base_style.xml").is_file():
+        return f"LIBERO-plus scene assets are missing under {root / 'assets'}."
+    try:
+        from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
+        from skimage.filters import gaussian
+        from wand.image import Image
+
+        # Importing the Python package alone does not load the ImageMagick shared library.
+        with Image(width=1, height=1) as image:
+            image.flip()
+    except Exception as error:
+        # An incompatible native extension can also raise a ValueError or AttributeError.
+        return f"LIBERO-plus simulator dependency failed: {error}"
+    return None
+
+
+# These source-based environments require simulator assets in addition to Python modules.
+# The probe covers shared runtime assets. Individual scene assets are checked by the simulator.
+SIMULATOR_REQUIREMENTS = {
+    "robomme": (("robomme", "sapien", "mani_skill"), ("env_metadata/test/record_dataset_*_metadata.json",)),
+    "robocasa": (("robocasa", "robosuite", "mujoco"),
+                 ("wrappers/gym_wrapper.py", "models/assets/fixtures/*/*/model.xml",
+                  "models/assets/objects/lightwheel/*/*/model.xml", "models/assets/textures/*/*",
+                  "models/assets/generative_textures/*/*")),
+    "vlabench": (("VLABench", "dm_control", "open3d"),
+                 ("configs/robot_config.json", "assets/scenes/default/empty.xml", "assets/obj/*")),
+}
+
+
+def simulator_runtime_issue(benchmark):
+    modules, assets = SIMULATOR_REQUIREMENTS[benchmark]
+    specs = {name: util.find_spec(name) for name in modules}
+    missing = [name for name, spec in specs.items() if spec is None]
+    if missing:
+        return "Missing simulator modules: " + ", ".join(missing) + "."
+    roots = specs[modules[0]].submodule_search_locations
+    if not roots:
+        return f"Cannot locate the {modules[0]} simulator package."
+    root = Path(next(iter(roots)))
+    # Upstream VLABench sets its own package root when imported on Linux.
+    if benchmark == "vlabench" and sys.platform != "linux":
+        root = Path(os.environ.get("VLABENCH_ROOT", root))
+    for pattern in assets:
+        if not any(root.glob(pattern)):
+            return f"Missing simulator files under {root}: {pattern}."
+    return None
+
+
 def supported_here(name):
     return name != "libero" or sys.platform == "linux"
 
@@ -174,11 +250,21 @@ def environment_catalog():
     manual = sorted(name for name, config in env_types.items()
                     if config.__module__.startswith("lerobot.envs.") and name not in installable
                     and name != "gym_manipulator")
+    # The extra alone cannot install the native image library or perturbation assets.
+    # Keep this separate from pip-installable benchmarks to protect stock LIBERO.
+    manual_status = {}
+    if "libero_plus" in env_types and env_types["libero_plus"].__module__.startswith("lerobot.envs."):
+        benchmarks.pop("libero_plus", None)
+        if "libero_plus" not in manual:
+            manual.append("libero_plus")
+        manual_status["libero_plus"] = libero_plus_issue()
+    for name in SIMULATOR_REQUIREMENTS.keys() & set(manual):
+        manual_status[name] = simulator_runtime_issue(name)
     peft_requirements = optional_requirements(distribution, "peft")
     runtime = {extra: all(installed(req, versions) for req in optional_requirements(distribution, extra))
                for extra in LEROBOT_RUNTIME_EXTRAS}
     return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
-            "runtime": runtime,
+            "manual_status": manual_status, "runtime": runtime,
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
             "peft_ready": "peft" in versions and all(installed(req, versions) for req in peft_requirements),
             "peft_installable": bool(peft_requirements),
