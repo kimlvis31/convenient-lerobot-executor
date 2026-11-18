@@ -7,7 +7,7 @@ marked as placeholders before execution. Relative paths start at the project roo
 Policy configuration: https://github.com/huggingface/lerobot/tree/145cc7ea53e5864bd5efec4e9bb70ee799e47bd8/src/lerobot/policies/molmoact2
 """
 
-# Fine-tune the converted checkpoint with compatible normalization statistics and action mode.
+# Training requires compatible LIBERO normalization statistics. Replace the norm_stats_path placeholder.
 # The model-specific train_mode_vlm option accepts fft, lora or freeze.
 
 JOBS = [
@@ -21,16 +21,16 @@ JOBS = [
         # Use "resume" with "steps" and "save_freq" to restore a native training checkpoint.
         # For exact resume, remove new-training inputs and scope or optimizer overrides.
         "train": {
-            "dataset": "allenai/MolmoAct2-LIBERO-Dataset",  # Required. LeRobot dataset ID.
+            "dataset": "lerobot/libero",  # Required. LeRobot dataset ID.
             "dataset_root": None,  # Optional. Local directory. None lets LeRobot fetch the dataset.
             "episodes": None,  # Optional. Set a list of episode IDs to override the dataset split.
-            "pretrained": "allenai/MolmoAct2-LIBERO-LeRobot",  # Optional. Hub ID or local checkpoint. None uses policy initialization.
+            "pretrained": None,  # Optional. None uses the raw model initializer in extra.
             "batch": 1,  # Required. Samples per optimizer batch.
             "device": "cuda",  # Required. Use a device supported by this policy.
             "seed": 0,  # Required. Training seed.
             "steps": 100,  # Required. Target optimizer step count.
             "save_freq": 100,  # Required. Optimizer steps between checkpoints.
-            "policy_training": {},  # Optional. Inherit the policy or checkpoint scope.
+            "policy_training": {"train_mode_vlm": "fft", "freeze_embedding": True},  # Optional. Fine-tuning scope.
             # Component settings exposed by this policy (constructor defaults shown).
             #   freeze_embedding = True
             #   train_mode_vlm = "lora"
@@ -51,7 +51,16 @@ JOBS = [
                 # "scheduler_decay_steps": 24000,
                 # "scheduler_decay_lr": 0.000001,
             },
-            "extra": [  # Optional. Additional LeRobot options in --name=value form.
+            "extra": [
+                "--policy.checkpoint_path=allenai/MolmoAct2",  # Required. Raw policy initializer.
+                "--policy.norm_tag=libero",  # Required. Normalization profile.
+                "--policy.norm_stats_path=datasets/your_libero/norm_stats.json",  # Required. Replace this path.
+                "--policy.action_mode=continuous",
+                "--policy.chunk_size=10",
+                "--policy.n_action_steps=10",
+                '--policy.image_keys=["observation.images.image","observation.images.image2"]',
+                "--policy.setup_type=single franka robotic arm in libero",
+                "--policy.control_mode=delta end-effector pose",
                 "--policy.dtype=bfloat16",
             ],
         },
@@ -63,7 +72,7 @@ JOBS = [
         "label": "MolmoAct2 evaluation",  # Optional. Display name.
         "save_outputs": True,  # Optional. False discards outputs after the job.
         "eval": {
-            "policy": "allenai/MolmoAct2-LIBERO-LeRobot",  # Required. Hub ID or local checkpoint with its processors.
+            "policy": None,  # Required field. None loads the native policy type and uses extra below.
             "env": "libero",  # Required. Evaluation environment.
             "tasks": ["libero_object"],  # Required. One or more LIBERO suites.
             "task_ids": [0],  # Optional. Zero-based IDs within one suite. [] evaluates all tasks.
@@ -75,7 +84,9 @@ JOBS = [
             "control": "relative",  # Required for LIBERO. Match the checkpoint's action controller.
             "size": 256,  # Required for LIBERO. Square camera input size in pixels.
             "environment": None,  # Optional. Conda override. None selects a compatible environment.
-            "extra": [  # Optional. Additional LeRobot options in --name=value form.
+            "extra": [
+                "--policy.checkpoint_path=allenai/MolmoAct2-LIBERO",  # Required. Original LIBERO release.
+                "--policy.norm_tag=libero",  # Required. Selects the original release's normalization profile.
                 "--policy.inference_action_mode=continuous",
                 "--policy.dtype=bfloat16",
                 "--policy.enable_inference_cuda_graph=false",

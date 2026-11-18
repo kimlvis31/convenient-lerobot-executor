@@ -341,9 +341,12 @@ class NativeAdapter:
     def eval_policy(self, after_training):
         model = (self.train_dir / "train/checkpoints/last/pretrained_model" if after_training
                  else self.settings["eval"]["policy"])
+        device = flag("policy.device", self.settings["eval"]["device"])
+        if model is None:
+            return [flag("policy.type", self.settings["model"]), device]
         if not after_training:
             validate_native_policy(model, self.settings["model"])
-        return [flag("policy.path", model), flag("policy.device", self.settings["eval"]["device"])]
+        return [flag("policy.path", model), device]
 
     def evaluate(self, after_training):
         cfg = self.settings["eval"]

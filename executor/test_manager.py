@@ -1164,6 +1164,21 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(seconds(86400), "1d 00:00:00")
         self.assertEqual(seconds(2 * 86400 + 3 * 3600 + 4 * 60 + 5), "2d 03:04:05")
 
+    def test_native_evaluation_accepts_an_explicit_policy_initializer(self):
+        settings = sample_settings()
+        settings["model"] = "molmoact2"
+        settings["eval"].update(policy=None, extra=["--policy.checkpoint_path=allenai/MolmoAct2-LIBERO",
+                                                   "--policy.norm_tag=libero"])
+        adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
+        args = adapter.evaluate(after_training=False).arguments
+        self.assertIn("--policy.type=molmoact2", args)
+        self.assertIn("--policy.checkpoint_path=allenai/MolmoAct2-LIBERO", args)
+        self.assertFalse(any(arg.startswith("--policy.path=") for arg in args))
+        settings["eval"]["extra"] = []
+        combined = adapter.evaluate(after_training=True).arguments
+        self.assertTrue(any(arg.startswith("--policy.path=") for arg in combined))
+        self.assertNotIn("--policy.type=molmoact2", combined)
+
     def test_native_evaluation_uses_selected_benchmark(self):
         answers = io.StringIO("\n1\n\n\n\nlerobot/act_pusht\n125\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:

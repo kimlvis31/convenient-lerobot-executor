@@ -7,7 +7,7 @@ marked as placeholders before execution. Relative paths start at the project roo
 Policy configuration: https://github.com/huggingface/lerobot/tree/145cc7ea53e5864bd5efec4e9bb70ee799e47bd8/src/lerobot/policies/eo1
 """
 
-# The evaluation block uses a community LIBERO checkpoint with two 256 px views.
+# Supply a fine-tuned LIBERO checkpoint for this LeRobot revision and its Qwen2.5-VL backbone.
 # The training initializer is the public base. Review dataset camera names and use --rename_map for differences.
 
 JOBS = [
@@ -55,7 +55,7 @@ JOBS = [
         "label": "EO-1 evaluation",  # Optional. Display name.
         "save_outputs": True,  # Optional. False discards outputs after the job.
         "eval": {
-            "policy": "crislmfroes/eo1-libero",  # Required. Hub ID or local checkpoint with its processors.
+            "policy": "./outputs/training/eo1-run/train/checkpoints/last/pretrained_model",  # Required. Compatible checkpoint.
             "env": "libero",  # Required. Evaluation environment.
             "tasks": ["libero_object"],  # Required. One or more LIBERO suites.
             "task_ids": [0],  # Optional. Zero-based IDs within one suite. [] evaluates all tasks.
