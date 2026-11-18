@@ -270,15 +270,17 @@ class NativeAdapter:
         automatic.update(required_scope_flags(cfg, model, explicit))
         automatic.update(native_training_preflight(self.settings))
         args += scope_flags + [flag(name, value) for name, value in automatic.items()]
+        save_checkpoint = self.settings.get("save_outputs", True) or "eval" in self.settings
         args += [flag("output_dir", output), flag("job_name", self.run_name), flag("steps", steps),
                  flag("log_freq", min(track_frequency(steps), cfg["save_freq"])),
-                 flag("save_freq", cfg["save_freq"]), "--save_checkpoint=true", "--policy.push_to_hub=false"]
+                 flag("save_freq", cfg["save_freq"]), flag("save_checkpoint", save_checkpoint),
+                 "--policy.push_to_hub=false"]
         args += additional_flags(extra,
                                  {a[2:].split("=")[0] for a in args if a.startswith("--")} |
                                  {"config_path", "resume", "policy.path", "policy.type",
                                   "save_checkpoint_to_hub", "output_dir"}, ("job.",))
-        expected = output / "checkpoints/last/pretrained_model/train_config.json"
-        return Stage("train", self.environment, args, (expected,), steps, start,
+        expected = (output / "checkpoints/last/pretrained_model/train_config.json",) if save_checkpoint else ()
+        return Stage("train", self.environment, args, expected, steps, start,
                      output=output, auto_flags=tuple(automatic))
 
     def eval_policy(self, after_training):

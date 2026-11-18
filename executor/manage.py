@@ -2,7 +2,7 @@
 """Interactive LeRobot training, evaluation, and resume manager."""
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timezone
 from itertools import product
 import json
@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory, gettempdir
 from textwrap import indent
 from uuid import uuid4
 
@@ -896,7 +897,12 @@ def configure_job(adapters, inventory, root, policies, training_catalog, evaluat
         cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, benchmark)
         if override:
             cfg["eval"]["environment"] = environment
-    return cfg
+    while True:
+        saving = ask("Save Job Outputs? (Y/N)", "Y").upper()
+        if saving in {"Y", "N"}:
+            cfg["save_outputs"] = saving == "Y"
+            return cfg
+        retry_question("Enter Y or N.")
 
 
 def paths_for(args, cfg):
@@ -956,7 +962,7 @@ def normalize_paths(cfg, root):
     return cfg
 
 
-def plan_job(args, cfg, conda, detected, benchmark_sessions):
+def plan_job(args, cfg, conda, detected, benchmark_sessions, temporary_output_directory=None):
     root, external = paths_for(args, cfg)
     plugins = args.plugin or cfg.get("plugins", [])
     adapters = load_adapters(plugins)
@@ -964,6 +970,9 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions):
         raise ValueError("Specify schema 1, a supported adapter, and a train or eval job.")
     if not isinstance(cfg["model"], str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", cfg["model"]):
         raise ValueError("Model names may contain letters, digits, periods, underscores, and hyphens.")
+    save_outputs = cfg.get("save_outputs", True)
+    if type(save_outputs) is not bool:
+        raise ValueError("save_outputs must be true or false.")
     cfg = normalize_paths(cfg, root)
     environments = {**DEFAULT_ENVIRONMENTS, **cfg.get("environments", {})}
     if args.env_map:
@@ -980,6 +989,16 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions):
     cfg.update(environments=environments, plugins=plugins, lerobot_root=str(root), tinyvla_root=str(external))
     name = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{cfg['model'][:50]}_{uuid4().hex[:8]}"
     adapter = adapters[cfg["adapter"]](cfg, name, PROJECT_ROOT, external, environments)
+    outputs = PROJECT_ROOT / "outputs"
+    if not save_outputs:
+        if args.dry_run:
+            outputs = Path(gettempdir()) / f"convlexecutor-{name}"
+        elif temporary_output_directory is not None:
+            outputs = temporary_output_directory()
+        else:
+            raise ValueError("Temporary jobs require an output directory managed by the executor.")
+        adapter.train_dir = outputs / "training" / name
+        adapter.eval_dir = outputs / "evaluation" / name
     stages = []
     if "train" in cfg:
         stages.append(adapter.train())
@@ -999,14 +1018,18 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions):
                 evaluate["environment"] = ready[0]
         stages.append(adapter.evaluate(after_training="train" in cfg))
     for stage in stages:
+        if not save_outputs:
+            paths = (*stage.artifacts, stage.output) if stage.output else stage.artifacts
+            if any(not path.resolve().is_relative_to(outputs.resolve()) for path in paths):
+                raise ValueError("This adapter must keep output paths inside the temporary job directory.")
         stage.env.setdefault("HF_LEROBOT_HOME", str(PROJECT_ROOT / "datasets/.hub"))
     first = stages[0]
-    output = first.output or PROJECT_ROOT / "outputs" / ("training" if first.name == "train" else "evaluation") / name
+    output = first.output or outputs / ("training" if first.name == "train" else "evaluation") / name
     run_dir = (output.parent if first.name == "train" and first.output else output) / "executor"
     return cfg, stages, run_dir, PROJECT_ROOT
 
 
-def plan(args):
+def plan(args, temporary_output_directory=None):
     source = args.settings or args.queue
     settings = load_settings(source) if source else None
     if args.queue and "jobs" not in settings:
@@ -1039,7 +1062,7 @@ def plan(args):
     jobs = settings_jobs(settings)
     for index, cfg in enumerate(jobs, 1):
         try:
-            plans.append(plan_job(args, cfg, conda, detected, benchmark_sessions))
+            plans.append(plan_job(args, cfg, conda, detected, benchmark_sessions, temporary_output_directory))
         except (OSError, ValueError, KeyError, TypeError, AttributeError, ImportError) as error:
             raise ValueError(f"Invalid settings for job {index}/{len(jobs)} ({error})") from error
     return plans, conda
@@ -1051,12 +1074,14 @@ def command_preview(arguments, auto_flags=()):
         if not groups or argument.startswith("--"):
             groups.append([])
         groups[-1].append(argument)
-    commands = []
+    commands, automatic = [], []
     for group in groups:
         command = shlex.join(group)
         if group[0].removeprefix("--").partition("=")[0] in auto_flags:
-            command = styled(command, "32")
-        commands.append(command)
+            automatic.append(styled(command, "32"))
+        else:
+            commands.append(command)
+    commands.extend(automatic)
     return " \\\n".join(f"    {command}" for command in commands)
 
 
@@ -1070,6 +1095,8 @@ def show_settings(plans, show_commands):
         if index > 1:
             print()
         print(job_title(index, cfg))
+        if not cfg.get("save_outputs", True):
+            print("  Job outputs: temporary")
         for stage in stages:
             print("  " + stage_title(stage, cfg["model"]))
             if show_commands:
@@ -1112,7 +1139,11 @@ def prepare_job_environments(cfg, stages, root, conda, sessions):
             stage.environment = target
 
 
-def run_plans(plans, conda, verbose):
+def temporary_job_root(path, temporary_outputs):
+    return next((root for root in temporary_outputs if path.is_relative_to(root)), None)
+
+
+def run_plans(plans, conda, verbose, temporary_outputs):
     sessions = {}
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
         if index > 1:
@@ -1121,7 +1152,9 @@ def run_plans(plans, conda, verbose):
         job_subheading("Status")
         prepare_job_environments(cfg, stages, root, conda, sessions)
         execute(stages, cfg, run_dir, root, conda, verbose)
-        show_job_result(stages)
+        show_job_result(stages, save_outputs=cfg.get("save_outputs", True))
+        if scratch := temporary_job_root(run_dir, temporary_outputs):
+            temporary_outputs.pop(scratch).cleanup()
 
 
 def metric(stats, key):
@@ -1139,7 +1172,7 @@ def success_rate(stats):
     return f"{percent:.2f}%" if percent is not None and percent <= 100 else "N/A"
 
 
-def evaluation_summary(output):
+def evaluation_summary(output, *, save_outputs=True):
     try:
         info = read_json(output / "eval_info.json")
     except (OSError, ValueError):
@@ -1163,7 +1196,9 @@ def evaluation_summary(output):
     else:
         lines.append("• Suite success rates: N/A")
     lines.extend((f"• Total evaluation time: {seconds(total)}",
-                  f"• Average time per episode: {average_text}", f"• Result path: {output}"))
+                  f"• Average time per episode: {average_text}"))
+    if save_outputs:
+        lines.append(f"• Result path: {output}")
     return "\n".join(lines)
 
 
@@ -1174,20 +1209,24 @@ def result_heading(in_job):
         section("Result")
 
 
-def show_job_result(stages):
+def show_job_result(stages, *, save_outputs=True):
     result_heading(in_job=True)
     evaluations = [stage.output for stage in stages if stage.name == "eval" and stage.output is not None]
     if evaluations:
-        print("\n\n".join(indent(evaluation_summary(output), "    ") for output in evaluations))
+        summaries = (evaluation_summary(output, save_outputs=save_outputs) for output in evaluations)
+        print("\n\n".join(indent(summary, "    ") for summary in summaries))
     else:
         print(styled("    • Job completed.", "32"))
-        for stage in stages:
-            if stage.output is not None:
-                print(f"    • Result path: {stage.output}")
+        if save_outputs:
+            for stage in stages:
+                if stage.output is not None:
+                    print(f"    • Result path: {stage.output}")
+    if not save_outputs:
+        print("    • Job outputs were not saved.")
     divider()
 
 
-def report_failure(message, in_job, *, reason=None, logfile=None):
+def report_failure(message, in_job, *, reason=None, logfile=None, temporary=False):
     result_heading(in_job)
     prefix = "    • " if in_job else ""
     print(f"{prefix}{message}", file=sys.stderr, flush=True)
@@ -1195,6 +1234,8 @@ def report_failure(message, in_job, *, reason=None, logfile=None):
         print(f"{prefix}Cause: {reason}", file=sys.stderr, flush=True)
     if logfile:
         print(f"{prefix}Full log: {logfile}", file=sys.stderr, flush=True)
+    if temporary:
+        print(f"{prefix}Job outputs were not saved.", file=sys.stderr, flush=True)
     divider()
 
 
@@ -1213,8 +1254,17 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Show detailed execution logs")
     args = parser.parse_args()
     executing = False
+    temporary_outputs = {}
+    scratch_dirs = ExitStack()
+
+    def make_temporary_output_directory():
+        folder = TemporaryDirectory(prefix="convlexecutor-")
+        path = Path(scratch_dirs.enter_context(folder)).resolve()
+        temporary_outputs[path] = folder
+        return path
+
     try:
-        plans, conda = plan(args)
+        plans, conda = plan(args, make_temporary_output_directory)
         if not plans:
             return 0
         section("Settings")
@@ -1231,19 +1281,22 @@ def main():
         conda = conda or conda_executable(args.conda)
         section("Execution")
         executing = True
-        run_plans(plans, conda, args.verbose)
+        run_plans(plans, conda, args.verbose, temporary_outputs)
         return 0
     except (KeyboardInterrupt, EOFError):
         report_failure("Run interrupted.", in_job=executing)
         return 130
     except StageFailure as error:
+        temporary = temporary_job_root(error.logfile, temporary_outputs) is not None
         report_failure(f"Run failed ({error.stage} exited with code {error.code}).", in_job=executing,
-                       reason=error.reason, logfile=error.logfile)
+                       reason=error.reason, logfile=None if temporary else error.logfile, temporary=temporary)
         return 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.TimeoutExpired) as error:
         report_failure(f"Run failed ({error})", in_job=executing)
         return 1
+    finally:
+        scratch_dirs.close()
 
 
 if __name__ == "__main__":

@@ -145,3 +145,5 @@ def show(inventory, environments, limit=None):
             print(f"  {index}. {item}")
         if limit is not None and len(items) > limit:
             print("  Run with --inventory to show the full list.")
+        if name == "Training Datasets":
+            print("  Browse LeRobot datasets on Hugging Face · https://huggingface.co/datasets?author=lerobot")

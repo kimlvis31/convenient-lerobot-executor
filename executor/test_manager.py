@@ -45,6 +45,10 @@ if args[0] == 'lerobot-train':
     if '--resume=true' in args:
         previous = Path(next(arg.split('=', 1)[1] for arg in args if arg.startswith('--config_path=')))
         assert (previous.parent.parent / 'training_state/training_step.json').is_file(), previous
+    if '--save_checkpoint=false' in args:
+        output.mkdir(parents=True)
+        print(f'step:{steps} smoothed loss:0.2', flush=True)
+        sys.exit(0)
     model = output / 'checkpoints/last/pretrained_model'
     model.mkdir(parents=True)
     (model / 'train_config.json').write_text('{"policy":{"type":"smolvla"}}')
@@ -59,6 +63,8 @@ elif args[0] == 'lerobot-eval':
     model = Path(next(arg.split('=', 1)[1] for arg in args
                       if arg.startswith(('--policy.path=', '--policy.model_path='))))
     assert model.is_dir(), model
+    if '--seed=2' in args:
+        raise ValueError('Temporary backend failed.')
     output.mkdir(parents=True, exist_ok=True)
     print('Stepping through eval batches: 0%|          | 0/2 [00:00<?, ?it/s]', flush=True)
     print('Stepping through eval batches: 100%|##########| 2/2 [00:00<00:00, 2it/s]', flush=True)
@@ -312,7 +318,71 @@ class ManagerTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(), 0)
         self.assertIn("Run 1 job? (Y/N) [Default: Y]", output.getvalue())
-        execute.assert_called_once_with(plans, "fake", False)
+        execute.assert_called_once_with(plans, "fake", False, {})
+
+    def test_temporary_native_jobs_clean_outputs_after_summary_or_failure(self):
+        for case in ("train", "both", "failure", "dry-run"):
+            with self.subTest(case=case):
+                job = sample_settings()
+                job["save_outputs"] = False
+                if case in {"train", "dry-run"}:
+                    del job["eval"]
+                if case == "failure":
+                    job["eval"]["seed"] = 2
+                job_file = self.root / f"{case}.json"
+                job_file.write_text(json.dumps(job), encoding="utf-8")
+                created = []
+                commands = []
+
+                def make_scratch(**kwargs):
+                    folder = tempfile.TemporaryDirectory(dir=self.root, **kwargs)
+                    created.append(Path(folder.name))
+                    return folder
+
+                def backend(conda, environment, args):
+                    commands.append(args)
+                    return [sys.executable, "-u", str(self.backend), *args]
+
+                cli = ["manage.py", "--settings", str(job_file)]
+                if case == "dry-run":
+                    cli.append("--dry-run")
+                with patch("sys.argv", cli), patch("manage.PROJECT_ROOT", self.root), \
+                     patch("manage.conda_executable", return_value="fake"), \
+                     patch("manage.available_environments", return_value=set()), \
+                     patch("manage.environment_catalog", return_value={}), \
+                     patch("manage.TemporaryDirectory", side_effect=make_scratch), \
+                     patch("runner.resolve_environment", return_value=self.environment), \
+                     patch("runner.conda_command", side_effect=backend), \
+                     contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(output):
+                    self.assertEqual(main(), 1 if case == "failure" else 0)
+                printed = output.getvalue()
+                self.assertIn("Job outputs: temporary", printed)
+                self.assertFalse((self.root / "outputs").exists())
+                self.assertNotIn("Result path:", printed)
+                if case == "dry-run":
+                    self.assertFalse(created)
+                    self.assertFalse(commands)
+                else:
+                    self.assertEqual(len(created), 1)
+                    self.assertFalse(created[0].exists())
+                    self.assertIn("--save_checkpoint=false" if case == "train" else "--save_checkpoint=true",
+                                  commands[0])
+                if case == "both":
+                    self.assertIn("Overall success rate", printed)
+                    self.assertIn("Job outputs were not saved.", printed)
+                if case == "failure":
+                    self.assertIn("Cause: ValueError: Temporary backend failed.", printed)
+                    self.assertIn("Job outputs were not saved.", printed)
+                    self.assertNotIn("Full log:", printed)
+
+    def test_dataset_download_catalog_is_listed_even_when_inventory_is_empty(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            show(Inventory(), [])
+        rendered = output.getvalue()
+        link = "https://huggingface.co/datasets?author=lerobot"
+        self.assertEqual(rendered.count(link), 1)
+        self.assertLess(rendered.index("Training Datasets"), rendered.index(link))
+        self.assertLess(rendered.index(link), rendered.index("Models for Evaluation"))
 
     def test_wizard_deletes_only_confirmed_result_run_folders(self):
         paths = {
@@ -699,6 +769,9 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("<32>--policy.enable_fast_action_loss=false</32>", preview)
         self.assertNotIn("<32>--policy.train_expert_only=true</32>", preview)
         self.assertIn("--policy.text_loss_weight=0.0", preview)
+        self.assertLess(preview.index("--policy.push_to_hub=false"), preview.index("<32>"))
+        self.assertLess(stage.arguments.index("--policy.text_loss_weight=0.0"),
+                        stage.arguments.index("--policy.push_to_hub=false"))
 
     def test_training_preflight_reuses_only_an_applicable_saved_camera_map(self):
         dataset = self.root / "dataset"

@@ -452,7 +452,8 @@ def run_stage(command, stage, root, logfile, update, write_message=None):
         raise StageFailure(stage.name, code, logfile)
     for item in stage.artifacts:
         require(item)
-    read_json(stage.artifacts[0])
+    if stage.artifacts:
+        read_json(stage.artifacts[0])
 
 
 def load_settings(path):

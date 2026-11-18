@@ -73,6 +73,8 @@ Training Scope lists the compatible component combinations together. The executo
 
 Each result has an `executor/` subdirectory with its executed `run.py`, reusable `script.py`, job status, and the stage console log. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
 
+Choose **N** at **Save Job Outputs?** to run in temporary storage and see the result in the terminal. Set `"save_outputs": False` for a job in a Python job queue. Temporary runs discard their outputs and logs after execution. A train-and-evaluate job keeps its checkpoint until evaluation finishes.
+
 See the [executor guide](executor/README.md), [TinyVLA guide](externals/TinyVLA/README.md), and [agent setup guide](AGENTS.md) for more details.
 
 ## License
