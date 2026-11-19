@@ -36,6 +36,21 @@ The default model directory, `models/Llava-Pythia-700M/`, needs the original `mo
 
 The executor passes `--policy.model_path` and `--policy.worker_log_dir`. The original `--policy.step7_script` option remains supported. Each evaluation saves worker logs in `eval/worker_logs/` under its output directory. The adapter removes the worker code from its temporary directory at shutdown. Job script retention is handled by the executor.
 
+## Regenerate source-bound example resume states
+
+Generated example resume states are tied to the trainer, loader, base snapshot, and training configuration used to create them. A source update can make an old example fail verification even when its exported model remains valid. Preserve the existing dataset, base weights, exported models, and all user training states; do not edit saved source hashes or relax the checks.
+
+From the checkout, use an unused staging directory with no existing checkpoint fixtures:
+
+```bash
+python -B executor/prepare_examples.py --checkpoint-root outputs/example-refresh --dry-run
+python -B executor/prepare_examples.py --checkpoint-root outputs/example-refresh
+```
+
+The preparation script verifies the generated fixtures before publishing them in that staging location. Check the staged model and a step-2-to-step-4 resume before changing the normal example paths. You can point your queue at the staged fixtures, or replace only the recognized generated example that needs refreshing after verifying its identity and result. When moving a generated `tinyvla_resume` fixture, update its `settings.json` field `train.selection` to the final `selection.json` path; preserve unrelated examples and user outputs.
+
+This procedure regenerates provided practice fixtures and does not migrate real training history. An older real training state needs its original source version for exact resume, or a new training run initialized from its exported weights with a fresh optimizer.
+
 ## Verify the evaluation connection
 
 The following command runs one episode for task 1 in `libero_object`. To verify a trained checkpoint, set `--policy.model_path` to its `pretrained_model/` directory.

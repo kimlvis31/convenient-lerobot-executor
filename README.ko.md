@@ -49,6 +49,8 @@ python -B ~/convLexecutor/executor/manage.py \
 
 준비 스크립트는 버전을 고정한 공개 기반 가중치와 크림치즈 집기 시연 1개를 사용하는 데 필요한 파일을 받습니다. 행동 출력부를 4단계 학습해 `outputs/example/`에 4단계 모델과 2단계 재개 상태를 만듭니다. 재개 상태에는 해당 컴퓨터의 기반 모델 위치가 들어가므로 각 컴퓨터에서 준비 명령을 실행합니다.
 
+업데이트 후 생성된 예제의 재개 상태가 소스 검사와 맞지 않으면 기존 모델과 사용자 학습 상태를 보존하고 새 `--checkpoint-root` 위치에 예제를 준비한 뒤, [임시 생성·검증 안내](externals/TinyVLA/README.md#regenerate-source-bound-example-resume-states)에 따라 확인된 생성 예제만 교체합니다.
+
 직접 설정하려면 `manage.py`를 실행하고 **Configure a new job**을 선택합니다. 한 목록에서 모델을 고르고 평가 벤치마크나 LIBERO(Lifelong Learning Benchmark on Robot Manipulation, 로봇 조작 평생학습 벤치마크) 스위트를 선택합니다. Enter를 누르면 표시된 기본값이 적용됩니다. 준비된 작업 큐를 실행하려면 **Import a job queue script**를 선택합니다. [예제 설정](scripts/example_script.py)
 
 작업을 시작하면 convLexecutor가 선택한 모델과 벤치마크를 함께 실행할 수 있는 Conda 환경을 찾아 재사용합니다. π 계열의 SentencePiece처럼 현재 LeRobot 버전이 선언한 패키지가 빠져 있으면 필요한 것만 설치합니다. 기존 버전을 유지한 상태에서 의존성이 충돌하면 별도 환경을 만듭니다. 관리자가 설치 명세를 제공하는 소스형 벤치마크는 실행을 확정한 작업에서 처음 필요할 때 자동으로 준비합니다. 미리보기에서는 설치하지 않습니다. 여전히 **Manual Setup**이 필요한 벤치마크에는 부족한 실행 조건을 표시하며, 설치된 LeRobot 환경 플러그인은 자동으로 조회합니다. 체크포인트는 작업 설정에서 선택합니다. PushT와 ALOHA는 작업 하나당 태스크 하나를 평가합니다. 배치 추론은 유지하고 시뮬레이터 단계는 기본적으로 동기 실행합니다. Meta-World는 시뮬레이터의 기본 에피소드 길이를 사용합니다.
