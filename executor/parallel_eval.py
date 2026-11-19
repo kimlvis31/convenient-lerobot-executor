@@ -54,9 +54,15 @@ def track_parallel_rollouts(evaluator):
 
 def main():
     from lerobot.scripts import lerobot_eval
+    from evaluation_cameras import restore_camera_arguments, simulator_directory
+    from robomme_split import simulator_context
+    from simulator_worker import simulator_context as source_context
+    import sys
 
     track_parallel_rollouts(lerobot_eval)
-    lerobot_eval.main()
+    restore_camera_arguments()
+    with simulator_directory(sys.argv[1:]), simulator_context(), source_context():
+        return lerobot_eval.main()
 
 
 if __name__ == "__main__":

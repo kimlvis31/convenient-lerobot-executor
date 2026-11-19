@@ -144,7 +144,8 @@ def robotwin_directory():
 
 @contextmanager
 def simulator_directory(arguments):
-    if "--env.type=robotwin" not in arguments:
+    split = json.loads(os.environ.get("CONVLEX_SIMULATOR_WORKER") or "{}")
+    if "--env.type=robotwin" not in arguments or split.get("kind") == "robotwin":
         yield
         return
     # The simulator reads its assets relative to the working directory during import and rollout.
@@ -162,9 +163,10 @@ def simulator_directory(arguments):
 def main():
     from lerobot.scripts.lerobot_eval import main as evaluate
     from robomme_split import simulator_context
+    from simulator_worker import simulator_context as source_context
 
     restore_camera_arguments()
-    with simulator_directory(sys.argv[1:]), simulator_context():
+    with simulator_directory(sys.argv[1:]), simulator_context(), source_context():
         return evaluate()
 
 

@@ -59,7 +59,8 @@ def conda_executable(explicit):
 
 
 def conda_command(conda, name, arguments):
-    return [conda, "run", "--no-capture-output", "-n", name, *arguments]
+    selector = "--prefix" if Path(name).is_absolute() else "-n"
+    return [conda, "run", "--no-capture-output", selector, name, *arguments]
 
 
 def available_environments(conda, root):
@@ -865,6 +866,9 @@ def run_job(job, run_dir):
             print_status_detail(stage_title(stage, settings["model"]))
             if worker := stage.env.get("CONVLEX_ROBOMME_WORKER"):
                 print_status_detail(f"RoboMME simulator Python: {json.loads(worker)['python']}")
+            if worker := stage.env.get("CONVLEX_SIMULATOR_WORKER"):
+                details = json.loads(worker)
+                print_status_detail(f"{details['kind']} simulator Python: {details['python']}")
             print_status_detail(f"Run script: {run_dir / 'run.py'}")
             stage_log = run_dir
             if stage.output:

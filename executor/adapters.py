@@ -456,7 +456,8 @@ class NativeAdapter:
             if renderer in {"egl", "osmesa"}:
                 env = {key: os.environ.get(key) or renderer for key in ("MUJOCO_GL", "PYOPENGL_PLATFORM")}
         environment = cfg.get("environment") or self.environment
-        if not isinstance(environment, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", environment):
+        if not isinstance(environment, str) or not (re.fullmatch(r"[a-zA-Z0-9_.-]+", environment)
+                                                   or Path(environment).is_absolute()):
             raise ValueError("Invalid Conda evaluation environment name.")
         return Stage("eval", environment, args, (output / "eval_info.json",), units,
                      eval_batches=(episodes + batch - 1) // batch, env=env, output=output, auto_flags=automatic)

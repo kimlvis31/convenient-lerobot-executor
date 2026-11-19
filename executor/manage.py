@@ -33,6 +33,7 @@ from adapters import (
 from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
+from runtime_setup import RuntimeSetupFailure
 from runner import (ANSI, StageFailure, available_environments, conda_command, conda_executable, environment_catalog,
                     execute, load_settings, seconds, stage_title, styled)
 
@@ -69,6 +70,23 @@ REFERENCE_MODEL_SIZES = {
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_ROOT = PROJECT_ROOT / "executor/log"
 SCRIPT_ROOT = PROJECT_ROOT / "scripts"
+SOURCE_BENCHMARKS = {"robotwin", "robocasa", "vlabench", "libero_plus"}
+HUB_PATH_VARIABLES = ("HF_HOME", "HF_HUB_CACHE", "HF_TOKEN_PATH", "HF_ASSETS_CACHE", "HF_XET_CACHE")
+MODEL_CACHE_VARIABLES = (*HUB_PATH_VARIABLES, "TORCH_HOME", "TRANSFORMERS_CACHE", "HF_MODULES_CACHE")
+
+
+def simulator_entrypoint(stage):
+    """Add simulator hooks without discarding another native evaluation helper."""
+    helper = str(Path(__file__).with_name("evaluation_cameras.py").resolve())
+    if stage.arguments[0] == "lerobot-eval":
+        stage.arguments[:1] = ["python", "-u", helper]
+        return
+    first_flag = next((index for index, item in enumerate(stage.arguments) if item.startswith("--")),
+                      len(stage.arguments))
+    known = {str(Path(__file__).with_name(name).resolve())
+             for name in ("evaluation_cameras.py", "pinned_policy.py", "parallel_eval.py")}
+    if not any(item in known for item in stage.arguments[:first_flag]):
+        raise RuntimeError("The simulator cannot be attached to an unknown evaluation entry point.")
 
 
 def divider():
@@ -748,19 +766,120 @@ class LeRobotEnvironments:
                 result = subprocess.run(probe, env={**os.environ, **env}, capture_output=True, text=True,
                                         encoding="utf-8", errors="replace", check=True, timeout=30)
                 worker = {"python": python, "env": env, "packages": json.loads(result.stdout)}
-        first_flag = next(i for i, argument in enumerate(stage.arguments) if argument.startswith("--"))
-        stage.arguments[:first_flag] = ["python", "-u", str(Path(__file__).with_name("evaluation_cameras.py").resolve())]
+        simulator_entrypoint(stage)
         stage.env[SIMULATOR_ENV] = json.dumps({"python": worker["python"], "env": worker["env"]})
         notes = [f"RoboMME simulator: separate interpreter {worker['python']}."]
         if packages := worker.get("packages"):
             notes.append("Simulator packages: " + ", ".join(f"{k} {v}" for k, v in packages.items()) + ".")
         return policy, tuple(notes)
 
+    def prepare_source(self, stage, preferred, evaluation, *, model, peft, preview):
+        """Resolve a native policy and a reusable managed source simulator."""
+        kind = evaluation["env"]
+        pinned = bool(evaluation.get("environment"))
+        catalogs = self.catalogs if preview else self.lerobot()
+        shared = [name for name, catalog in catalogs.items()
+                  if catalog.get("manual_status", {}).get(kind, "unavailable") is None
+                  and not catalog.get("runtime_issue") and (not pinned or name == preferred)]
+        if shared:
+            # Reuse an existing verified combined installation before creating
+            # any managed runtime, including a user's own source installation.
+            try:
+                target = self.prepare(preferred, model=model, benchmark=kind, runtime="evaluation",
+                                      peft=peft, pinned=pinned, preview=preview)
+                return target, ()
+            except RuntimeError:
+                pass
+        policy = self.prepare(preferred, model=model, runtime="evaluation", peft=peft,
+                              pinned=pinned, preview=preview)
+        split = kind == "robotwin"
+        if preview:
+            role = "separate simulator" if split else "isolated compatible LeRobot"
+            return policy, (f"{kind}: {role} environment and required source/assets prepared automatically at launch.",
+                            "Existing compatible installations are checked before any download or compilation.")
+
+        # Read the wrapper origin without importing simulator extensions. The
+        # worker consumes exactly the source selected by this policy runtime.
+        wrapper = {"libero_plus": "libero"}.get(kind, kind)
+        probe = (
+            "import hashlib,importlib.util,importlib.metadata,json,os,sys;from pathlib import Path;"
+            "from huggingface_hub import constants as hub;"
+            f"cache_paths={{name:str(getattr(hub,name)) for name in {HUB_PATH_VARIABLES!r} "
+            "if getattr(hub,name,None) is not None};"
+            "cache_paths['TORCH_HOME']=os.path.expanduser(os.environ.get('TORCH_HOME') or "
+            "os.path.join(os.environ.get('XDG_CACHE_HOME') or str(Path.home()/'.cache'),'torch'));"
+            "cache_paths.update({name:os.environ[name] for name in ('TRANSFORMERS_CACHE','HF_MODULES_CACHE') "
+            "if os.environ.get(name)});"
+            "p=Path(next(iter(importlib.util.find_spec('lerobot').submodule_search_locations)))"
+            f"/'envs'/'{wrapper}.py';"
+            "print('CONVLEX_NATIVE_SOURCE '+json.dumps({'source':str(p.resolve()),"
+            "'base_prefix':sys.prefix,"
+            "'source_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),"
+            "'base_signature':hashlib.sha256(json.dumps(sorted((d.metadata.get('Name',''),d.version) "
+            "for d in importlib.metadata.distributions())).encode()).hexdigest(),"
+            "'hub_environment':cache_paths}))"
+        )
+        origin = subprocess.run(conda_command(self.conda, policy, ["python", "-B", "-c", probe]),
+                                cwd=self.root, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=30)
+        line = next((line for line in reversed(origin.stdout.splitlines())
+                     if line.startswith("CONVLEX_NATIVE_SOURCE ")), "")
+        if origin.returncode or not line:
+            reason = origin.stderr.strip() or f"Native {kind} wrapper source was not found."
+            raise RuntimeError(f"Cannot inspect {kind} in {policy}: {reason}")
+        try:
+            source = json.loads(line.partition(" ")[2])
+            if not isinstance(source, dict) or set(source) != {"source", "source_sha256", "base_signature", "base_prefix", "hub_environment"}:
+                raise ValueError("Unexpected native source report.")
+            if not isinstance(source["base_prefix"], str) or not Path(source["base_prefix"]).is_absolute():
+                raise ValueError("The native environment prefix must be an absolute path.")
+            hub_environment = source["hub_environment"]
+            if (not isinstance(hub_environment, dict) or set(hub_environment) - set(MODEL_CACHE_VARIABLES)
+                    or any(not isinstance(value, str) or not value for value in hub_environment.values())):
+                raise ValueError("The native Hub environment must contain only cache and credential file paths.")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"Invalid {kind} wrapper source report in {policy}.") from error
+        if split:
+            from simulator_worker import validate_source
+            validate_source({"kind": kind, **source})
+        from runtime_setup import prepare_runtime
+        options = {"base_environment": policy, **source}
+        if kind == "robocasa":
+            registries = next((item.partition("=")[2] for item in reversed(stage.arguments)
+                               if item.startswith("--env.obj_registries=")), None)
+            if registries is not None:
+                options["obj_registries"] = registries
+        prepared = prepare_runtime(kind, self.conda, options=options)
+        stage.env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+        if policy != preferred:
+            # Dependency resolution may have selected/cloned a better policy
+            # base. Reuse that base next time, never the simulator clone itself.
+            evaluation["environment"] = policy
+        worker_env = dict(prepared["env"])
+        worker_env.setdefault("CONVLEX_SIMULATOR_ROOT", worker_env.get("ROBOTWIN_ROOT", str(prepared["root"])))
+        notes = tuple(prepared.get("notes", ()))
+        if split:
+            from simulator_worker import SIMULATOR_ENV
+            config = {"kind": kind, "python": str(prepared["python"]), "env": worker_env,
+                      "recipe": prepared["recipe"], "source": source["source"],
+                      "source_sha256": source["source_sha256"]}
+            simulator_entrypoint(stage)
+            stage.env[SIMULATOR_ENV] = json.dumps(config)
+            notes = (f"{kind} simulator: separate interpreter {prepared['python']}; policy remains in {policy}.", *notes)
+            return policy, notes
+        target = str(prepared.get("prefix") or Path(prepared["python"]).parent.parent)
+        # Managed simulator prefixes need their recorded source overrides.
+        # Keep them out of the bare named-environment catalog: a later queued
+        # job must pass through prepare_runtime to restore and verify that env.
+        stage.env.update(worker_env)
+        self.selection_reason = f"Managed {kind} runtime prepared from {policy}; verified before evaluation."
+        return target, (f"{kind} simulator and native policy: isolated environment {target}.", *notes)
+
     def packages(self, name, model, runtime, benchmark=None, peft=False, tiny_root=None):
         key = (name, model, runtime, benchmark, peft, tiny_root)
         if key not in self.package_reports:
             groups = {}
-            if self.conda and (not self.names or name in self.names):
+            if self.conda and (not self.names or name in self.names or Path(name).is_absolute()):
                 probe = ["python", "-B", str(Path(__file__).with_name("benchmarks.py")),
                          "--describe-stage", runtime, "--model-name", model]
                 if benchmark:
@@ -958,7 +1077,8 @@ class LeRobotEnvironments:
 
 
 def benchmark_options(kinds):
-    labels = dict(BENCHMARKS)
+    labels = {**dict(BENCHMARKS), "libero_plus": "LIBERO-plus", "robotwin": "RoboTwin",
+              "robocasa": "RoboCasa365", "vlabench": "VLABench", "robomme": "RoboMME"}
     return [(kind, labels.get(kind, kind.replace("_", " ").title()))
             for kind in [*(kind for kind in labels if kind in kinds), *sorted(kinds - labels.keys())]]
 
@@ -983,7 +1103,9 @@ def choose_evaluation_environment(environments, preferred, model, tiny):
     options = ([("libero", "LIBERO (supported by TinyVLA)")] if tiny
                else benchmark_options(installable | installed.keys() | manual))
     missing = {kind for kind, _ in options if kind not in available}
-    reasons = {kind: "Manual Setup" for kind in missing & manual}
+    reasons = {kind: ("Automatic Setup" if sys.platform == "linux" else "Requires Linux")
+               if kind in SOURCE_BENCHMARKS or kind == "robomme" else "Manual Setup"
+               for kind in missing & manual}
     reasons.update({kind: "Model Runtime Missing in " + ", ".join(installed[kind])
                     for kind in missing if kind in installed})
     options = [(kind, f"{label} [{', '.join(available[kind])}]" if kind in available else label)
@@ -998,6 +1120,11 @@ def choose_evaluation_environment(environments, preferred, model, tiny):
     if not names and kind in missing:
         if kind == "robomme" and not tiny:
             print("A separate RoboMME simulator can be selected or prepared automatically at launch.")
+        elif kind in SOURCE_BENCHMARKS and not tiny:
+            if sys.platform == "linux":
+                print("The executor will prepare a compatible environment, source and required simulator assets at launch.")
+            else:
+                print("Automatic source simulator setup requires Linux.")
         elif kind in manual:
             print(f"{kind} requires separate simulator setup.")
             issue = catalogs.get(preferred, {}).get("manual_status", {}).get(kind)
@@ -1475,6 +1602,9 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
             if not tiny and benchmark == "robomme":
                 target, simulator_detail = session.prepare_robomme(stage, preferred, evaluation, model=model,
                                                                   peft=uses_peft, preview=preview)
+            elif not tiny and benchmark in SOURCE_BENCHMARKS:
+                target, simulator_detail = session.prepare_source(stage, preferred, evaluation, model=model,
+                                                                  peft=uses_peft, preview=preview)
             else:
                 target = session.prepare(preferred, model=model, tiny=tiny and not tiny_train, benchmark=benchmark,
                                          pinned=bool(evaluation.get("environment")), peft=uses_peft,
@@ -1510,7 +1640,13 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
         else:
             if not preview and target != preferred:
                 if evaluation:
-                    evaluation["environment"] = target
+                    # Reusable settings describe the user's policy/base
+                    # environment. The resolved prefix and source overrides are
+                    # already recorded in run.py's stage provenance. Persisting
+                    # a managed source prefix as the next clone's base would
+                    # recursively create another runtime on every reuse.
+                    if not (benchmark in SOURCE_BENCHMARKS and Path(target).is_absolute()):
+                        evaluation["environment"] = target
                 else:
                     cfg.setdefault("environments", {})[model] = target
             stage.environment = target
@@ -1675,8 +1811,12 @@ def main():
         report_failure(f"Run failed ({error.description}).", in_job=executing,
                        reason=error.reason, logfile=None if temporary else error.logfile, temporary=temporary)
         return 1
+    except RuntimeSetupFailure as error:
+        report_failure("Environment setup failed.", in_job=executing,
+                       reason=error.reason, logfile=error.logfile)
+        return 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
-            subprocess.TimeoutExpired) as error:
+            subprocess.SubprocessError) as error:
         report_failure(f"Run failed ({error})", in_job=executing)
         return 1
     finally:

@@ -84,7 +84,9 @@ def pinned_entrypoint(stage, reference, revision):
 
             hooks.enter_context(patch.object(lerobot_eval, "make_pre_post_processors", load_processors))
             from robomme_split import simulator_context
-            with simulator_context():
+            from simulator_worker import simulator_context as source_context
+            from evaluation_cameras import simulator_directory
+            with simulator_directory(sys.argv[1:]), simulator_context(), source_context():
                 return lerobot_eval.main()
         if stage != "train":
             raise ValueError(f"Unsupported native stage: {stage}")
