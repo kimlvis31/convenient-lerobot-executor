@@ -425,7 +425,7 @@ class NativeAdapter:
             args.append("--eval.use_async_envs=false")
             automatic = ("eval.use_async_envs",)
         if self.key == "native":
-            mapping = camera_mapping(args)
+            mapping = camera_mapping(args, model=self.settings["model"])
             if mapping:
                 args.append(flag("rename_map", mapping))
                 automatic += ("rename_map",)

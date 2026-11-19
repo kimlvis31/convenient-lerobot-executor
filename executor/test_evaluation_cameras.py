@@ -27,10 +27,10 @@ class EvaluationCameraTests(unittest.TestCase):
         processor = {"steps": [{"registry_name": "rename_observations_processor", "config": {"rename_map": self.mapping}}]}
         (self.model / "policy_preprocessor.json").write_text(json.dumps(processor))
 
-    def stage(self, kind, extra=(), after_training=False):
+    def stage(self, kind, extra=(), after_training=False, model="smolvla"):
         eval_config = {"env": kind, "tasks": ["task"], "policy": str(self.model), "device": "cpu",
                        "episodes": 1, "batch": 1, "seed": 0, "extra": list(extra)}
-        manager = NativeAdapter({"model": "smolvla", "eval": eval_config}, "example", self.root, self.root,
+        manager = NativeAdapter({"model": model, "eval": eval_config}, "example", self.root, self.root,
                                 {"native": "lerobot"})
         return manager.evaluate(after_training)
 
@@ -68,6 +68,33 @@ class EvaluationCameraTests(unittest.TestCase):
             step["config"]["rename_map"] = dict(zip(self.mapping, (f"observation.images.{key}" for key in targets)))
             path.write_text(json.dumps({"steps": [step]}))
             self.assertNotIn("rename_map", self.stage("vlabench").auto_flags)
+
+    def test_empty_saved_maps_use_only_documented_policy_camera_positions(self):
+        cases = [
+            ("libero", "gaussian_actor", ("image", "image2"), ("image", "wrist_image")),
+            ("robotwin", "lingbot_vla_v2", ("head_camera", "left_camera", "right_camera"),
+             ("cam_high", "cam_left_wrist", "cam_right_wrist")),
+        ]
+        for kind, model, sources, targets in cases:
+            with self.subTest(kind=kind):
+                self.checkpoint(sources, targets)
+                config = self.model / "config.json"
+                policy = dict(json.loads(config.read_text()), type=model)
+                config.write_text(json.dumps(policy))
+                processor = self.model / "policy_preprocessor.json"
+                saved = json.loads(processor.read_text())
+                saved["steps"][0]["config"]["rename_map"] = {}
+                processor.write_text(json.dumps(saved))
+                stage = self.stage(kind, model=model)
+                expected = {k: v for k, v in self.mapping.items() if k != v}
+                argument = next(arg for arg in stage.arguments if arg.startswith("--rename_map="))
+                self.assertEqual(json.loads(argument.partition("=")[2]), expected)
+                self.assertIn("rename_map", stage.auto_flags)
+                for custom in ("--rename_map={}", "--env.camera_names=head_camera", "--env.camera_name_mapping={}"):
+                    self.assertNotIn("rename_map", self.stage(kind, [custom], model=model).auto_flags)
+                policy["input_features"].pop(next(iter(expected.values())))
+                config.write_text(json.dumps(policy))
+                self.assertNotIn("rename_map", self.stage(kind, model=model).auto_flags)
 
     def test_after_training_has_a_deferred_lookup_and_respects_manual_override(self):
         stage = self.stage("vlabench", after_training=True)

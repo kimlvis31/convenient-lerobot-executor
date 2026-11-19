@@ -7,8 +7,20 @@ import sys
 
 # Raw camera names declared by the corresponding LeRobot environment configs.
 ENVIRONMENT_CAMERAS = {
+    "libero": ("image", "image2"),
     "robocasa": ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"),
+    "robotwin": ("head_camera", "left_camera", "right_camera"),
     "vlabench": ("image", "second_image", "wrist_image"),
+}
+
+# Verified camera positions for checkpoints that save an empty rename step.
+# LIBERO maps the eye-in-hand camera to image2. The published RoboTwin
+# LingBot policy uses its head and two wrist cameras in this order.
+POLICY_CAMERA_ALIASES = {
+    "libero": ("gaussian_actor", {"image": "image", "image2": "wrist_image"}),
+    "robotwin": ("lingbot_vla_v2", {
+        "head_camera": "cam_high", "left_camera": "cam_left_wrist", "right_camera": "cam_right_wrist",
+    }),
 }
 
 
@@ -40,15 +52,21 @@ def checkpoint_directory(reference, revision, *, download):
         return None
 
 
-def camera_mapping(arguments, *, download=False):
+def camera_mapping(arguments, *, download=False, model=None):
     """Return a verified map, {} if none applies, or None if the checkpoint is pending."""
     options = dict(arg[2:].split("=", 1) for arg in arguments if arg.startswith("--") and "=" in arg)
     kind = options.get("env.type")
     reference = options.get("policy.path")
     if kind not in ENVIRONMENT_CAMERAS or not reference:
         return {}
+    aliases = POLICY_CAMERA_ALIASES.get(kind)
+    if aliases and model is not None and model != aliases[0]:
+        return {}
+    overrides = ("rename_map", "env.features", "env.features_map", "policy.input_features")
+    if aliases:
+        overrides += ("env.camera_name", "env.camera_names", "env.camera_name_mapping")
     if any(key == field or key.startswith(field + ".") for key in options
-           for field in ("rename_map", "env.features", "env.features_map", "policy.input_features")):
+           for field in overrides):
         return {}
     names = ENVIRONMENT_CAMERAS[kind]
     if kind == "robocasa" and "env.camera_name" in options:
@@ -77,6 +95,10 @@ def camera_mapping(arguments, *, download=False):
     mapping = renames[0].get("rename_map")
     if not isinstance(mapping, dict):
         return {}
+    if not mapping and aliases and policy.get("type") == aliases[0]:
+        expected = {f"observation.images.{src}": f"observation.images.{dst}" for src, dst in aliases[1].items()}
+        if visual == set(expected.values()):
+            mapping = expected
     mapping = {name: target for name, target in mapping.items()
                if name in cameras and isinstance(target, str) and target in visual and name != target}
     renamed = {mapping.get(name, name) for name in cameras}
