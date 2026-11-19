@@ -27,9 +27,11 @@ conda run -n lerobot lerobot-train --help
 conda create -n tinyvla_infer python=3.10 pip
 conda run -n tinyvla_infer python -m pip install -r externals/TinyVLA/sources/TinyVLA/requirements.txt
 conda run -n tinyvla_infer python -c "import torch; assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()"
-conda run -n lerobot python -m pip install --no-deps --no-build-isolation \
+conda run -n lerobot python -m pip install --no-deps --no-build-isolation --editable \
   "./externals/TinyVLA/lerobot_policy_tinyvla"
 ```
+
+평가 연결 패키지를 편집 가능 모드로 설치하면 `git pull`로 응용 프로그램과 연결 코드가 함께 갱신되며, 이전에 패키지 복사본으로 설치했다면 위 연결 패키지 설치 명령을 한 번 다시 실행하면 됩니다.
 
 LeRobot 기본 모델만 사용한다면 별도 모델 환경과 아래 TinyVLA(Vision-Language-Action, 시각·언어·행동 모델) 예제 준비 단계는 건너뛸 수 있습니다.
 

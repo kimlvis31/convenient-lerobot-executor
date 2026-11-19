@@ -43,9 +43,11 @@ TinyVLA runs in a separate model environment. The verified setup used Python 3.1
 conda create -n tinyvla_infer python=3.10 pip
 conda run -n tinyvla_infer python -m pip install -r externals/TinyVLA/sources/TinyVLA/requirements.txt
 conda run -n tinyvla_infer python -c "import torch; assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()"
-conda run -n lerobot python -m pip install --no-deps --no-build-isolation \
+conda run -n lerobot python -m pip install --no-deps --no-build-isolation --editable \
   "./externals/TinyVLA/lerobot_policy_tinyvla"
 ```
+
+Install the bundled evaluation bridge in editable mode so `git pull` updates the application and bridge directly; if an older setup installed a copied package, rerun the bridge installation command above once.
 
 ## Prepare and run the examples
 

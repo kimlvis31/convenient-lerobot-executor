@@ -18,8 +18,10 @@ See [third-party sources](../../THIRD_PARTY.md) for upstream code and model asse
 Use a LeRobot environment with the LIBERO benchmark. Install the evaluation adapter in the `lerobot` environment. Model inference requires a `tinyvla_infer` or `lerobot_tinyvla` environment and a device that supports bfloat16. The worker records its package versions in `ready.json`.
 
 ```bash
-conda run -n lerobot python -m pip install --no-deps --no-build-isolation "$HOME/convLexecutor/externals/TinyVLA/lerobot_policy_tinyvla"
+conda run -n lerobot python -m pip install --no-deps --no-build-isolation --editable "$HOME/convLexecutor/externals/TinyVLA/lerobot_policy_tinyvla"
 ```
+
+Editable installation lets `git pull` update the application and bundled evaluation bridge directly; rerun this bridge installation command once to replace an older copied-package installation.
 
 The default model directory, `models/Llava-Pythia-700M/`, needs the original `model.safetensors`, `tokenizer.json`, and model configuration. To use an existing copy elsewhere, give its directory to the executor or pass `--policy.model_path` to LeRobot.
 
