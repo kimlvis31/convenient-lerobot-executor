@@ -377,11 +377,18 @@ def environment_catalog():
         manual_status["libero_plus"] = libero_plus_issue()
     for name in SIMULATOR_REQUIREMENTS.keys() & set(manual):
         manual_status[name] = simulator_runtime_issue(name)
+    split_robomme = False
+    if "robomme" in env_types:
+        try:
+            from lerobot.envs import robomme
+            split_robomme = callable(getattr(robomme, "_make_env_fns", None))
+        except (ImportError, OSError):
+            pass
     peft_requirements = optional_requirements(distribution, "peft")
     runtime = {extra: all(installed(req, versions) for req in optional_requirements(distribution, extra))
                for extra in LEROBOT_RUNTIME_EXTRAS}
     return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
-            "manual_status": manual_status, "runtime": runtime,
+            "manual_status": manual_status, "runtime": runtime, "split_robomme": split_robomme,
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
             "peft_ready": "peft" in versions and all(installed(req, versions) for req in peft_requirements),
             "peft_installable": bool(peft_requirements),

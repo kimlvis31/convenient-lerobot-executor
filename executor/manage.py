@@ -574,6 +574,16 @@ def eval_settings(model, tiny, train, inventory, env_type):
             cfg["task_ids"] = evaluation_task_ids(tasks[0], default_id, env_type)
     if env_type in EPISODE_LENGTH_BENCHMARKS:
         cfg["episode_length"] = number("Episode Length (maximum control steps, 0 uses benchmark default)", 0, 0)
+    if env_type == "robomme" and not tiny:
+        cfg["robomme_runtime"] = choose("RoboMME Runtime", [
+            ("auto", "Use a compatible combined environment, otherwise separate the simulator"),
+            ("split", "Use a separate simulator environment"),
+            ("shared", "Require a combined policy and simulator environment"),
+        ])
+        if cfg["robomme_runtime"] == "split":
+            simulator = ask("Simulator Conda Name or Prefix (blank for automatic selection)", optional=True)
+            if simulator:
+                cfg["simulator_environment"] = simulator
     if env_type in LIBERO_BENCHMARKS:
         cfg.update(control="relative" if tiny else ask("Control Mode", "absolute" if model == "xvla" else "relative"),
                    size=256 if tiny else number("Camera Image Width and Height", 448 if model == "evo1" else 256))
@@ -669,8 +679,82 @@ class LeRobotEnvironments:
         self.preferred = preferred
         self.names = set(names)
         self.catalogs = {}
+        self.simulators = {}
+        self.simulator_issues = {}
         self.package_reports = {}
         self.selection_reason = ""
+
+    def simulator(self, name):
+        if name not in self.simulators:
+            script = str(Path(__file__).with_name("robomme_split.py"))
+            selector = "--prefix" if Path(name).is_absolute() else "--name"
+            command = [self.conda, "run", "--no-capture-output", selector, name, "python", "-B", script, "--inspect"]
+            try:
+                run = subprocess.run(command, cwd=self.root, capture_output=True, text=True, encoding="utf-8",
+                                     errors="replace", timeout=75)
+                entry = next((line for line in reversed(run.stdout.splitlines()) if line.startswith("ROBOMME_SIMULATOR ")), "")
+                self.simulators[name] = json.loads(entry.partition(" ")[2]) if entry and run.returncode == 0 else None
+                if not self.simulators[name]:
+                    errors = [line for line in run.stderr.splitlines() if not line.startswith("ERROR conda.")]
+                    self.simulator_issues[name] = errors[-1] if errors else "RoboMME runtime or assets missing."
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self.simulators[name] = None
+                self.simulator_issues[name] = str(error)
+        return self.simulators[name]
+
+    def prepare_robomme(self, stage, preferred, evaluation, *, model, peft, preview):
+        from robomme_split import SIMULATOR_ENV
+
+        pinned = bool(evaluation.get("environment"))
+        name = evaluation.get("simulator_environment")
+        mode = evaluation.get("robomme_runtime", "auto")
+        catalogs = self.catalogs if preview else self.lerobot()
+        shared = [key for key, catalog in catalogs.items()
+                  if catalog.get("manual_status", {}).get("robomme", "unavailable") is None
+                  and not catalog.get("runtime_issue") and (not pinned or key == preferred)]
+        if mode == "shared" or (mode == "auto" and not name and shared):
+            try:
+                if not shared and not preview:
+                    raise RuntimeError("No combined environment has a verified RoboMME simulator.")
+                policy = self.prepare(preferred, model=model, benchmark="robomme", runtime="evaluation",
+                                      peft=peft, pinned=pinned, preview=preview)
+                return policy, ()
+            except RuntimeError:
+                if mode == "shared":
+                    raise
+        policy = self.prepare(preferred, model=model, runtime="evaluation", peft=peft, pinned=pinned, preview=preview)
+        if preview:
+            detail = (f"separate Conda environment {name}" if name else
+                      "separate environment selected or prepared at launch")
+            if mode == "auto" and not name:
+                detail = "combined environment if compatible, otherwise " + detail
+            return policy, (f"RoboMME simulator: {detail}.",
+                            "Simulator packages: RoboMME, ManiSkill, NumPy, Gymnasium, SAPIEN, PyTorch, torchvision.")
+        if not self.catalog(policy).get("split_robomme"):
+            raise RuntimeError(f"Cannot verify the native RoboMME Gym adapter in policy environment {policy}. "
+                               "Select a LeRobot version that provides RoboMME evaluation.")
+        if name:
+            worker = self.simulator(name)
+            if not worker:
+                raise RuntimeError(f"Cannot use RoboMME simulator {name}: "
+                                   f"{self.simulator_issues.get(name, 'runtime or assets missing')}")
+        else:
+            worker = next((found for candidate in sorted(self.names)
+                           if (found := self.simulator(candidate)) is not None), None)
+            if not worker:
+                from robomme_setup import prepare_simulator
+                python, env = prepare_simulator(self.conda)
+                probe = [python, "-B", str(Path(__file__).with_name("robomme_split.py")), "--versions"]
+                result = subprocess.run(probe, env={**os.environ, **env}, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace", check=True, timeout=30)
+                worker = {"python": python, "env": env, "packages": json.loads(result.stdout)}
+        first_flag = next(i for i, argument in enumerate(stage.arguments) if argument.startswith("--"))
+        stage.arguments[:first_flag] = ["python", "-u", str(Path(__file__).with_name("evaluation_cameras.py").resolve())]
+        stage.env[SIMULATOR_ENV] = json.dumps({"python": worker["python"], "env": worker["env"]})
+        notes = [f"RoboMME simulator: separate interpreter {worker['python']}."]
+        if packages := worker.get("packages"):
+            notes.append("Simulator packages: " + ", ".join(f"{k} {v}" for k, v in packages.items()) + ".")
+        return policy, tuple(notes)
 
     def packages(self, name, model, runtime, benchmark=None, peft=False, tiny_root=None):
         key = (name, model, runtime, benchmark, peft, tiny_root)
@@ -912,7 +996,9 @@ def choose_evaluation_environment(environments, preferred, model, tiny):
         kind = ask("LeRobot Environment Type")
     names = available.get(kind, [])
     if not names and kind in missing:
-        if kind in manual:
+        if kind == "robomme" and not tiny:
+            print("A separate RoboMME simulator can be selected or prepared automatically at launch.")
+        elif kind in manual:
             print(f"{kind} requires separate simulator setup.")
             issue = catalogs.get(preferred, {}).get("manual_status", {}).get(kind)
             if issue:
@@ -1385,9 +1471,14 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
             preferred = evaluation.get("environment") or (native if tiny else cfg.get("environments", {}).get(model, native))
             runtime = "evaluation" if evaluation else "training"
         try:
-            target = session.prepare(preferred, model=model, tiny=tiny and not tiny_train, benchmark=benchmark,
-                                     pinned=bool(evaluation.get("environment")), peft=uses_peft,
-                                     runtime=runtime, preview=preview)
+            simulator_detail = None
+            if not tiny and benchmark == "robomme":
+                target, simulator_detail = session.prepare_robomme(stage, preferred, evaluation, model=model,
+                                                                  peft=uses_peft, preview=preview)
+            else:
+                target = session.prepare(preferred, model=model, tiny=tiny and not tiny_train, benchmark=benchmark,
+                                         pinned=bool(evaluation.get("environment")), peft=uses_peft,
+                                         runtime=runtime, preview=preview)
             reason = session.selection_reason
         except RuntimeError as error:
             if not preview:
@@ -1395,7 +1486,9 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
             target, reason = preferred, f"Cannot confirm readiness: {error}"
         role = "LeRobot dataset reader" if tiny_train else f"LeRobot {runtime}"
         notes.append(f"{role}: {target}. {reason}")
-        groups = session.packages(target, model, runtime, benchmark, uses_peft)
+        if simulator_detail:
+            notes.extend(simulator_detail)
+        groups = session.packages(target, model, runtime, None if simulator_detail else benchmark, uses_peft)
         if not tiny_train:
             key = "TinyVLA bridge" if tiny else "Policy requirements"
             if key not in groups:
@@ -1403,7 +1496,7 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
                 detail = "LeRobot core; no extra declared" if groups.get("LeRobot runtime") and session.catalogs.get(
                     target, {}).get("policies", {}).get(model) else "requirements unverified"
                 notes.append(f"Model {model} ({scope}): {detail}.")
-        if benchmark and f"Simulator {benchmark}" not in groups:
+        if benchmark and not simulator_detail and f"Simulator {benchmark}" not in groups:
             notes.append(f"Simulator {benchmark}: package requirements unverified.")
         notes.extend(package_lines(groups, f"LeRobot {runtime} packages"))
         previous_notes = stage.environment_notes

@@ -354,6 +354,17 @@ class NativeAdapter:
         cfg = self.settings["eval"]
         output = self.eval_dir
         kind, tasks = cfg["env"], cfg["tasks"]
+        if "robomme_runtime" in cfg or "simulator_environment" in cfg:
+            if kind != "robomme" or self.key != "native":
+                raise ValueError("The RoboMME runtime settings apply only to native RoboMME evaluation.")
+            mode = cfg.get("robomme_runtime", "auto")
+            if mode not in ("auto", "shared", "split"):
+                raise ValueError("Set robomme_runtime to auto, shared, or split.")
+            if "simulator_environment" in cfg:
+                name = cfg["simulator_environment"]
+                if (mode == "shared" or not isinstance(name, str)
+                        or not (Path(name).is_absolute() or re.fullmatch(r"[a-zA-Z0-9_.-]+", name))):
+                    raise ValueError("Specify a simulator Conda name or absolute prefix for a split RoboMME run.")
         if not isinstance(tasks, (list, tuple)) or not tasks or any(
             not isinstance(task, str) or not task.strip() for task in tasks
         ):

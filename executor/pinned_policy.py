@@ -83,7 +83,9 @@ def pinned_entrypoint(stage, reference, revision):
                 return original_processors(*args, **kwargs)
 
             hooks.enter_context(patch.object(lerobot_eval, "make_pre_post_processors", load_processors))
-            return lerobot_eval.main()
+            from robomme_split import simulator_context
+            with simulator_context():
+                return lerobot_eval.main()
         if stage != "train":
             raise ValueError(f"Unsupported native stage: {stage}")
         from lerobot.policies import pretrained

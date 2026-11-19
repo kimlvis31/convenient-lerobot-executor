@@ -118,9 +118,11 @@ def restore_camera_arguments():
 
 def main():
     from lerobot.scripts.lerobot_eval import main as evaluate
+    from robomme_split import simulator_context
 
     restore_camera_arguments()
-    return evaluate()
+    with simulator_context():
+        return evaluate()
 
 
 if __name__ == "__main__":

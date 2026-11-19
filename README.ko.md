@@ -69,6 +69,14 @@ Training Scope는 선택한 모델의 학습 범위 조합을 한 목록에 표�
 
 설치 작업을 에이전트에게 맡길 때는 [AGENTS.md](AGENTS.md)를 사용하세요.
 
+## RoboMME 평가
+
+대화형 평가에서 **RoboMME**를 선택하거나 네이티브 작업의 `eval.env`를 `"robomme"`로 지정한다. `eval.robomme_runtime`의 기본값은 `"auto"`다. 실행기는 정책과 시뮬레이터를 함께 실행할 수 있는 환경을 먼저 찾는다. 의존성이 충돌하면 기존 LeRobot 환경에서 정책을 실행하고 별도 환경에서 시뮬레이터를 실행한다. 영상, 통계, 실행 로그는 공식 LeRobot 평가기가 생성한다.
+
+처음 분리 실행할 때 기존 Conda 환경을 검색하고, 필요한 경우 Linux 사용자 캐시에 시뮬레이터 환경을 새로 만든다. 자동 설치에는 인터넷 연결, CUDA(Compute Unified Device Architecture, 엔비디아 병렬 연산 플랫폼) 12.6 이상을 지원하는 드라이버, 작동하는 Vulkan 렌더러가 필요하다. 실제 물리 한 스텝을 확인한 환경을 재사용한다. 저장 위치는 `CONVLEX_ROBOMME_CACHE`로 지정하고 실행 화면에서 시뮬레이터 Python 경로를 확인할 수 있다.
+
+합쳐진 환경을 명시적으로 요구하려면 `eval.robomme_runtime`을 `"shared"`로, 두 프로세스를 사용하려면 `"split"`으로 지정한다. `eval.simulator_environment`에는 기존 시뮬레이터 Conda 환경 이름이나 절대 경로를, `eval.environment`에는 정책 환경을 지정한다. [공식 RoboMME 설치 및 태스크 번호 안내](https://huggingface.co/docs/lerobot/main/robomme)
+
 ## 라이선스
 
 프로젝트 자체 코드는 MIT(Massachusetts Institute of Technology, 매사추세츠 공과대학) 라이선스를 따릅니다. 외부 소스와 공개 데이터는 각각의 원래 라이선스를 따릅니다. [프로젝트 라이선스](LICENSE) · [외부 소스와 라이선스](THIRD_PARTY.md)

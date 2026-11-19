@@ -70,7 +70,12 @@ def available_environments(conda, root):
                                 text=True, encoding="utf-8", errors="replace", timeout=15, check=True)
         info = json.loads(result.stdout)
         base = Path(info["root_prefix"]) if info.get("root_prefix") else None
-        return {"base" if path == base else path.name for path in map(Path, info["envs"])}
+        directories = info.get("envs_dirs")
+        if directories is None and base is not None:
+            directories = [base / "envs"]
+        directories = {Path(path) for path in directories or ()}
+        return {"base" if path == base else path.name for path in map(Path, info["envs"])
+                if path == base or path.parent in directories}
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         return set()
 
@@ -856,6 +861,8 @@ def run_job(job, run_dir):
             if index:
                 print()
             print_status_detail(stage_title(stage, settings["model"]))
+            if worker := stage.env.get("CONVLEX_ROBOMME_WORKER"):
+                print_status_detail(f"RoboMME simulator Python: {json.loads(worker)['python']}")
             print_status_detail(f"Run script: {run_dir / 'run.py'}")
             stage_log = run_dir
             if stage.output:

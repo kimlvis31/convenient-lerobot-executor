@@ -71,6 +71,10 @@ JOBS = [
             "episode_length": 0,  # Optional. Simulator default when 0.
             "control": "relative",  # Required for LIBERO. Match the checkpoint's action controller.
             "size": 256,  # Required for LIBERO. Square camera input size in pixels.
+            # For a matching RoboMME checkpoint, set env="robomme", tasks=["PickXtimes"].
+            # Optional RoboMME-only keys may then be added to this eval dictionary.
+            # "robomme_runtime": "auto",  # auto/shared/split. Auto reuses or prepares compatible runtimes.
+            # "simulator_environment": None,  # Existing simulator Conda name or absolute prefix. None discovers it.
             "environment": None,  # Optional. Conda override. None selects a compatible environment.
             "extra": [],  # Optional. Additional LeRobot options in --name=value form.
         },

@@ -13,6 +13,13 @@
 # A job can contain train, eval, or both. With both present, evaluation uses
 # the checkpoint produced by that job's training stage.
 # The dataset and checkpoints below are example assets under the convLexecutor root.
+# For a native SmolVLA RoboMME job, use a matching policy checkpoint such as
+# "lerobot/smolvla_robomme", eval.env="robomme", and eval.tasks=["PickXtimes"].
+# Optional eval.robomme_runtime is "auto" (reuse or prepare), "shared", or "split".
+# Optional eval.simulator_environment selects a simulator Conda name or absolute
+# prefix. Leave it unset for automatic selection. eval.environment selects the
+# policy environment. See format_smolvla.py for the native job dictionary layout.
+
 JOBS = [
     {
         "label": "Base model: parallel evaluation of tasks 1 and 2",  # Name shown in the queue.

@@ -81,6 +81,14 @@ Choose **N** at **Save Job Outputs?** to run in temporary storage and see the re
 
 See the [executor guide](executor/README.md), [TinyVLA guide](externals/TinyVLA/README.md), and [agent setup guide](AGENTS.md) for more details.
 
+## RoboMME evaluation
+
+Choose **RoboMME** in the evaluation wizard or set `eval.env` to `"robomme"` in a native job. The default `eval.robomme_runtime` is `"auto"`. The executor first looks for a combined environment that can run both the policy and the simulator. If those dependencies conflict, it runs the policy in the native LeRobot environment and starts simulation workers in a separate environment. The official LeRobot evaluator still produces the video, metrics, and execution log.
+
+The first split run searches installed Conda environments before building a simulator under the user cache on Linux. The managed installation needs network access, an NVIDIA driver compatible with CUDA 12.6 or newer, and a working Vulkan renderer. It tests one physical step before reuse. Set `CONVLEX_ROBOMME_CACHE` to choose the installation directory. The execution screen shows the simulator Python path.
+
+Set `eval.robomme_runtime` to `"shared"` to require a combined environment, or `"split"` to request separate processes. Set `eval.simulator_environment` to a Conda environment name or an absolute prefix to select an existing simulator explicitly. `eval.environment` selects the policy environment. [Official RoboMME setup and task IDs](https://huggingface.co/docs/lerobot/main/robomme)
+
 ## License
 
 The first-party project is under [MIT](LICENSE). See [third-party sources](THIRD_PARTY.md) for bundled upstream software and public assets.

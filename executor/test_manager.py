@@ -940,6 +940,15 @@ class ManagerTests(unittest.TestCase):
         with patch("runner.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(listing))):
             self.assertEqual(available_environments("conda", self.root), {"base", "robot"})
 
+    def test_managed_prefix_is_not_advertised_as_a_named_conda_environment(self):
+        prefix = self.root / "miniconda3"
+        user_envs = self.root / "user-envs"
+        listing = {"root_prefix": str(prefix), "envs_dirs": [str(prefix / "envs"), str(user_envs)],
+                   "envs": [str(prefix), str(prefix / "envs/robot"), str(user_envs / "custom"),
+                            str(self.root / "runtime/conda-worker")]}
+        with patch("runner.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(listing))):
+            self.assertEqual(available_environments("conda", self.root), {"base", "robot", "custom"})
+
     def test_native_lora_inventory_requires_weights_and_complete_training_state(self):
         model = self.root / "outputs/training/run/train/checkpoints/003/pretrained_model"
         model.mkdir(parents=True)
