@@ -435,7 +435,11 @@ class NativeAdapter:
                 args[:len(command)] = ["python", "-u", str(helper)]
         headless_mujoco = (kind in {"aloha", "robocasa", "vlabench"} and sys.platform == "linux"
                            and not (os.environ.get("DISPLAY") or os.environ.get("MUJOCO_GL")))
-        env = {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"} if kind in LIBERO_BENCHMARKS or headless_mujoco else {}
+        env = {}
+        if kind in LIBERO_BENCHMARKS or headless_mujoco:
+            renderer = os.environ.get("MUJOCO_GL") or os.environ.get("PYOPENGL_PLATFORM") or "egl"
+            if renderer in {"egl", "osmesa"}:
+                env = {key: os.environ.get(key) or renderer for key in ("MUJOCO_GL", "PYOPENGL_PLATFORM")}
         environment = cfg.get("environment") or self.environment
         if not isinstance(environment, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", environment):
             raise ValueError("Invalid Conda evaluation environment name.")

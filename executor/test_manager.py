@@ -1168,6 +1168,23 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(failure.reason, "CUDA out of memory. Requested 16.00 MiB with 15.38 MiB free.")
         self.assertEqual(failure.logfile, logfile)
 
+    def test_explicitly_ignored_cleanup_errors_do_not_hide_the_stage_failure(self):
+        logfile = self.root / "eval.log"
+        ignored = ("Exception ignored in: <function Context.__del__ at 0x01234>\n"
+                   "Traceback (most recent call last):\n  File \"render.py\", line 8, in __del__\n"
+                   "    self.context.free()\nAttributeError: missing context\n")
+        error = "ImportError: Cannot initialize the renderer."
+        for log, expected in (
+            (error + "\n" + ignored + ignored, error),
+            (ignored + "Traceback (most recent call last):\n" + error + "\n", error),
+            (ignored, "AttributeError: missing context"),
+        ):
+            with self.subTest(log=log):
+                logfile.write_text(log, encoding="utf-8")
+                failure = StageFailure("eval", 1, logfile)
+                self.assertEqual(failure.reason, expected)
+                self.assertIn(str(logfile), str(failure))
+
     def test_tokenizer_wrapper_shows_the_chained_cause_and_full_log_path(self):
         logfile = self.root / "eval.log"
         wrapper = "RuntimeError: Failed to load required tokenizers for PI0FastPolicy initialization"
@@ -1318,6 +1335,21 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(any(arg.startswith("--env.episode_length=") for arg in adapter.evaluate(False).arguments))
         self.assertIn("[Default: PushT-v0]", menu.getvalue())
 
+    def test_libero_honors_the_selected_mujoco_renderer(self):
+        settings = sample_settings()
+        settings["eval"]["policy"] = "lerobot/smolvla_libero"
+        adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
+        for renderer, platform, expected in (
+            ("", "", {"MUJOCO_GL": "egl", "PYOPENGL_PLATFORM": "egl"}),
+            ("osmesa", "", {"MUJOCO_GL": "osmesa", "PYOPENGL_PLATFORM": "osmesa"}),
+            ("", "osmesa", {"MUJOCO_GL": "osmesa", "PYOPENGL_PLATFORM": "osmesa"}),
+            ("glfw", "glx", {}),
+        ):
+            with self.subTest(renderer=renderer, platform=platform), patch.dict(
+                "os.environ", {"MUJOCO_GL": renderer, "PYOPENGL_PLATFORM": platform}
+            ):
+                self.assertEqual(adapter.evaluate(False).env, expected)
+
     def test_libero_plus_routes_selected_variants_and_preserves_manual_environment(self):
         settings = sample_settings()
         config = settings["eval"]
@@ -1325,7 +1357,8 @@ class ManagerTests(unittest.TestCase):
                       task_ids=[0, 21], control="absolute", size=224, episode_length=5,
                       policy="lerobot/smolvla_libero", environment="custom_libero_plus")
         adapter = NativeAdapter(settings, "run", self.root, self.external, self.envs)
-        stage = adapter.evaluate(False)
+        with patch.dict("os.environ", {"MUJOCO_GL": "", "PYOPENGL_PLATFORM": ""}):
+            stage = adapter.evaluate(False)
         self.assertEqual(stage.environment, "custom_libero_plus")
         self.assertEqual(stage.units, 8)
         self.assertEqual(stage.env["MUJOCO_GL"], "egl")

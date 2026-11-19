@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from adapters import native_peft_checkpoint, native_training_step, read_json, require, weights
+from checkpoint_compat import legacy_tdmpc_config
 from runner import run_log_directories, styled
 
 
@@ -87,6 +88,8 @@ def scan(root, external, log_root):
             policy = train.get("policy")
             kind = policy.get("type") if isinstance(policy, dict) else None
             model = "tinyvla" if tiny else kind or config.get("type")
+            if model is None and legacy_tdmpc_config(config) is not None:
+                model = "tdmpc"
             if not isinstance(model, str):
                 continue
             resolved = path.resolve()

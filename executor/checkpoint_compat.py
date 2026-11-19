@@ -8,7 +8,7 @@ import shutil
 import re
 
 
-LEGACY_POLICIES = frozenset({"diffusion", "vqbet"})
+LEGACY_POLICIES = frozenset({"diffusion", "vqbet", "tdmpc"})
 PROCESSORS = ("policy_preprocessor.json", "policy_postprocessor.json")
 WEIGHTS = "model.safetensors"
 RESULT_PREFIX = "MANAGER_CHECKPOINT "
@@ -71,11 +71,56 @@ def validate_processor_states(reference):
         )
 
 
+def legacy_tdmpc_config(config):
+    """Translate the original TD-MPC feature and normalization schema."""
+    if (not isinstance(config, dict) or config.get("type") not in (None, "tdmpc")
+            or not {"cem_iterations", "q_ensemble_size", "n_gaussian_samples"} <= config.keys()
+            or {"input_features", "output_features", "normalization_mapping"} & config.keys()):
+        return None
+    result = dict(config, type="tdmpc")
+    modes = {}
+    encoded_names = set()
+    for group in ("input", "output"):
+        shapes = result.pop(f"{group}_shapes", None)
+        normalizations = result.pop(f"{group}_normalization_modes", None)
+        if (not isinstance(shapes, dict) or not shapes or not isinstance(normalizations, dict)
+                or shapes.keys() != normalizations.keys()):
+            return None
+        features = {}
+        for name, shape in shapes.items():
+            if not isinstance(name, str) or not isinstance(shape, list) or not shape:
+                return None
+            if not all(type(size) is int and size > 0 for size in shape):
+                return None
+            if group == "output":
+                kind = "ACTION" if name == "action" else None
+            elif name == "observation.image" or name.startswith("observation.images."):
+                kind = "VISUAL"
+            else:
+                kind = {"observation.state": "STATE", "observation.environment_state": "ENV"}.get(name)
+            mode = normalizations[name]
+            if not kind or not isinstance(mode, str) or mode.upper() not in {"IDENTITY", "MIN_MAX", "MEAN_STD"}:
+                return None
+            mode = mode.upper()
+            # Old buffers flattened dots and underscores into the same namespace.
+            encoded = name.replace(".", "_")
+            if encoded in encoded_names or (kind in modes and modes[kind] != mode):
+                return None
+            encoded_names.add(encoded)
+            modes[kind] = mode
+            features[name] = {"type": kind, "shape": shape}
+        result[f"{group}_features"] = features
+    result["normalization_mapping"] = modes
+    return result
+
+
 def _read_config(path, model):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if model == "tdmpc" and isinstance(data, dict) and "input_shapes" in data:
+        return legacy_tdmpc_config(data)
     return data if isinstance(data, dict) and data.get("type") == model else None
 
 
@@ -147,6 +192,17 @@ def _check_normalization(config, stats):
                 raise ValueError(f"Legacy checkpoint has incomplete or unsupported normalization for {name}.")
 
 
+def _normalization_stats(migration, state, config):
+    stats = migration.extract_normalization_stats(state)
+    if config["type"] == "tdmpc":
+        # The LeRobot migration decodes every underscore as a dot. Preserve the
+        # actual feature names recorded by the checkpoint (e.g. environment_state).
+        names = {name.replace("_", "."): name for group in ("input_features", "output_features")
+                 for name in config.get(group, {})}
+        stats = {names.get(key, key): value for key, value in stats.items()}
+    return stats
+
+
 def write_processor_view(destination, fetch, replacements):
     """Build a private checkpoint view while retaining the published weights and processor state."""
     destination = Path(destination)
@@ -212,7 +268,7 @@ def prepare_checkpoint(reference, model, destination, revision=None, stage=None)
 
     config, weights = source
     state = load_file(str(weights), device="cpu")
-    stats = migration.extract_normalization_stats(state)
+    stats = _normalization_stats(migration, state, config)
     _check_normalization(config, stats)
     if model == "vqbet":
         # This older field has no matching parameter in the current VQ-BeT.

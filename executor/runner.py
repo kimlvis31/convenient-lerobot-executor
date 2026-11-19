@@ -444,6 +444,19 @@ def stage_failure_reason(logfile):
     exception_line = re.compile(
         r"((?:[A-Za-z_]\w*\.)*(?:[A-Z]\w*(?:Error|Exception)|Error|Exception|OfflineModeIsEnabled)):\s*(.*)"
     )
+    ignored_errors = set()
+    for index, line in enumerate(lines[:-1]):
+        if not line.startswith("Exception ignored in:"):
+            continue
+        start = index + 1
+        if lines[start].startswith("Traceback (most recent call last)"):
+            start += 1
+        for position in range(start, len(lines)):
+            if exception_line.fullmatch(lines[position]):
+                ignored_errors.add(position)
+                break
+            if not lines[position] or lines[position].startswith(("Traceback ", "Exception ignored in:")):
+                break
     chain_markers = {
         "The above exception was the direct cause of the following exception:",
         "During handling of the above exception, another exception occurred:",
@@ -519,6 +532,10 @@ def stage_failure_reason(logfile):
         if match:
             error, detail = match.groups()
             error_type = error.rsplit(".", 1)[-1]
+            if index in ignored_errors:
+                if diagnostic is None:
+                    diagnostic = compact(line, 320)
+                continue
             if error_type in {"CalledProcessError", "ChildFailedError"}:
                 continue
             if error_type in {"BrokenPipeError", "ConnectionResetError"}:

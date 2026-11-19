@@ -69,6 +69,36 @@ class CheckpointCompatibilityTests(unittest.TestCase):
             header.assert_called_once()
         self.assertFalse(self.destination.exists())
 
+    def test_early_tdmpc_config_and_state_preserve_environment_feature(self):
+        from checkpoint_compat import _check_normalization, _normalization_stats, legacy_tdmpc_config
+        from inventory import scan
+
+        original = {"cem_iterations": 6, "q_ensemble_size": 5, "n_gaussian_samples": 512, "latent_dim": 50,
+                    "input_shapes": {"observation.state": [2], "observation.environment_state": [16]},
+                    "input_normalization_modes": {"observation.state": "min_max", "observation.environment_state": "min_max"},
+                    "output_shapes": {"action": [2]}, "output_normalization_modes": {"action": "min_max"}}
+        config = legacy_tdmpc_config(original)
+        self.assertEqual(config["type"], "tdmpc")
+        self.assertEqual(config["latent_dim"], 50)
+        self.assertEqual(config["input_features"]["observation.environment_state"], {"type": "ENV", "shape": [16]})
+        self.assertEqual(config["normalization_mapping"], {"STATE": "MIN_MAX", "ENV": "MIN_MAX", "ACTION": "MIN_MAX"})
+        self.assertNotIn("type", original)
+        values = {"min": object(), "max": object()}
+        migration = Mock()
+        migration.extract_normalization_stats.return_value = {
+            "observation.state": values, "observation.environment.state": values, "action": values}
+        stats = _normalization_stats(migration, {}, config)
+        self.assertIs(stats["observation.environment_state"], values)
+        self.assertNotIn("observation.environment.state", stats)
+        _check_normalization(config, stats)
+        (self.source / "config.json").write_text(json.dumps(original), encoding="utf-8")
+        with patch("inventory.cached_snapshots", return_value=[(self.source, "example/tdmpc @ commit")]):
+            found = scan(self.root, self.root, self.root / "log")
+        self.assertIn((self.source.resolve(), "tdmpc"), found.models)
+        self.assertIsNone(legacy_tdmpc_config(dict(original, type="diffusion")))
+        self.assertIsNone(legacy_tdmpc_config(dict(original, output_shapes={"unknown": [2]})))
+        self.assertIsNone(legacy_tdmpc_config({k: v for k, v in original.items() if k != "cem_iterations"}))
+
     def test_old_vqbet_creates_independent_preprocessors_and_preserves_weights(self):
         decoder = Mock(side_effect=lambda folder: json.loads((folder / "config.json").read_text(encoding="utf-8")))
 
