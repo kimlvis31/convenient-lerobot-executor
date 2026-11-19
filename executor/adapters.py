@@ -74,6 +74,7 @@ class Stage:
     env: dict[str, str] = field(default_factory=dict)
     output: Path | None = None
     auto_flags: tuple[str, ...] = ()
+    environment_notes: tuple[str, ...] = ()
 
 
 def flag(name, value):

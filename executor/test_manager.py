@@ -435,7 +435,7 @@ class ManagerTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(), 0)
         self.assertEqual(output.getvalue().count("Run 1 job? (Y/N) [Default: Y]"), 2)
-        execute.assert_called_once_with(plans, "fake", False, {})
+        execute.assert_called_once_with(plans, "fake", False, {}, {})
 
     def test_temporary_native_jobs_clean_outputs_after_summary_or_failure(self):
         for case in ("train", "both", "failure", "dry-run"):
@@ -977,6 +977,43 @@ class ManagerTests(unittest.TestCase):
         with patch.object(environments, "prepare", return_value="smolvla_env") as prepare:
             prepare_job_environments(settings, [adapter.evaluate(False)], self.root, "conda", sessions)
         self.assertTrue(prepare.call_args.kwargs["peft"])
+
+    def test_environment_preview_shares_selection_without_installing(self):
+        environments = LeRobotEnvironments("conda", self.root, "lerobot", {"lerobot", "sim"})
+        base = {"policies": {"act": True}, "runtime": {"evaluation": True}}
+        environments.catalogs = {"lerobot": {**base, "benchmarks": {"pusht": False}},
+                                 "sim": {**base, "benchmarks": {"pusht": True}}}
+        with patch("manage.subprocess.run") as command, patch.object(environments, "catalog", side_effect=AssertionError):
+            self.assertEqual(environments.prepare("lerobot", model="act", benchmark="pusht",
+                                                  runtime="evaluation", preview=True), "sim")
+            self.assertIn("Alternative to lerobot", environments.selection_reason)
+            self.assertEqual(environments.prepare("lerobot", model="act", benchmark="pusht", pinned=True,
+                                                  runtime="evaluation", preview=True), "lerobot")
+            self.assertIn("Pinned", environments.selection_reason)
+            self.assertIn("setup required", environments.selection_reason)
+            self.assertEqual(environments.prepare("lerobot", model="custom", benchmark="custom", preview=True), "lerobot")
+            self.assertIn("unverified", environments.selection_reason)
+            command.assert_not_called()
+
+    def test_tiny_reports_both_roles_and_old_stage_loads(self):
+        from dataclasses import asdict
+        from adapters import Stage
+        environments = LeRobotEnvironments(None, self.root, "lerobot", set())
+        cfg = {"adapter": "tinyvla", "model": "tinyvla", "environments": {"native": "lerobot", "tinyvla": "worker"},
+               "train": {}, "eval": {"env": "libero", "environment": "sim"}}
+        stages = [Stage("train", "worker", ["train", "--dataset-python", "@python:lerobot"], (), 1),
+                  Stage("eval", "sim", ["eval"], (), 1)]
+        old = asdict(stages[0])
+        del old["environment_notes"]
+        self.assertEqual(Stage(**old).environment_notes, ())
+        prepare_job_environments(cfg, stages, self.root, None, {(self.root, "lerobot"): environments}, preview=True)
+        train_summary, eval_summary = (" ".join(stage.environment_notes) for stage in stages)
+        self.assertIn("TinyVLA training: worker", train_summary)
+        self.assertIn("LeRobot dataset reader: lerobot", train_summary)
+        self.assertIn("TinyVLA inference: worker", eval_summary)
+        self.assertIn("LeRobot evaluation: sim. Pinned", eval_summary)
+        self.assertIn("Simulator libero", eval_summary)
+        self.assertIn("versions unverified", eval_summary)
 
     def test_dependency_install_tries_an_existing_alternate_before_cloning(self):
         environments = LeRobotEnvironments("conda", self.root, "preferred", {"alternate"})

@@ -669,8 +669,38 @@ class LeRobotEnvironments:
         self.preferred = preferred
         self.names = set(names)
         self.catalogs = {}
+        self.package_reports = {}
+        self.selection_reason = ""
+
+    def packages(self, name, model, runtime, benchmark=None, peft=False, tiny_root=None):
+        key = (name, model, runtime, benchmark, peft, tiny_root)
+        if key not in self.package_reports:
+            groups = {}
+            if self.conda and (not self.names or name in self.names):
+                probe = ["python", "-B", str(Path(__file__).with_name("benchmarks.py")),
+                         "--describe-stage", runtime, "--model-name", model]
+                if benchmark:
+                    probe += ["--benchmark-name", benchmark]
+                if peft:
+                    probe.append("--peft")
+                if tiny_root:
+                    probe += ["--tiny-root", str(tiny_root)]
+                try:
+                    proc = subprocess.run(conda_command(self.conda, name, probe), cwd=self.root,
+                                          capture_output=True, text=True, encoding="utf-8",
+                                          errors="replace", timeout=15, check=True)
+                    for line in reversed(proc.stdout.splitlines()):
+                        if line.startswith("MANAGER_REQUIREMENTS "):
+                            groups = json.loads(line.removeprefix("MANAGER_REQUIREMENTS "))
+                            break
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
+            self.package_reports[key] = groups
+        return self.package_reports[key]
 
     def catalog(self, name, *, refresh=False):
+        if refresh:
+            self.package_reports = {key: value for key, value in self.package_reports.items() if key[0] != name}
         if refresh or name not in self.catalogs:
             self.catalogs[name] = environment_catalog(self.conda, name, self.root)
         return self.catalogs[name]
@@ -690,9 +720,13 @@ class LeRobotEnvironments:
                 locations.setdefault(kind, []).append(name)
         return locations
 
-    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False, peft=False, runtime=None):
-        catalogs = self.lerobot()
-        if preferred not in catalogs and (catalog := self.catalog(preferred)):
+    def prepare(self, preferred, *, model, benchmark=None, tiny=False, pinned=False, peft=False, runtime=None,
+                preview=False):
+        prefix = "Pinned by eval.environment. " if pinned else ""
+        self.selection_reason = prefix + "Configured environment; runtime readiness unverified."
+        catalogs = ({name: entry for name, entry in self.catalogs.items() if entry}
+                    if preview else self.lerobot())
+        if not preview and preferred not in catalogs and (catalog := self.catalog(preferred)):
             catalogs[preferred] = catalog
         if not catalogs:
             return preferred
@@ -774,7 +808,12 @@ class LeRobotEnvironments:
             return False
 
         for _, _, source, dependencies in sorted(candidates):
+            selection = "Preferred environment" if source == preferred else f"Alternative to {preferred}"
             if not dependencies:
+                unknown = (runtime != "dataset" and not check_policy) or (benchmark and not check_benchmark)
+                detail = ("policy or simulator support unverified"
+                          if unknown or not catalogs.get(source) else "matches inspected runtime requirements")
+                self.selection_reason = prefix + f"{selection}; {detail}."
                 return source
             program = ["python", "-B", str(Path(__file__).with_name("benchmarks.py"))]
             names_to_install = [name or "LoRA" for _, name in dependencies]
@@ -783,6 +822,9 @@ class LeRobotEnvironments:
                 if name is not None:
                     program.append(name)
             description = " and ".join(names_to_install)
+            if preview:
+                self.selection_reason = prefix + f"{selection}; setup required for {description} at launch."
+                return source
             print(f"  Preparing dependencies for {description} in {source}…", flush=True)
             result = subprocess.run(conda_command(self.conda, source, program), **process_options)
             if result.returncode:
@@ -791,6 +833,7 @@ class LeRobotEnvironments:
                     suffix = re.sub(r"[^a-zA-Z0-9_.-]", "_", "_".join(names_to_install))
                     conflicts.append((source, suffix, program, description))
             elif verify(source, description):
+                self.selection_reason = prefix + f"Prepared and verified {description} in the selected environment."
                 return source
 
         for source, suffix, program, description in conflicts:
@@ -816,6 +859,7 @@ class LeRobotEnvironments:
                 else:
                     ready = verify(target, description)
                 if ready:
+                    self.selection_reason = prefix + f"Cloned from {source} after a package conflict; verified {description}."
                     return target
             finally:
                 if not ready:
@@ -1131,9 +1175,10 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions, temporary_output_di
         evaluate = cfg["eval"]
         if conda and not evaluate.get("environment") and cfg["adapter"] in {"native", "tinyvla"}:
             native = environments["native"]
-            if native not in benchmark_sessions:
-                benchmark_sessions[native] = LeRobotEnvironments(conda, PROJECT_ROOT, native, installed)
-            session = benchmark_sessions[native]
+            key = (PROJECT_ROOT, native)
+            if key not in benchmark_sessions:
+                benchmark_sessions[key] = LeRobotEnvironments(conda, PROJECT_ROOT, native, installed)
+            session = benchmark_sessions[key]
             preferred = adapter.environment
             tiny = cfg["adapter"] == "tinyvla"
             # Queue jobs without an override follow the same installed-environment routing as the wizard.
@@ -1153,12 +1198,17 @@ def plan_job(args, cfg, conda, detected, benchmark_sessions, temporary_output_di
                 raise ValueError("This adapter must keep output paths inside the temporary job directory.")
         stage.env.setdefault("HF_LEROBOT_HOME", str(PROJECT_ROOT / "datasets/.hub"))
     first = stages[0]
+    native = environments["native"]
+    key = (PROJECT_ROOT, native)
+    if key not in benchmark_sessions:
+        benchmark_sessions[key] = LeRobotEnvironments(conda, PROJECT_ROOT, native, installed)
+    prepare_job_environments(cfg, stages, PROJECT_ROOT, conda, benchmark_sessions, preview=True)
     output = first.output or outputs / ("training" if first.name == "train" else "evaluation") / name
     run_dir = (output.parent if first.name == "train" and first.output else output) / "executor"
     return cfg, stages, run_dir, PROJECT_ROOT
 
 
-def plan(args, temporary_output_directory=None):
+def plan(args, temporary_output_directory=None, sessions=None):
     source = args.settings or args.queue
     settings = load_settings(source) if source else None
     if args.queue and "jobs" not in settings:
@@ -1168,7 +1218,7 @@ def plan(args, temporary_output_directory=None):
     except FileNotFoundError:
         conda = None
     detected = {}
-    benchmark_sessions = {}
+    benchmark_sessions = {} if sessions is None else sessions
     if args.inventory or settings is None:
         _, external = paths_for(args, settings or {})
         detected[PROJECT_ROOT] = available_environments(conda, PROJECT_ROOT)
@@ -1180,7 +1230,7 @@ def plan(args, temporary_output_directory=None):
         env_map = read_json(args.env_map) if args.env_map else {}
         native_env = env_map.get("native", DEFAULT_ENVIRONMENTS["native"])
         session = LeRobotEnvironments(conda, PROJECT_ROOT, native_env, detected[PROJECT_ROOT])
-        benchmark_sessions[native_env] = session
+        benchmark_sessions[(PROJECT_ROOT, native_env)] = session
         settings = wizard(load_adapters(args.plugin or []), inventory, PROJECT_ROOT, conda, native_env,
                           external=external, env_map=env_map, allow_changes=not args.dry_run,
                           environment_session=session)
@@ -1266,6 +1316,8 @@ def show_settings(plans, show_commands):
             print("  Job outputs: temporary")
         for stage in stages:
             print("  " + stage_title(stage, cfg["model"]))
+            for line in stage.environment_notes:
+                print(f"    {line}")
             if show_commands:
                 print(command_preview(stage.arguments, stage.auto_flags))
             elif stage.auto_flags:
@@ -1287,9 +1339,11 @@ def job_subheading(title):
     print(styled(f"  ({title})", "1;94"), flush=True)
 
 
-def prepare_job_environments(cfg, stages, root, conda, sessions):
+def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=False):
     backend = cfg["adapter"]
     if backend not in {"native", "tinyvla"}:
+        for stage in stages:
+            stage.environment_notes = (f"{stage.environment}: selected by the external adapter; requirements unverified.",)
         return
     native = cfg.get("environments", {}).get("native", DEFAULT_ENVIRONMENTS["native"])
     key = (root, native)
@@ -1306,35 +1360,81 @@ def prepare_job_environments(cfg, stages, root, conda, sessions):
             saved = read_json(checkpoint / "train_config.json")
             uses_peft = bool(saved.get("peft") or (saved.get("policy") or {}).get("use_peft"))
             source = checkpoint
-        uses_peft = uses_peft or train.get("lora") is not None or (
+        explicit_peft = any(arg.startswith("--peft.") for arg in train.get("extra", ()))
+        uses_peft = uses_peft or explicit_peft or train.get("lora") is not None or (
             train.get("policy_training", {}).get("train_mode_vlm") == "lora"
         ) or bool(source and Path(source).is_dir() and native_peft_checkpoint(Path(source)))
 
     for stage in stages:
-        if backend == "tinyvla" and stage.name == "train":
-            dataset_python = stage.arguments.index("--dataset-python") + 1
-            target = session.prepare(stage.arguments[dataset_python].removeprefix("@python:"),
-                                     model=model, runtime="dataset")
-            stage.arguments[dataset_python] = f"@python:{target}"
-            continue
+        notes = []
+        tiny = backend == "tinyvla"
+        tiny_train = tiny and stage.name == "train"
         evaluation = cfg["eval"] if stage.name == "eval" else {}
-        target = session.prepare(stage.environment, model=model, tiny=backend == "tinyvla",
-                                 benchmark=evaluation.get("env"), pinned=bool(evaluation.get("environment")),
-                                 peft=uses_peft, runtime="evaluation" if stage.name == "eval" else "training")
-        if target != stage.environment:
-            if stage.name == "eval":
-                evaluation["environment"] = target
-            else:
-                cfg.setdefault("environments", {})[model] = target
+        benchmark = evaluation.get("env")
+        if tiny:
+            worker = cfg.get("environments", {}).get("tinyvla", DEFAULT_ENVIRONMENTS["tinyvla"])
+            role = "training" if tiny_train else "inference"
+            notes.append(f"TinyVLA {role}: {worker} (configured external model interpreter).")
+            worker_packages = session.packages(worker, model, "tiny-model", tiny_root=cfg.get("tinyvla_root"))
+            notes.extend(package_lines(worker_packages, "TinyVLA model: torch, torchvision, transformers, diffusers"))
+        if tiny_train:
+            dataset_python = stage.arguments.index("--dataset-python") + 1
+            preferred = stage.arguments[dataset_python].removeprefix("@python:")
+            runtime = "dataset"
+        else:
+            preferred = evaluation.get("environment") or (native if tiny else cfg.get("environments", {}).get(model, native))
+            runtime = "evaluation" if evaluation else "training"
+        try:
+            target = session.prepare(preferred, model=model, tiny=tiny and not tiny_train, benchmark=benchmark,
+                                     pinned=bool(evaluation.get("environment")), peft=uses_peft,
+                                     runtime=runtime, preview=preview)
+            reason = session.selection_reason
+        except RuntimeError as error:
+            if not preview:
+                raise
+            target, reason = preferred, f"Cannot confirm readiness: {error}"
+        role = "LeRobot dataset reader" if tiny_train else f"LeRobot {runtime}"
+        notes.append(f"{role}: {target}. {reason}")
+        groups = session.packages(target, model, runtime, benchmark, uses_peft)
+        if not tiny_train:
+            key = "TinyVLA bridge" if tiny else "Policy requirements"
+            if key not in groups:
+                scope = "bridge" if tiny else "native policy"
+                detail = "LeRobot core; no extra declared" if groups.get("LeRobot runtime") and session.catalogs.get(
+                    target, {}).get("policies", {}).get(model) else "requirements unverified"
+                notes.append(f"Model {model} ({scope}): {detail}.")
+        if benchmark and f"Simulator {benchmark}" not in groups:
+            notes.append(f"Simulator {benchmark}: package requirements unverified.")
+        notes.extend(package_lines(groups, f"LeRobot {runtime} packages"))
+        previous_notes = stage.environment_notes
+        stage.environment_notes = tuple(notes)
+        if not preview and previous_notes and previous_notes != stage.environment_notes:
+            print(f"  Resolved {stage.name} environment:")
+            for line in notes:
+                print(f"    {line}")
+        if tiny_train:
+            stage.arguments[dataset_python] = f"@python:{target}"
+        else:
+            if not preview and target != preferred:
+                if evaluation:
+                    evaluation["environment"] = target
+                else:
+                    cfg.setdefault("environments", {})[model] = target
             stage.environment = target
+
+
+def package_lines(groups, fallback):
+    if not groups:
+        return [f"{fallback}: versions unverified."]
+    return [f"{label}: {', '.join(packages)}" for label, packages in groups.items()]
 
 
 def temporary_job_root(path, temporary_outputs):
     return next((root for root in temporary_outputs if path.is_relative_to(root)), None)
 
 
-def run_plans(plans, conda, verbose, temporary_outputs):
-    sessions = {}
+def run_plans(plans, conda, verbose, temporary_outputs, sessions=None):
+    sessions = {} if sessions is None else sessions
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
         if index > 1:
             print()
@@ -1454,7 +1554,8 @@ def main():
         return path
 
     try:
-        plans, conda = plan(args, make_temporary_output_directory)
+        sessions = {}
+        plans, conda = plan(args, make_temporary_output_directory, sessions)
         if not plans:
             return 0
         section("Settings")
@@ -1471,7 +1572,7 @@ def main():
         conda = conda or conda_executable(args.conda)
         section("Execution")
         executing = True
-        run_plans(plans, conda, args.verbose, temporary_outputs)
+        run_plans(plans, conda, args.verbose, temporary_outputs, sessions)
         return 0
     except (KeyboardInterrupt, EOFError):
         report_failure("Run interrupted.", in_job=executing)

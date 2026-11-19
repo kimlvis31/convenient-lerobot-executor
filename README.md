@@ -73,6 +73,8 @@ The policy list marks models without a local checkpoint as <No Local Checkpoint>
 
 Training Scope lists the compatible component combinations together. The executor checks local dataset and checkpoint inputs before training, preserves the original dataset, and shows required arguments it added in green in Settings. Failed subprocesses show a short cause and the full log path in Result.
 
+**Settings** shows the Conda environment for each stage, the reason it was selected, and the model and simulator package requirements with the versions found there. TinyVLA lists its model interpreter and the LeRobot dataset reader or evaluation runner separately. An unverified entry means the executor could not confirm it. `--dry-run` previews this information without installing packages. If dependency preparation changes the selection, the executor shows the resolved environment and saves it in the run script.
+
 Each result has an `executor/` subdirectory with its executed `run.py`, reusable `script.py`, job status, and the stage console log. Evaluation and training results go to `outputs/evaluation/` and `outputs/training/`. Put local datasets in `datasets/`. LeRobot datasets fetched by the executor are cached in `datasets/.hub/`. The repository tracks code, configuration, and source manifests. Downloads, weights, logs, and outputs are local artifacts.
 
 Choose **N** at **Save Job Outputs?** to run in temporary storage and see the result in the terminal. Set `"save_outputs": False` for a job in a Python job queue. Temporary runs discard their outputs and logs after execution. A train-and-evaluate job keeps its checkpoint until evaluation finishes.

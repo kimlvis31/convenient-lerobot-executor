@@ -30,7 +30,7 @@ BENCHMARK_MODULES = {
 POLICY_EXTRAS = {"pi0": "pi", "pi05": "pi", "pi0_fast": "pi", "wall_x": "wallx"}
 
 
-def optional_requirements(distribution, extra):
+def optional_requirements(distribution, extra, *, include_nested=True):
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
@@ -48,7 +48,8 @@ def optional_requirements(distribution, extra):
             if marker is None or marker.evaluate({"extra": ""}) or not marker.evaluate({"extra": name}):
                 continue
             if canonicalize_name(requirement.name) == "lerobot":
-                pending.extend(requirement.extras)
+                if include_nested:
+                    pending.extend(requirement.extras)
                 continue
             # pip receives only the dependencies selected by the LeRobot extra.
             selected = Requirement(str(requirement))
@@ -78,6 +79,69 @@ def installed_versions():
             except (ValueError, InvalidVersion):
                 continue
     return versions
+
+
+def stage_packages(model, runtime, benchmark=None, peft=False, tiny_root=None):
+    """Read package metadata for one role without importing a policy or simulator."""
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    def package_group(requirements):
+        observed = {}
+        for item in requirements:
+            spec = Requirement(str(item))
+            key = canonicalize_name(spec.name)
+            try:
+                version = metadata.version(spec.name)
+                value = f"{spec} ({version})"
+                if spec.specifier and not spec.specifier.contains(version, prereleases=True):
+                    value = f"{spec} ({version}, incompatible)"
+            except metadata.PackageNotFoundError:
+                value = f"{spec} (distribution not found)"
+            observed[key] = value
+        return list(observed.values())
+
+    if runtime == "tiny-model":
+        names = ("torch", "torchvision", "transformers", "diffusers")
+        root = Path(tiny_root) if tiny_root else Path(__file__).resolve().parents[1] / "externals/TinyVLA"
+        source = root / "sources/TinyVLA/requirements.txt"
+        specs = dict.fromkeys(names)
+        if source.is_file():
+            for line in source.read_text().splitlines():
+                key = line.partition("==")[0].strip().lower()
+                if key in specs:
+                    specs[key] = line.strip()
+        return {"TinyVLA model": package_group(specs[name] or name for name in names)}
+
+    groups = {"LeRobot runtime": package_group(["lerobot", "torch"])}
+    try:
+        distribution = metadata.distribution("lerobot")
+    except metadata.PackageNotFoundError:
+        return groups
+    if runtime != "dataset":
+        if model == "tinyvla":
+            groups["TinyVLA bridge"] = package_group(["lerobot-policy-tinyvla"])
+        else:
+            specs = list(policy_requirements(distribution, model))
+            if model == "flux3" and not any(req.name == "natten" for req in specs):
+                specs.append("natten")
+            if specs:
+                groups["Policy requirements"] = package_group(specs)
+    if peft:
+        groups["LoRA requirements"] = package_group(optional_requirements(distribution, "peft") or ["peft"])
+    runtime_specs = optional_requirements(distribution, runtime)
+    if runtime_specs:
+        groups[f"LeRobot {runtime} requirements"] = package_group(runtime_specs)
+    if benchmark:
+        specs = list(optional_requirements(distribution, benchmark, include_nested=False))
+        known = {canonicalize_name(req.name) for req in specs}
+        modules = SIMULATOR_REQUIREMENTS.get(benchmark, ((), ()))[0]
+        if benchmark == "libero_plus":
+            modules = ("libero", "robosuite", "Wand", "scikit-image")
+        specs.extend(name for name in modules if canonicalize_name(name) not in known)
+        if specs:
+            groups[f"Simulator {benchmark}"] = package_group(specs)
+    return groups
 
 
 def installed(requirement, versions):
@@ -390,6 +454,10 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--describe-stage", choices=(*LEROBOT_RUNTIME_EXTRAS, "tiny-model"))
+    parser.add_argument("--model-name")
+    parser.add_argument("--benchmark-name")
+    parser.add_argument("--tiny-root")
     parser.add_argument("--catalog", action="store_true")
     parser.add_argument("--install", help="Install the declared dependencies for a benchmark")
     parser.add_argument("--policy", help="Install the declared dependencies for a native policy")
@@ -398,6 +466,12 @@ def main():
     parser.add_argument("--runtime", choices=LEROBOT_RUNTIME_EXTRAS, help="Install the declared LeRobot runtime extra")
     parser.add_argument("--isolated", action="store_true")
     args = parser.parse_args()
+    if args.describe_stage:
+        if not args.model_name:
+            parser.error("--describe-stage requires --model-name.")
+        print("MANAGER_REQUIREMENTS " + json.dumps(stage_packages(
+            args.model_name, args.describe_stage, args.benchmark_name, args.peft, args.tiny_root)))
+        return 0
     if sum(map(bool, (args.catalog, args.install or args.policy or args.peft or args.runtime, args.plugin))) != 1:
         parser.error("Choose --catalog, --install/--policy/--peft/--runtime, or --plugin.")
     try:
