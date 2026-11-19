@@ -552,7 +552,9 @@ def stage_failure_reason(logfile):
             )
             hub_wrapper = (error_type == "OSError" and detail.startswith("We couldn't connect to ")
                            and "cached files" in detail)
-            if (loading_wrapper or hub_wrapper) and chained_cause(index) is not None:
+            config_wrapper = (error in {"draccus.utils.ParsingError", "ParsingError"}
+                              and detail.startswith("Couldn't instantiate class "))
+            if (loading_wrapper or hub_wrapper or config_wrapper) and chained_cause(index) is not None:
                 diagnostic = compact(line, 320)
                 continue
             if error_type == "LocalEntryNotFoundError" and "outgoing traffic has been disabled" in detail:

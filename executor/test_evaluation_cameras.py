@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from adapters import NativeAdapter
-from evaluation_cameras import main
+from evaluation_cameras import main, simulator_directory
 
 
 class EvaluationCameraTests(unittest.TestCase):
@@ -95,6 +95,51 @@ class EvaluationCameraTests(unittest.TestCase):
                 policy["input_features"].pop(next(iter(expected.values())))
                 config.write_text(json.dumps(policy))
                 self.assertNotIn("rename_map", self.stage(kind, model=model).auto_flags)
+
+    def test_robotwin_smol_composes_physical_positions_with_saved_dataset_names(self):
+        aliases = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+        self.checkpoint(aliases, ("camera1", "camera2", "camera3"))
+        stage = self.stage("robotwin")
+        expected = dict(zip(("observation.images." + name for name in ("head_camera", "left_camera", "right_camera")),
+                            self.mapping.values()))
+        option = next(arg for arg in stage.arguments if arg.startswith("--rename_map="))
+        self.assertEqual(json.loads(option.partition("=")[2]), expected)
+        self.assertEqual(Path(stage.arguments[2]).name, "evaluation_cameras.py")
+        self.assertNotIn("rename_map", self.stage("robotwin", ["--rename_map={}"]).auto_flags)
+        self.assertNotIn("rename_map", self.stage("robotwin", ["--env.camera_names=head_camera"]).auto_flags)
+        self.checkpoint(("cam_high", "cam_right_wrist", "unrelated"), ("camera1", "camera2", "camera3"))
+        self.assertNotIn("rename_map", self.stage("robotwin").auto_flags)
+
+    def test_robotwin_relative_assets_are_found_and_cwd_and_import_path_are_restored(self):
+        previous, paths = Path.cwd(), sys.path.copy()
+        files = ("envs/_base_task.py", "task_config/demo_clean.yml", "assets/objects/objaverse/list.json",
+                 "assets/embodiments/aloha/config.yml")
+        for name in files:
+            path = self.root / name
+            path.parent.mkdir(parents=True)
+            path.touch()
+        with patch.dict("os.environ", {"ROBOTWIN_ROOT": str(self.root)}):
+            with self.assertRaisesRegex(RuntimeError, "failed rollout"):
+                with simulator_directory(["--env.type=robotwin"]):
+                    self.assertTrue(Path(files[2]).is_file())
+                    self.assertEqual(sys.path[0], str(self.root.resolve()))
+                    raise RuntimeError("failed rollout")
+            self.assertEqual((Path.cwd(), sys.path), (previous, paths))
+            (self.root / files[2]).unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "ROBOTWIN_ROOT"), simulator_directory(["--env.type=robotwin"]):
+                pass
+            with simulator_directory(["--env.type=libero"]):
+                self.assertEqual(Path.cwd(), previous)
+
+    def test_robotwin_total_counts_the_unique_names_in_the_upstream_task_dictionary(self):
+        self.checkpoint(("cam_high", "cam_left_wrist", "cam_right_wrist"), ("camera1", "camera2", "camera3"))
+        config = {"eval": {"env": "robotwin", "tasks": ["beat_block_hammer", "click_bell, beat_block_hammer"],
+                           "batch": 2, "episodes": 3, "seed": 0, "device": "cpu", "policy": str(self.model)},
+                  "model": "smolvla", "adapter": "native"}
+        adapter = NativeAdapter(config, "test", self.root, None, {"native": "lerobot"})
+        stage = adapter.evaluate(False)
+        self.assertEqual(stage.units, 6)
+        self.assertEqual(stage.eval_batches, 2)
 
     def test_after_training_has_a_deferred_lookup_and_respects_manual_override(self):
         stage = self.stage("vlabench", after_training=True)

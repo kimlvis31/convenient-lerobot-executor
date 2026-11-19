@@ -1246,6 +1246,27 @@ class ManagerTests(unittest.TestCase):
                 self.assertEqual(failure.reason, expected)
                 self.assertIn(str(logfile), str(failure))
 
+    def test_config_constructor_wrapper_only_shows_a_linked_cause(self):
+        logfile = self.root / "eval.log"
+        cause = "ValueError: The checkpoint uses exactly 10 Euler flow steps."
+        wrapper = "draccus.utils.ParsingError: Couldn't instantiate class WallOSS05Config using given arguments."
+        direct = "The above exception was the direct cause of the following exception:"
+        handling = "During handling of the above exception, another exception occurred:"
+        traceback = "Traceback (most recent call last):\n"
+        parse_error = "draccus.utils.ParsingError: Unknown policy option."
+        for log, expected in (
+            (f"{cause}\n\n{direct}\n\n{traceback}{wrapper}", cause),
+            (f"{cause}\n\n{handling}\n\n{traceback}{wrapper}", cause),
+            (traceback + wrapper, wrapper),
+            (f"ImportError: An unrelated earlier warning.\n{traceback}{wrapper}", wrapper),
+            (f"{cause}\n\n{direct}\n\n{traceback}{parse_error}", parse_error),
+        ):
+            with self.subTest(log=log):
+                logfile.write_text(log, encoding="utf-8")
+                failure = StageFailure("eval", 1, logfile)
+                self.assertEqual(failure.reason, expected)
+                self.assertIn(str(logfile), str(failure))
+
     def test_tokenizer_wrapper_shows_the_chained_cause_and_full_log_path(self):
         logfile = self.root / "eval.log"
         wrapper = "RuntimeError: Failed to load required tokenizers for PI0FastPolicy initialization"

@@ -92,3 +92,7 @@ Set `eval.robomme_runtime` to `"shared"` to require a combined environment, or `
 ## License
 
 The first-party project is under [MIT](LICENSE). See [third-party sources](THIRD_PARTY.md) for bundled upstream software and public assets.
+
+## RoboTwin runtime
+
+RoboTwin needs its upstream simulator source, robot and object assets, and native libraries before evaluation. Set `ROBOTWIN_ROOT` to that checkout, or make its `envs` package discoverable in the selected environment. The executor checks the runtime files and MPlib/NumPy compatibility, restores verified camera mappings, and runs evaluation from the simulator asset root. Follow the [upstream installation guide for the tested LeRobot version](https://github.com/huggingface/lerobot/blob/145cc7ea53e5864bd5efec4e9bb70ee799e47bd8/docs/source/robotwin.mdx). Initial source and system-library setup uses that upstream procedure. The validation used an isolated container with matching LeRobot source/package metadata and compatible NumPy, PyArrow, Transformers, and native-library versions.

@@ -80,3 +80,7 @@ Training Scope는 선택한 모델의 학습 범위 조합을 한 목록에 표�
 ## 라이선스
 
 프로젝트 자체 코드는 MIT(Massachusetts Institute of Technology, 매사추세츠 공과대학) 라이선스를 따릅니다. 외부 소스와 공개 데이터는 각각의 원래 라이선스를 따릅니다. [프로젝트 라이선스](LICENSE) · [외부 소스와 라이선스](THIRD_PARTY.md)
+
+## RoboTwin 실행 환경
+
+RoboTwin 평가에는 상위 시뮬레이터 소스, 로봇·물체 자산, 네이티브 라이브러리를 먼저 준비한다. `ROBOTWIN_ROOT`로 해당 저장소를 지정하거나 선택한 환경에서 `envs` 패키지를 찾을 수 있게 설정한다. 실행기는 필수 파일과 MPlib·NumPy 호환성을 검사하고, 확인된 카메라 이름을 연결하며, 시뮬레이터 자산 루트에서 평가를 실행한다. 최초 소스·시스템 라이브러리 설치는 [검증한 LeRobot 버전의 상위 설치 안내](https://github.com/huggingface/lerobot/blob/145cc7ea53e5864bd5efec4e9bb70ee799e47bd8/docs/source/robotwin.mdx)를 따른다. 이번 검증은 LeRobot 소스와 설치된 패키지 정보 및 NumPy·PyArrow·Transformers·네이티브 라이브러리 버전을 맞춘 별도 컨테이너에서 진행했다.

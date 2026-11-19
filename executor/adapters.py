@@ -423,6 +423,9 @@ class NativeAdapter:
                 units = episodes * len(tasks) * (len(ids) or 10)
         elif kind == "robomme":
             units = episodes * len(tasks) * (len(ids) or 1)
+        elif kind == "robotwin":
+            names = {name.strip() for task in tasks for name in task.split(",") if name.strip()}
+            units = episodes * len(names)
         args += self.eval_policy(after_training)
         args += additional_flags(cfg.get("extra", []),
                                  {a[2:].split("=")[0] for a in args if a.startswith("--")} |
@@ -441,8 +444,8 @@ class NativeAdapter:
             if mapping:
                 args.append(flag("rename_map", mapping))
                 automatic += ("rename_map",)
-            elif mapping is None:
-                # The checkpoint may be trained in a preceding stage or downloaded at launch.
+            if mapping is None or kind == "robotwin":
+                # Resolve pending checkpoints and run RoboTwin beside its relative asset paths.
                 helper = Path(__file__).with_name("evaluation_cameras.py").resolve()
                 args[:len(command)] = ["python", "-u", str(helper)]
         headless_mujoco = (kind in {"aloha", "robocasa", "vlabench"} and sys.platform == "linux"

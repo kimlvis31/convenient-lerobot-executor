@@ -1,6 +1,9 @@
 """Restore saved camera names when a native evaluation uses a checkpoint."""
 
+from contextlib import contextmanager
+from importlib.util import find_spec
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -60,7 +63,7 @@ def camera_mapping(arguments, *, download=False, model=None):
     if kind not in ENVIRONMENT_CAMERAS or not reference:
         return {}
     aliases = POLICY_CAMERA_ALIASES.get(kind)
-    if aliases and model is not None and model != aliases[0]:
+    if aliases and model is not None and model != aliases[0] and (kind, model) != ("robotwin", "smolvla"):
         return {}
     overrides = ("rename_map", "env.features", "env.features_map", "policy.input_features")
     if aliases:
@@ -99,6 +102,13 @@ def camera_mapping(arguments, *, download=False, model=None):
         expected = {f"observation.images.{src}": f"observation.images.{dst}" for src, dst in aliases[1].items()}
         if visual == set(expected.values()):
             mapping = expected
+    if kind == "robotwin" and policy.get("type") == "smolvla":
+        # RoboTwin datasets call the physical head and wrist cameras by their ALOHA names.
+        # The SmolVLA processor maps those dataset names to its policy camera names.
+        sources = {f"observation.images.{src}": f"observation.images.{alias}" for src, alias in aliases[1].items()}
+        complete = set(mapping) == set(sources.values()) and all(isinstance(value, str) for value in mapping.values())
+        if complete and set(mapping.values()) == visual:
+            mapping = {src: mapping[alias] for src, alias in sources.items()}
     mapping = {name: target for name, target in mapping.items()
                if name in cameras and isinstance(target, str) and target in visual and name != target}
     renamed = {mapping.get(name, name) for name in cameras}
@@ -116,12 +126,45 @@ def restore_camera_arguments():
         print(f"Restored checkpoint camera names: {argument}", flush=True)
 
 
+def robotwin_directory():
+    """Check the official simulator repository without importing its native extensions."""
+    configured = os.environ.get("ROBOTWIN_ROOT")
+    if configured:
+        roots = [Path(configured).expanduser().resolve()]
+    else:
+        package = find_spec("envs")
+        paths = package.submodule_search_locations if package else ()
+        roots = [Path(path).resolve().parent for path in paths or ()]
+    for root in roots:
+        files = ("envs/_base_task.py", "task_config/demo_clean.yml", "assets/objects/objaverse/list.json")
+        if all((root / name).is_file() for name in files) and any(root.glob("assets/embodiments/*/config.yml")):
+            return root
+    raise FileNotFoundError("Set ROBOTWIN_ROOT to the installed RoboTwin repository with its official task, robot and object assets.")
+
+
+@contextmanager
+def simulator_directory(arguments):
+    if "--env.type=robotwin" not in arguments:
+        yield
+        return
+    # The simulator reads its assets relative to the working directory during import and rollout.
+    root = robotwin_directory()
+    previous = Path.cwd()
+    os.chdir(root)
+    sys.path.insert(0, str(root))
+    try:
+        yield
+    finally:
+        sys.path.remove(str(root))
+        os.chdir(previous)
+
+
 def main():
     from lerobot.scripts.lerobot_eval import main as evaluate
     from robomme_split import simulator_context
 
     restore_camera_arguments()
-    with simulator_context():
+    with simulator_directory(sys.argv[1:]), simulator_context():
         return evaluate()
 
 

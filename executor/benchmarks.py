@@ -14,6 +14,7 @@ import tempfile
 from typing import Literal, get_args, get_origin, get_type_hints
 
 from adapters import PEFT_POLICIES, TRAINING_SWITCHES, is_policy_training_option
+from evaluation_cameras import robotwin_directory
 
 
 BENCHMARKS = (
@@ -136,6 +137,8 @@ def stage_packages(model, runtime, benchmark=None, peft=False, tiny_root=None):
         specs = list(optional_requirements(distribution, benchmark, include_nested=False))
         known = {canonicalize_name(req.name) for req in specs}
         modules = SIMULATOR_REQUIREMENTS.get(benchmark, ((), ()))[0]
+        if benchmark == "robotwin":
+            modules = tuple({"warp": "warp-lang", "curobo": "nvidia-curobo"}.get(name, name) for name in modules)
         if benchmark == "libero_plus":
             modules = ("libero", "robosuite", "Wand", "scikit-image")
         specs.extend(name for name in modules if canonicalize_name(name) not in known)
@@ -210,6 +213,7 @@ def libero_plus_issue():
 # These source-based environments require simulator assets in addition to Python modules.
 # The probe covers shared runtime assets. Individual scene assets are checked by the simulator.
 SIMULATOR_REQUIREMENTS = {
+    "robotwin": (("sapien", "mplib", "curobo", "pytorch3d", "warp"), ()),
     "robomme": (("robomme", "sapien", "mani_skill"), ("env_metadata/test/record_dataset_*_metadata.json",)),
     "robocasa": (("robocasa", "robosuite", "mujoco"),
                  ("wrappers/gym_wrapper.py", "models/assets/fixtures/*/*/model.xml",
@@ -274,6 +278,21 @@ def simulator_runtime_issue(benchmark):
     missing = [name for name, spec in specs.items() if spec is None]
     if missing:
         return "Missing simulator modules: " + ", ".join(missing) + "."
+    if benchmark == "robotwin":
+        from packaging.requirements import Requirement
+
+        try:
+            robotwin_directory()
+            import numpy
+
+            for text in metadata.requires("mplib") or ():
+                req = Requirement(text)
+                if req.name.lower() == "numpy" and (not req.marker or req.marker.evaluate()):
+                    if not req.specifier.contains(numpy.__version__, prereleases=True):
+                        return f"RoboTwin MPlib requires {req}; NumPy {numpy.__version__} is active."
+        except (ImportError, OSError, metadata.PackageNotFoundError) as error:
+            return str(error)
+        return None
     roots = specs[modules[0]].submodule_search_locations
     if not roots:
         return f"Cannot locate the {modules[0]} simulator package."

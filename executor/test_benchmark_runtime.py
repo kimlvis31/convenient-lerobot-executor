@@ -12,6 +12,14 @@ from manage import LeRobotEnvironments
 
 
 class LiberoPlusRuntimeTests(unittest.TestCase):
+    def test_robotwin_rejects_the_active_numpy_when_it_conflicts_with_mplib(self):
+        with patch("benchmarks.util.find_spec", return_value=object()), \
+             patch("benchmarks.robotwin_directory", return_value=Path("/installed")), \
+             patch("benchmarks.metadata.requires", return_value=["numpy<2.0", "toppra>=0.4"]):
+            for version, expected in (("1.26.4", None), ("2.5.5", "RoboTwin MPlib requires numpy<2.0; NumPy 2.5.5 is active.")):
+                with self.subTest(version=version), patch.dict(sys.modules, {"numpy": SimpleNamespace(__version__=version)}):
+                    self.assertEqual(simulator_runtime_issue("robotwin"), expected)
+
     def test_missing_arrow_binary_is_reported_before_launch(self):
         issue = "PyArrow cannot load in this interpreter"
         with patch("benchmarks.util.find_spec", return_value=object()), patch.dict(sys.modules, {"pyarrow": None}):
