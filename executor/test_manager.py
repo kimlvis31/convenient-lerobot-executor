@@ -871,6 +871,7 @@ class ManagerTests(unittest.TestCase):
         results = [subprocess.CompletedProcess([], code, stdout="") for code in (3, 0, 0)]
         with patch("manage.subprocess.run", side_effect=results) as process, \
              patch("manage.available_environments", return_value=set()), \
+             patch("manage.configure_clone_inheritance") as inherited, \
              patch("manage.environment_catalog", return_value=refreshed), \
              contextlib.redirect_stdout(io.StringIO()):
             selected = environments.prepare("preferred", model="act", benchmark="pusht")
@@ -881,6 +882,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(retry[-3:], ["--install", "pusht", "--isolated"])
         self.assertIn("preferred_pusht_2", environments.names)
         self.assertEqual(selected, "preferred_pusht_2")
+        inherited.assert_called_once_with("conda", "preferred", "preferred_pusht_2", self.root)
         job = sample_settings()
         job["eval"]["environment"] = selected
         adapter = NativeAdapter(job, "run", self.root, self.external, self.envs)
@@ -1042,9 +1044,25 @@ class ManagerTests(unittest.TestCase):
         environments.catalogs = {"preferred": {"policies": {"act": True}, "benchmarks": {"pusht": False}}}
         results = [subprocess.CompletedProcess([], code, stdout="isolated error") for code in (3, 0, 1, 0)]
         with patch("manage.subprocess.run", side_effect=results) as process, \
+             patch("manage.configure_clone_inheritance"), \
              patch("manage.available_environments", return_value=set()), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "isolated error"):
                 environments.prepare("preferred", model="act", benchmark="pusht")
+        self.assertEqual(process.call_args.args[0], ["conda", "env", "remove", "--yes", "--name", "preferred_pusht"])
+        self.assertNotIn("preferred_pusht", environments.names)
+
+    def test_clone_inheritance_failure_removes_only_new_clone_before_installing(self):
+        from runtime_activation import ActivationError
+
+        environments = LeRobotEnvironments("conda", self.root, "preferred", set())
+        environments.catalogs = {"preferred": {"policies": {"act": True}, "benchmarks": {"pusht": False}}}
+        results = [subprocess.CompletedProcess([], code, stdout="") for code in (3, 0, 0)]
+        with patch("manage.subprocess.run", side_effect=results) as process, \
+             patch("manage.configure_clone_inheritance", side_effect=ActivationError("Safe clone setup failure")), \
+             patch("manage.available_environments", return_value=set()), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "Safe clone setup failure"):
+                environments.prepare("preferred", model="act", benchmark="pusht")
+        self.assertEqual(len(process.call_args_list), 3)
         self.assertEqual(process.call_args.args[0], ["conda", "env", "remove", "--yes", "--name", "preferred_pusht"])
         self.assertNotIn("preferred_pusht", environments.names)
 

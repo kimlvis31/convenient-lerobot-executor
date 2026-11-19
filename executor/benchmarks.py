@@ -15,6 +15,8 @@ from typing import Literal, get_args, get_origin, get_type_hints
 
 from adapters import PEFT_POLICIES, TRAINING_SWITCHES, is_policy_training_option
 from evaluation_cameras import robotwin_directory
+from policy_extensions import (POLICY_EXTENSIONS, extension_problems, extension_runtime_issue,
+                               extension_specs, install_extensions)
 
 
 BENCHMARKS = (
@@ -124,8 +126,9 @@ def stage_packages(model, runtime, benchmark=None, peft=False, tiny_root=None):
             groups["TinyVLA bridge"] = package_group(["lerobot-policy-tinyvla"])
         else:
             specs = list(policy_requirements(distribution, model))
-            if model == "flux3" and not any(req.name == "natten" for req in specs):
-                specs.append("natten")
+            known_extensions = {canonicalize_name(req.name) for req in specs}
+            specs.extend(spec for spec in extension_specs(model)
+                         if canonicalize_name(Requirement(spec).name) not in known_extensions)
             if specs:
                 groups["Policy requirements"] = package_group(specs)
     if peft:
@@ -351,13 +354,15 @@ def environment_catalog():
         if config.__module__.startswith("lerobot.policies."):
             missing = sorted({req.name for req in policy_requirements(distribution, name)
                               if not installed(req, versions)})
-            if name == "flux3" and "natten" not in versions:
-                if "natten" not in missing:
-                    missing.append("natten")
-            elif missing:
-                policy_installable.append(name)
-            if missing:
-                issues[name] = f"Missing: {', '.join(missing)}"
+            extensions = extension_problems(name, versions)
+            if missing or extensions:
+                issue = extension_runtime_issue(name) if extensions else None
+                if issue is None:
+                    policy_installable.append(name)
+                details = ([f"Missing: {', '.join(missing)}"] if missing else []) + list(extensions.values())
+                if issue:
+                    details.append(issue)
+                issues[name] = "; ".join(details)
             else:
                 try:
                     get_policy_class(name)
@@ -442,7 +447,8 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False
 
         config = PreTrainedConfig.get_known_choices().get(policy)
         declared = policy_requirements(distribution, policy)
-        if config is None or not config.__module__.startswith("lerobot.policies.") or not declared:
+        if (config is None or not config.__module__.startswith("lerobot.policies.")
+                or not (declared or POLICY_EXTENSIONS.get(policy))):
             raise ValueError(f"LeRobot {distribution.version} does not declare installable dependencies for {policy}.")
         requirements.extend(declared)
     if runtime:
@@ -454,8 +460,11 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False
         if not declared:
             raise ValueError(f"LeRobot {distribution.version} does not declare LoRA dependencies.")
         requirements.extend(declared)
-    needed = sorted({str(req) for req in requirements if not installed(req, versions)})
-    if not needed:
+    extension_names = {recipe.distribution for recipe in POLICY_EXTENSIONS.get(policy, ())}
+    needed = sorted({str(req) for req in requirements
+                     if canonicalize_name(req.name) not in extension_names and not installed(req, versions)})
+    needs_extensions = bool(extension_problems(policy, versions))
+    if not needed and not needs_extensions:
         if runtime and (issue := data_runtime_issue()):
             raise ValueError(issue)
         print("Requested dependencies are already installed.")
@@ -466,15 +475,18 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False
         core = {"lerobot", "numpy", "torch", "torchvision", "torchcodec", "transformers"}
         pins = ((name, version) for name, version in sorted(versions.items()) if not isolated or name in core)
         constraints.write_text("".join(f"{name}=={version}\n" for name, version in pins), encoding="utf-8")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-input", "--no-user",
-             "--disable-pip-version-check", "--progress-bar", "off", "--constraint", str(constraints), *needed],
-            text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.returncode:
-            return DEPENDENCY_CONFLICT if "ResolutionImpossible" in result.stdout else 1
+        if needed:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-input", "--no-user",
+                 "--disable-pip-version-check", "--progress-bar", "off", "--constraint", str(constraints), *needed],
+                text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.returncode:
+                return DEPENDENCY_CONFLICT if "ResolutionImpossible" in result.stdout else 1
+    if needs_extensions:
+        install_extensions(policy, installed_versions(), requirements)
     return 0
 
 

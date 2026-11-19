@@ -12,7 +12,8 @@ TAIL = r'''
 
     channel = args.output.parent
     head_file = args.model / 'action_head.safetensors'
-    action_head = 'new_random_initialization'
+    head_loading = locals().get('head_loading') or {'status': 'unknown'}
+    action_head = head_loading.get('status', 'unknown')
     if head_file.is_file():
         from safetensors.torch import load_file
         parameters = dict(model.named_parameters())
@@ -35,6 +36,7 @@ TAIL = r'''
         'status': 'TINYVLA_READY', 'versions': versions, 'seed': args.seed,
         'repo': str(args.repo), 'repo_commit': revision(args.repo),
         'model': str(args.model), 'action_head': action_head,
+        'action_head_loading': head_loading,
         'state_dim': 8, 'action_dim': 7, 'chunk_size': 16,
         'scheduler_dtype': str(model.noise_scheduler.alphas_cumprod.dtype),
         'model_config_sha256': hashlib.sha256((args.model / 'config.json').read_bytes()).hexdigest(),

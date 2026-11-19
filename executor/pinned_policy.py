@@ -42,6 +42,10 @@ def pinned_command(command, stage, reference, revision, root):
 
 
 def pinned_entrypoint(stage, reference, revision):
+    if stage == "eval":
+        from evaluation_cameras import prepare_evaluation_runtime
+
+        prepare_evaluation_runtime(sys.argv[1:])
     from huggingface_hub import hf_hub_download
     from lerobot.configs import PreTrainedConfig
 

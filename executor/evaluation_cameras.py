@@ -5,12 +5,14 @@ from importlib.util import find_spec
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 
 # Raw camera names declared by the corresponding LeRobot environment configs.
 ENVIRONMENT_CAMERAS = {
     "libero": ("image", "image2"),
+    "libero_plus": ("image", "image2"),
     "robocasa": ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"),
     "robotwin": ("head_camera", "left_camera", "right_camera"),
     "vlabench": ("image", "second_image", "wrist_image"),
@@ -21,10 +23,32 @@ ENVIRONMENT_CAMERAS = {
 # LingBot policy uses its head and two wrist cameras in this order.
 POLICY_CAMERA_ALIASES = {
     "libero": ("gaussian_actor", {"image": "image", "image2": "wrist_image"}),
+    "libero_plus": ("smolvla", {"image": "front", "image2": "wrist"}),
     "robotwin": ("lingbot_vla_v2", {
         "head_camera": "cam_high", "left_camera": "cam_left_wrist", "right_camera": "cam_right_wrist",
     }),
 }
+
+
+def prepare_evaluation_runtime(arguments):
+    """Load LIBERO-plus image libraries before LeRobot's native extensions.
+
+    Some policy/data extensions load a different JPEG ABI. Loading Wand only
+    after those modules can make ImageMagick's TIFF plugin fail to resolve its
+    JPEG symbols. Initialize through Wand's public API in this evaluation
+    process before importing the evaluator; other benchmarks are unchanged.
+    """
+    options = dict(arg[2:].split("=", 1) for arg in arguments
+                   if arg.startswith("--") and "=" in arg)
+    if options.get("env.type") != "libero_plus":
+        return
+    try:
+        from wand.image import Image
+
+        with Image(width=1, height=1):
+            pass
+    except (ImportError, OSError, RuntimeError) as error:
+        raise RuntimeError(f"LIBERO-plus ImageMagick initialization failed before evaluation: {error}") from error
 
 
 def checkpoint_directory(reference, revision, *, download):
@@ -65,7 +89,7 @@ def camera_mapping(arguments, *, download=False, model=None):
     aliases = POLICY_CAMERA_ALIASES.get(kind)
     if aliases and model is not None and model != aliases[0] and (kind, model) != ("robotwin", "smolvla"):
         return {}
-    overrides = ("rename_map", "env.features", "env.features_map", "policy.input_features")
+    overrides = ("rename_map", "env.features", "env.features_map", "policy.input_features", "policy.empty_cameras")
     if aliases:
         overrides += ("env.camera_name", "env.camera_names", "env.camera_name_mapping")
     if any(key == field or key.startswith(field + ".") for key in options
@@ -88,7 +112,17 @@ def camera_mapping(arguments, *, download=False, model=None):
     if not isinstance(inputs, dict) or not isinstance(steps, list):
         return {}
     visual = {name for name, spec in inputs.items() if isinstance(spec, dict) and spec.get("type") == "VISUAL"}
-    if not visual or visual <= cameras or cameras <= visual:
+    empty_cameras = policy.get("empty_cameras", 0)
+    virtual = set()
+    if policy.get("type") == "smolvla" and type(empty_cameras) is int and empty_cameras > 0:
+        # SmolVLA creates these declared virtual slots itself, with zero images
+        # and false masks. They are not physical simulator cameras to rename.
+        for name in tuple(visual):
+            slot = re.fullmatch(r"observation\.images\.empty_camera_(0|[1-9][0-9]*)", name)
+            if slot and len(slot[1]) <= len(str(empty_cameras)) and int(slot[1]) < empty_cameras:
+                virtual.add(name)
+        visual -= virtual
+    if not visual:
         return {}
 
     renames = [step.get("config") for step in steps if isinstance(step, dict)
@@ -98,13 +132,21 @@ def camera_mapping(arguments, *, download=False, model=None):
     mapping = renames[0].get("rename_map")
     if not isinstance(mapping, dict):
         return {}
-    if not mapping and aliases and policy.get("type") == aliases[0]:
+    if visual <= cameras or cameras <= visual:
+        identity = {name: name for name in sorted(cameras)}
+        if virtual and visual == cameras and (not mapping or mapping == identity):
+            # SmolVLA supplies and masks its own missing virtual slots. An
+            # explicit verified identity map lets the evaluator keep that
+            # contract instead of requiring virtual slots from the simulator.
+            return identity
+        return {}
+    if not mapping and aliases and kind != "libero_plus" and policy.get("type") == aliases[0]:
         expected = {f"observation.images.{src}": f"observation.images.{dst}" for src, dst in aliases[1].items()}
         if visual == set(expected.values()):
             mapping = expected
-    if kind == "robotwin" and policy.get("type") == "smolvla":
-        # RoboTwin datasets call the physical head and wrist cameras by their ALOHA names.
-        # The SmolVLA processor maps those dataset names to its policy camera names.
+    if kind in {"robotwin", "libero_plus"} and policy.get("type") == "smolvla":
+        # Compose verified physical positions with the checkpoint's saved
+        # dataset-name map, preserving SmolVLA's own virtual camera masking.
         sources = {f"observation.images.{src}": f"observation.images.{alias}" for src, alias in aliases[1].items()}
         complete = set(mapping) == set(sources.values()) and all(isinstance(value, str) for value in mapping.values())
         if complete and set(mapping.values()) == visual:
@@ -161,6 +203,7 @@ def simulator_directory(arguments):
 
 
 def main():
+    prepare_evaluation_runtime(sys.argv[1:])
     from lerobot.scripts.lerobot_eval import main as evaluate
     from robomme_split import simulator_context
     from simulator_worker import simulator_context as source_context

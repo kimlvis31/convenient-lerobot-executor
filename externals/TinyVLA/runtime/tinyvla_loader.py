@@ -39,6 +39,30 @@ def revision(repo):
     return result.stdout.strip() if result.returncode == 0 else 'unknown'
 
 
+def action_head_loading(parameter_names, loading_info):
+    """Describe active action-head restoration without asserting it was trained.
+
+    Compare loading diagnostics only against parameters of the configured head.
+    Older snapshots can carry an unused language embed_out.weight; that unexpected
+    tensor says nothing about whether the current diffusion head was restored.
+    """
+    expected = {name for name in parameter_names if name.startswith(('embed_out.', 'proj_to_action.'))}
+    missing = set(loading_info.get('missing_keys') or ())
+    mismatched = {item[0] for item in loading_info.get('mismatched_keys') or ()
+                  if isinstance(item, (tuple, list)) and item and isinstance(item[0], str)}
+    initialized = expected & (missing | mismatched)
+    if not expected:
+        status = 'unknown'
+    elif initialized == expected:
+        status = 'new_random_initialization'
+    elif initialized:
+        status = 'partially_initialized'
+    else:
+        status = 'loaded_from_checkpoint'
+    return {'status': status, 'expected_parameter_keys': len(expected),
+            'newly_initialized_keys': sorted(initialized)}
+
+
 def main():
     args = arguments()
     implementation = args.repo / 'llava-pythia' / 'llava_pythia'
@@ -98,6 +122,7 @@ def main():
     for prefix in ('gpt_neox.',):
         if any(k.startswith(prefix) for k in info.get('unexpected_keys', [])):
             raise RuntimeError('Unexpected keys in the base model: ' + json.dumps(info, default=str))
+    head_loading = action_head_loading((name for name, _ in model.named_parameters()), info)
     model = model.to(device='cuda', dtype=torch.bfloat16).eval()
     # scheduler_float32_fix
     scheduler = model.noise_scheduler
@@ -114,7 +139,7 @@ def main():
     schedule = model.noise_scheduler.alphas_cumprod
     print('scheduler_after:', schedule.dtype,
           'alpha0:', schedule[0].item(), flush=True)
-    print('new_action_head_keys:', len(info.get('missing_keys', [])), flush=True)
+    print('new_action_head_keys:', len(head_loading['newly_initialized_keys']), flush=True)
 
     print('[3/5] Prepare two test images and a robot state', flush=True)
     tokenizer = AutoTokenizer.from_pretrained(str(args.model), local_files_only=True, use_fast=True)
@@ -164,7 +189,8 @@ def main():
     print('[5/5] Save the inference report', flush=True)
     report = {
         'status': 'MODEL_CALL_OK', 'input_kind': 'synthetic_images_and_zero_state',
-        'simulator_connected': False, 'action_head': 'new_random_initialization',
+        'simulator_connected': False, 'action_head': head_loading['status'],
+        'action_head_loading': head_loading,
         'repo': str(args.repo), 'repo_commit': revision(args.repo),
         'model': str(args.model), 'torch': torch.__version__,
         'device': torch.cuda.get_device_name(0), 'seed': args.seed,

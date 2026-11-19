@@ -1,5 +1,6 @@
 """Regression coverage for applying saved camera semantics in native evaluation."""
 
+import builtins
 import json
 from pathlib import Path
 import sys
@@ -9,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from adapters import NativeAdapter
-from evaluation_cameras import main, simulator_directory
+from evaluation_cameras import main, prepare_evaluation_runtime, simulator_directory
 
 
 class EvaluationCameraTests(unittest.TestCase):
@@ -110,6 +111,112 @@ class EvaluationCameraTests(unittest.TestCase):
         self.checkpoint(("cam_high", "cam_right_wrist", "unrelated"), ("camera1", "camera2", "camera3"))
         self.assertNotIn("rename_map", self.stage("robotwin").auto_flags)
 
+    def libero_plus_checkpoint(self, *, count=2, extra_camera=None, model="smolvla"):
+        self.checkpoint(("front", "wrist"), ("camera1", "camera2"))
+        path = self.model / "config.json"
+        config = json.loads(path.read_text())
+        config.update(type=model, empty_cameras=count)
+        for name in ("empty_camera_0", "empty_camera_1", extra_camera):
+            if name:
+                config["input_features"]["observation.images." + name] = {"type": "VISUAL"}
+        path.write_text(json.dumps(config))
+        return path
+
+    def test_libero_plus_smol_maps_saved_front_and_wrist_without_turning_virtual_slots_into_images(self):
+        config = self.libero_plus_checkpoint()
+        original = config.read_bytes()
+        stage = self.stage("libero_plus")
+        option = next(arg for arg in stage.arguments if arg.startswith("--rename_map="))
+        self.assertEqual(json.loads(option.partition("=")[2]), {
+            "observation.images.image": "observation.images.camera1",
+            "observation.images.image2": "observation.images.camera2",
+        })
+        self.assertEqual(Path(stage.arguments[2]).name, "evaluation_cameras.py")
+        self.assertIn("rename_map", stage.auto_flags)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertFalse(any(arg.startswith("--policy.empty_cameras=") for arg in stage.arguments))
+        for override in ("--rename_map={}", "--env.features_map={}", "--policy.input_features={}",
+                         "--env.camera_name_mapping={}"):
+            with self.subTest(override=override):
+                manual = self.stage("libero_plus", [override])
+                self.assertIn(override, manual.arguments)
+                self.assertNotIn("rename_map", manual.auto_flags)
+
+    def test_only_smol_declared_canonical_virtual_slots_are_excluded_from_physical_matching(self):
+        cases = [(None, None, "smolvla"), (0, None, "smolvla"), (-1, None, "smolvla"),
+                 (True, None, "smolvla"), ("2", None, "smolvla"), (1, None, "smolvla"),
+                 (2, "empty_camera_2", "smolvla"), (2, "empty_camera_01", "smolvla"),
+                 (2, "third_camera", "smolvla"), (2, None, "act")]
+        for count, extra, model in cases:
+            with self.subTest(count=count, extra=extra, model=model):
+                self.libero_plus_checkpoint(count=count, extra_camera=extra, model=model)
+                self.assertNotIn("rename_map", self.stage("libero_plus", model=model).auto_flags)
+
+    def test_libero_plus_aliases_require_a_complete_unambiguous_saved_real_camera_mapping(self):
+        alternatives = ({}, {"front": "camera1"}, {"front": "camera1", "wrist": "camera1"},
+                        {"front": "empty_camera_0", "wrist": "camera2"},
+                        {"unverified_front": "camera1", "wrist": "camera2"})
+        for saved in alternatives:
+            with self.subTest(saved=saved):
+                self.libero_plus_checkpoint()
+                path = self.model / "policy_preprocessor.json"
+                content = json.loads(path.read_text())
+                content["steps"][0]["config"]["rename_map"] = {
+                    "observation.images." + source: "observation.images." + target
+                    for source, target in saved.items()
+                }
+                path.write_text(json.dumps(content))
+                self.assertNotIn("rename_map", self.stage("libero_plus").auto_flags)
+
+    def test_smol_virtual_slots_keep_their_masks_when_physical_names_already_match(self):
+        names = ("image", "image2")
+        identity = {"observation.images." + name: "observation.images." + name for name in names}
+        for saved in ({}, identity):
+            with self.subTest(saved=saved):
+                self.checkpoint(names, names)
+                config_path = self.model / "config.json"
+                policy = json.loads(config_path.read_text())
+                policy["empty_cameras"] = 2
+                policy["input_features"].update({
+                    "observation.images.empty_camera_0": {"type": "VISUAL"},
+                    "observation.images.empty_camera_1": {"type": "VISUAL"},
+                })
+                config_path.write_text(json.dumps(policy))
+                original = config_path.read_bytes()
+                processor_path = self.model / "policy_preprocessor.json"
+                processor = json.loads(processor_path.read_text())
+                processor["steps"][0]["config"]["rename_map"] = saved
+                processor_path.write_text(json.dumps(processor))
+                stage = self.stage("libero_plus")
+                option = next(arg for arg in stage.arguments if arg.startswith("--rename_map="))
+                self.assertEqual(json.loads(option.partition("=")[2]), identity)
+                self.assertEqual(config_path.read_bytes(), original)
+                for override in ("--rename_map={}", "--env.features={}", "--policy.empty_cameras=0"):
+                    self.assertNotIn("rename_map", self.stage("libero_plus", [override]).auto_flags)
+
+    def test_identity_recovery_requires_virtual_slots_and_exact_verified_physical_features(self):
+        names = ("image", "image2")
+        for count, slots, model, saved in (
+            (0, (), "smolvla", {}), (2, (), "smolvla", {}),
+            (1, ("empty_camera_0", "empty_camera_1"), "smolvla", {}),
+            (2, ("empty_camera_0", "unknown_camera"), "smolvla", {}),
+            (2, ("empty_camera_0",), "act", {}),
+            (2, ("empty_camera_0",), "smolvla", {"observation.images.image": "observation.images.image"}),
+        ):
+            with self.subTest(count=count, slots=slots, model=model, saved=saved):
+                self.checkpoint(names, names)
+                config_path = self.model / "config.json"
+                policy = json.loads(config_path.read_text())
+                policy.update(type=model, empty_cameras=count)
+                policy["input_features"].update({"observation.images." + name: {"type": "VISUAL"}
+                                                  for name in slots})
+                config_path.write_text(json.dumps(policy))
+                processor_path = self.model / "policy_preprocessor.json"
+                processor = json.loads(processor_path.read_text())
+                processor["steps"][0]["config"]["rename_map"] = saved
+                processor_path.write_text(json.dumps(processor))
+                self.assertNotIn("rename_map", self.stage("libero_plus", model=model).auto_flags)
+
     def test_robotwin_relative_assets_are_found_and_cwd_and_import_path_are_restored(self):
         previous, paths = Path.cwd(), sys.path.copy()
         files = ("envs/_base_task.py", "task_config/demo_clean.yml", "assets/objects/objaverse/list.json",
@@ -146,6 +253,76 @@ class EvaluationCameraTests(unittest.TestCase):
         self.assertEqual(Path(stage.arguments[2]).name, "evaluation_cameras.py")
         self.assertEqual(self.stage("vlabench", ["--rename_map={}"], after_training=True).arguments[0], "lerobot-eval")
         self.assertEqual(self.stage("robomme", after_training=True).arguments[0], "lerobot-eval")
+
+    def test_libero_plus_always_uses_runtime_initialization_even_without_camera_renaming(self):
+        self.checkpoint(("image", "image2"), ("image", "image2"))
+        for overrides in ((), ("--rename_map={}",)):
+            with self.subTest(overrides=overrides):
+                stage = self.stage("libero_plus", overrides)
+                self.assertEqual(Path(stage.arguments[2]).name, "evaluation_cameras.py")
+                self.assertNotIn("rename_map", stage.auto_flags)
+        self.assertEqual(Path(self.stage("libero_plus", after_training=True).arguments[2]).name,
+                         "evaluation_cameras.py")
+
+    def test_other_benchmarks_do_not_require_or_import_wand(self):
+        original = builtins.__import__
+
+        def without_wand(name, *args, **kwargs):
+            if name.startswith("wand"):
+                raise AssertionError("An unrelated benchmark must not load ImageMagick")
+            return original(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=without_wand):
+            for kind in ("libero", "robotwin", "robocasa", "vlabench"):
+                prepare_evaluation_runtime([f"--env.type={kind}"])
+
+    def test_libero_plus_initialization_failure_preserves_the_native_error(self):
+        image = ModuleType("wand.image")
+        image.Image = lambda **_: (_ for _ in ()).throw(OSError("missing native JPEG symbol"))
+        with patch.dict(sys.modules, {"wand.image": image}):
+            with self.assertRaisesRegex(RuntimeError, "ImageMagick initialization failed.*missing native JPEG symbol"):
+                prepare_evaluation_runtime(["--env.type=libero_plus"])
+
+    def test_standard_and_parallel_entrypoints_initialize_before_importing_evaluator_extensions(self):
+        from parallel_eval import main as parallel_main
+
+        for entrypoint in (main, parallel_main):
+            with self.subTest(entrypoint=entrypoint.__module__):
+                events = []
+
+                class Image:
+                    def __init__(self, **kwargs):
+                        events.append(("image", kwargs))
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *error):
+                        events.append(("image-close",))
+
+                image = ModuleType("wand.image")
+                image.Image = Image
+                evaluator = ModuleType("lerobot.scripts.lerobot_eval")
+                evaluator.main = lambda: events.append(("evaluate",)) or 29
+                scripts = ModuleType("lerobot.scripts")
+                scripts.lerobot_eval = evaluator
+                original = builtins.__import__
+
+                def ordered_import(name, *args, **kwargs):
+                    if name in ("lerobot.scripts", evaluator.__name__):
+                        self.assertIn(("image-close",), events,
+                                      "Native evaluator extensions must load after ImageMagick")
+                        events.append(("import-evaluator",))
+                    return original(name, *args, **kwargs)
+
+                with patch.dict(sys.modules, {image.__name__: image, evaluator.__name__: evaluator,
+                                              scripts.__name__: scripts}), \
+                     patch.object(sys, "argv", ["evaluation", "--env.type=libero_plus"]), \
+                     patch("builtins.__import__", side_effect=ordered_import), \
+                     patch("parallel_eval.track_parallel_rollouts"):
+                    self.assertEqual(entrypoint(), 29)
+                self.assertEqual(events[:2], [("image", {"width": 1, "height": 1}), ("image-close",)])
+                self.assertEqual(events[-1], ("evaluate",))
 
     def test_runtime_looks_up_a_new_checkpoint_before_the_standard_evaluator(self):
         self.checkpoint(("image", "second_image", "wrist_image"), ("camera1", "camera2", "camera3"))

@@ -31,9 +31,11 @@ from adapters import (
     read_json,
 )
 from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
+from evaluation_capabilities import evaluation_notices, stock_evaluation_issue
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
 from runtime_setup import RuntimeSetupFailure
+from runtime_activation import ActivationError, configure_clone_inheritance
 from runner import (ANSI, StageFailure, available_environments, conda_command, conda_executable, environment_catalog,
                     execute, load_settings, seconds, stage_title, styled)
 
@@ -1056,6 +1058,7 @@ class LeRobotEnvironments:
             self.names.add(target)
             ready = False
             try:
+                configure_clone_inheritance(self.conda, source, target, self.root)
                 result = subprocess.run(conda_command(self.conda, target, [*program, "--isolated"]), **process_options)
                 if result.returncode:
                     failures.append(result.stdout.strip() or f"Could not install {description} in {target}.")
@@ -1064,6 +1067,9 @@ class LeRobotEnvironments:
                 if ready:
                     self.selection_reason = prefix + f"Cloned from {source} after a package conflict; verified {description}."
                     return target
+            except (ActivationError, OSError, ValueError) as error:
+                failures.append(str(error) if isinstance(error, ActivationError)
+                                else "Could not configure runtime variables for the managed clone.")
             finally:
                 if not ready:
                     removed = subprocess.run([self.conda, "env", "remove", "--yes", "--name", target],
@@ -1102,12 +1108,15 @@ def choose_evaluation_environment(environments, preferred, model, tiny):
     manual = {kind for catalog in catalogs.values() for kind in catalog.get("manual_benchmarks", ())}
     options = ([("libero", "LIBERO (supported by TinyVLA)")] if tiny
                else benchmark_options(installable | installed.keys() | manual))
+    task_adapters = {kind for kind, _ in options if stock_evaluation_issue(kind)} if not tiny else set()
+    available = {kind: names for kind, names in available.items() if kind not in task_adapters}
     missing = {kind for kind, _ in options if kind not in available}
     reasons = {kind: ("Automatic Setup" if sys.platform == "linux" else "Requires Linux")
                if kind in SOURCE_BENCHMARKS or kind == "robomme" else "Manual Setup"
                for kind in missing & manual}
     reasons.update({kind: "Model Runtime Missing in " + ", ".join(installed[kind])
                     for kind in missing if kind in installed})
+    reasons.update({kind: "Task Adapter Required" for kind in task_adapters})
     options = [(kind, f"{label} [{', '.join(available[kind])}]" if kind in available else label)
                for kind, label in options]
     if not tiny:
@@ -1116,8 +1125,11 @@ def choose_evaluation_environment(environments, preferred, model, tiny):
     kind = choose("Evaluation Benchmark", options, default=default, unavailable=missing, reasons=reasons)
     if kind == "manual":
         kind = ask("LeRobot Environment Type")
+    task_issue = stock_evaluation_issue(kind) if not tiny else None
+    if task_issue:
+        print(task_issue)
     names = available.get(kind, [])
-    if not names and kind in missing:
+    if not task_issue and not names and kind in missing:
         if kind == "robomme" and not tiny:
             print("A separate RoboMME simulator can be selected or prepared automatically at launch.")
         elif kind in SOURCE_BENCHMARKS and not tiny:
@@ -1629,6 +1641,8 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
         if benchmark and not simulator_detail and f"Simulator {benchmark}" not in groups:
             notes.append(f"Simulator {benchmark}: package requirements unverified.")
         notes.extend(package_lines(groups, f"LeRobot {runtime} packages"))
+        if backend == "native" and evaluation and not (cfg.get("train") and model == "fineart_vla"):
+            notes.extend(evaluation_notices(model, evaluation))
         previous_notes = stage.environment_notes
         stage.environment_notes = tuple(notes)
         if not preview and previous_notes and previous_notes != stage.environment_notes:

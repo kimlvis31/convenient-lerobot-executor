@@ -10,6 +10,7 @@ import re
 import sys
 
 from evaluation_cameras import camera_mapping
+from evaluation_capabilities import stock_evaluation_issue
 from training_preflight import native_training_preflight
 
 
@@ -354,6 +355,8 @@ class NativeAdapter:
         cfg = self.settings["eval"]
         output = self.eval_dir
         kind, tasks = cfg["env"], cfg["tasks"]
+        if self.key == "native" and (issue := stock_evaluation_issue(kind, cfg.get("extra", ()))):
+            raise ValueError(issue)
         if "robomme_runtime" in cfg or "simulator_environment" in cfg:
             if kind != "robomme" or self.key != "native":
                 raise ValueError("The RoboMME runtime settings apply only to native RoboMME evaluation.")
@@ -444,8 +447,8 @@ class NativeAdapter:
             if mapping:
                 args.append(flag("rename_map", mapping))
                 automatic += ("rename_map",)
-            if mapping is None or kind == "robotwin":
-                # Resolve pending checkpoints and run RoboTwin beside its relative asset paths.
+            if mapping is None or kind in {"robotwin", "libero_plus"}:
+                # Resolve pending checkpoints and initialize source-specific evaluation runtimes.
                 helper = Path(__file__).with_name("evaluation_cameras.py").resolve()
                 args[:len(command)] = ["python", "-u", str(helper)]
         headless_mujoco = (kind in {"aloha", "robocasa", "vlabench"} and sys.platform == "linux"

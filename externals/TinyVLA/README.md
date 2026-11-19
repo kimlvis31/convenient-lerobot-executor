@@ -8,7 +8,7 @@ The executor finds this integration at `externals/TinyVLA/` in the convLexecutor
 | `models/Llava-Pythia-700M/` | Model configuration. The preparation script adds the public base weights and tokenizer vocabulary here. |
 | `runtime/tinyvla_loader.py` | Loads the pretrained vision-language weights and the action head |
 | `lerobot_policy_tinyvla/` | Connects TinyVLA inference to LeRobot evaluation |
-| `training/train_head.py` | Trains the action head on one or all 40 tasks and resumes from checkpoints |
+| `training/train_head.py` | Trains the action head, optionally with language-attention adapters, on one or all 40 tasks and resumes from checkpoints |
 | `training/lerobot_data.py` | Selects training episodes, serves batches, and exports episodes for offline training |
 
 See [third-party sources](../../THIRD_PARTY.md) for upstream code and model assets.
@@ -25,10 +25,11 @@ The default model directory, `models/Llava-Pythia-700M/`, needs the original `mo
 
 ## Training and evaluation
 
-- Training updates the action head and supports one or all 40 tasks. The dataset revision and training and held-out episodes are recorded in `selection.json`. Future-action chunks respect episode boundaries and mark padding after the last action.
-- `train/pretrained_model/` holds the full model and action-head weights. When `action_head.safetensors` is present, the evaluation worker verifies that the saved action-head tensors were loaded.
-- `train/checkpoints/training_state.pt` stores the action head, optimizer state, step count, and random state. The trainer replaces this file at each configured save interval. Resume requires the same training settings, selection, base weights, and runtime environment.
-- An older run's `train/pretrained_model/` and `selection.json` can initialize a new run with a fresh optimizer.
+- Training supports one or all 40 tasks. **Training Scope** offers the action head alone or the action head plus language-attention LoRA (Low-Rank Adaptation). The latter adds adapters to the GPT-NeoX language backbone's attention query/key/value projections; other backbone weights remain frozen. In a job dictionary, omit `train.lora` or set it to `None` for the action head alone, or set `train.lora` to `{"rank": 16, "alpha": 16, "dropout": 0.0}` for adapters. Rank and alpha must be positive integers, and dropout must be in `[0, 1)`. The direct trainer equivalent is `--lora-rank 16 --lora-alpha 16 --lora-dropout 0.0`; its default rank of 0 trains the action head alone. See [the job format](../../scripts/format_tinyvla.py).
+- The dataset revision and training and held-out episodes are recorded in `selection.json`. Future-action chunks respect episode boundaries and mark padding after the last action.
+- `train/pretrained_model/` holds the full exported model, with language-attention adapter weights merged when used. The separate `action_head.safetensors` contains only action-head tensors. When that file is present, the evaluation worker verifies that those saved tensors were loaded. Evaluation uses the full exported model and does not need to recreate the training adapters.
+- `train/checkpoints/training_state.pt` stores all trainable tensors, including any language-attention adapters, optimizer state, step count, sampler position, and random state. The trainer replaces this file at each configured save interval. Exact resume requires the same dataset selection, base model snapshot, loader/trainer, batch size, learning rate, seed, adapter settings, and planned total updates, with a compatible runtime. It continues an interrupted run toward its original target; changing the target or training configuration requires a new run.
+- An older run's `train/pretrained_model/` and `selection.json` can initialize a new run with a fresh optimizer. This route loads the full exported model, including any previously merged language changes, and creates new adapters only if requested. It does not restore the previous optimizer or unmerged adapter state.
 - The evaluation adapter expects two images, eight state values, seven action values, and chunks of up to 16 actions. Use 256-pixel images and relative control. The executor can run several LIBERO tasks concurrently. Each task has its own action queue and processors, and one GPU worker handles requests in sequence. The worker evaluates observation batches on the graphics device. Batch capacity depends on available device memory. The adapter preserves the original camera processing, action bounds, and gripper sign.
 
 The executor passes `--policy.model_path` and `--policy.worker_log_dir`. The original `--policy.step7_script` option remains supported. Each evaluation saves worker logs in `eval/worker_logs/` under its output directory. The adapter removes the worker code from its temporary directory at shutdown. Job script retention is handled by the executor.

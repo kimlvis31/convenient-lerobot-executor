@@ -399,10 +399,16 @@ def install_vlabench(build):
 
 
 PROBE = r'''
-import importlib,json,numpy as np,os,sys
+import importlib,json,os,sys
 from pathlib import Path
 kind=sys.argv[1]
 options=json.loads(sys.argv[2]) if len(sys.argv)>2 else {}
+from evaluation_cameras import prepare_evaluation_runtime
+prepare_evaluation_runtime(['--env.type='+kind])
+# Match the real entry point's native-extension import order before declaring
+# this runtime ready. Importing the simulator alone misses evaluator conflicts.
+importlib.import_module('lerobot.scripts.lerobot_eval')
+import numpy as np
 sources=json.loads(os.environ['CONVLEX_SOURCE_BENCHMARK'])
 for name,record in sources.items():
     module=importlib.import_module(name)

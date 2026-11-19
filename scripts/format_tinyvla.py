@@ -27,10 +27,13 @@ JOBS = [
             "lora": None,  # Optional. Add language attention LoRA to action-head training.
             # "lora": {"rank": 16, "alpha": 16, "dropout": 0.0},
             # "warm_start": "outputs/example/tinyvla_checkpoint/train/pretrained_model",
-            # Optional. Reuse action-head weights with a new optimizer.
+            # Optional. Start a new run with a fresh optimizer from the full
+            # exported model, including any merged language-adapter changes.
+            # Choose new updates or adapter settings here when desired.
             # "resume": "outputs/example/tinyvla_resume/train/checkpoints/training_state.pt",
             # Optional. Restore an interrupted run. Match its data, batch, seed,
-            # learning rate and LoRA settings. Use a target above the saved step.
+            # learning rate, base snapshot, trainer and LoRA settings. Keep its
+            # original planned updates target; exact resume does not extend it.
             # Choose one initialization route: base_model, warm_start or resume.
         },
     },

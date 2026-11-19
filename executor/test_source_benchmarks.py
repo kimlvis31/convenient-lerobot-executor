@@ -313,10 +313,21 @@ class SourceRecipeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "expected patch"):
                 _patch_once(build, target, "old line", "new line")
 
-    def run_probe(self, root, *, black_camera=False, wrong_source=False, nonfinite_state=False):
+    def run_probe(self, root, *, black_camera=False, wrong_source=False, nonfinite_state=False,
+                  kind="vlabench", evaluator_failure=False):
         import numpy as np
 
         calls = []
+        class Image:
+            def __init__(self, **kwargs):
+                calls.append(("wand", kwargs))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *error):
+                calls.append(("wand-close",))
+
         class VectorEnv:
             action_space = types.SimpleNamespace(shape=(1, 7))
 
@@ -346,12 +357,30 @@ class SourceRecipeTests(unittest.TestCase):
 
         configs = types.ModuleType("lerobot.envs.configs")
         configs.VLABenchEnv = Config
+        configs.LiberoPlusEnv = Config
         source = types.ModuleType("pinned_fixture")
         source.__file__ = str(Path(root) / ("wrong/source.py" if wrong_source else "source/source.py"))
         records = {"pinned_fixture": {"directory": str(Path(root) / "source"), "revision": "a" * 40}}
-        modules = {"lerobot.envs.configs": configs, "pinned_fixture": source}
+        image_module = types.ModuleType("wand.image")
+        image_module.Image = Image
+        evaluator = types.ModuleType("lerobot.scripts.lerobot_eval")
+        modules = {"lerobot.envs.configs": configs, "pinned_fixture": source,
+                   "wand.image": image_module, evaluator.__name__: evaluator}
+        import importlib
+        original_import = importlib.import_module
+
+        def guarded_import(name, *args, **kwargs):
+            if name == evaluator.__name__:
+                calls.append(("evaluator",))
+                if evaluator_failure:
+                    raise RuntimeError("evaluator native extension cannot load")
+                if kind == "libero_plus" and ("wand-close",) not in calls:
+                    raise RuntimeError("ImageMagick must initialize before the evaluator")
+            return original_import(name, *args, **kwargs)
+
         with patch.dict(sys.modules, modules), patch.dict(os.environ, {"CONVLEX_SOURCE_BENCHMARK": json.dumps(records)}), \
-                patch.object(sys, "argv", ["probe", "vlabench"]), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(sys, "argv", ["probe", kind]), patch("importlib.import_module", side_effect=guarded_import), \
+                patch("benchmarks.libero_plus_issue", return_value=None), contextlib.redirect_stdout(io.StringIO()):
             try:
                 exec(compile(PROBE, "source-runtime-probe", "exec"), {})
             except RuntimeError as error:
@@ -378,7 +407,7 @@ class SourceRecipeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             calls, error = self.run_probe(root, wrong_source=True)
             self.assertIn("outside the managed pinned source", str(error))
-            self.assertEqual([], calls)
+            self.assertEqual([("evaluator",)], calls)
 
     @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
     def test_nonfinite_joint_state_is_rejected_and_the_environment_is_closed(self):
@@ -387,6 +416,22 @@ class SourceRecipeTests(unittest.TestCase):
             self.assertIn("Nonfinite robot state", str(error))
             self.assertEqual(("close",), calls[-1])
             self.assertFalse(any(call[0] == "step" for call in calls))
+
+    @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
+    def test_libero_plus_probe_loads_image_libraries_then_the_real_evaluator_before_reset(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls, error = self.run_probe(root, kind="libero_plus")
+            self.assertIsNone(error)
+            self.assertEqual(calls[:3], [("wand", {"width": 1, "height": 1}),
+                                        ("wand-close",), ("evaluator",)])
+            self.assertEqual(calls[-3:], [("reset", 0), ("step", (1, 7)), ("close",)])
+
+    @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
+    def test_evaluator_import_failure_cannot_publish_readiness_even_if_simulator_alone_would_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls, error = self.run_probe(root, evaluator_failure=True)
+            self.assertIn("native extension cannot load", str(error))
+            self.assertEqual(calls, [("evaluator",)])
 
 
 if __name__ == "__main__":

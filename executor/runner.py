@@ -60,7 +60,9 @@ def conda_executable(explicit):
 
 def conda_command(conda, name, arguments):
     selector = "--prefix" if Path(name).is_absolute() else "-n"
-    return [conda, "run", "--no-capture-output", selector, name, *arguments]
+    helper = str(Path(__file__).with_name("runtime_activation.py"))
+    return [conda, "run", "--no-capture-output", selector, name,
+            "python", "-B", helper, "run", "--", *arguments]
 
 
 def available_environments(conda, root):

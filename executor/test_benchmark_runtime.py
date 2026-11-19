@@ -9,9 +9,49 @@ from unittest.mock import MagicMock, patch
 
 from benchmarks import data_runtime_issue, environment_catalog, install_dependencies, libero_plus_issue, maniskill_numpy_issue, simulator_runtime_issue
 from manage import LeRobotEnvironments
+from packaging.requirements import Requirement
 
 
 class LiberoPlusRuntimeTests(unittest.TestCase):
+    def test_flux_extension_is_installable_and_not_reported_ready_when_its_import_fails(self):
+        config = SimpleNamespace(__module__="lerobot.policies.flux3.configuration_flux3")
+        root = SimpleNamespace()
+        policies = SimpleNamespace()
+        modules = {
+            "lerobot": root, "lerobot.policies": policies,
+            "lerobot.configs": SimpleNamespace(PreTrainedConfig=SimpleNamespace(get_known_choices=lambda: {"flux3": config})),
+            "lerobot.envs.configs": SimpleNamespace(EnvConfig=SimpleNamespace(get_known_choices=lambda: {})),
+            "lerobot.policies.factory": SimpleNamespace(get_policy_class=MagicMock()),
+            "lerobot.utils.import_utils": SimpleNamespace(register_third_party_plugins=lambda: None),
+        }
+        for detail in ("Missing or outdated: natten>=0.21.6", "natten runtime import failed: undefined symbol"):
+            with self.subTest(detail=detail), patch.dict(sys.modules, modules), \
+                 patch("benchmarks.metadata.distribution"), patch("benchmarks.data_runtime_issue", return_value=None), \
+                 patch("benchmarks.installed_versions", return_value={"transformers": "5.5.4"}), \
+                 patch("benchmarks.optional_requirements", return_value=[]), \
+                 patch("benchmarks.policy_requirements", return_value=[Requirement("transformers>=5")]), \
+                 patch("benchmarks.extension_problems", return_value={"natten": detail}), \
+                 patch("benchmarks.extension_runtime_issue", return_value=None), \
+                 patch("benchmarks.util.find_spec", return_value=None):
+                result = environment_catalog()
+            self.assertFalse(result["policies"]["flux3"])
+            self.assertIn("flux3", result["policy_installable"])
+            self.assertIn(detail, result["policy_issues"]["flux3"])
+
+    def test_confirmed_flux_install_includes_registered_kernel_outside_pyproject_extra(self):
+        modules = {"lerobot": SimpleNamespace(), "lerobot.policies": SimpleNamespace(),
+                   "lerobot.configs": SimpleNamespace(PreTrainedConfig=SimpleNamespace(get_known_choices=lambda: {
+                       "flux3": SimpleNamespace(__module__="lerobot.policies.flux3.configuration_flux3")}))}
+        with patch.dict(sys.modules, modules), patch("benchmarks.metadata.distribution"), \
+             patch("benchmarks.installed_versions", return_value={"torch": "2.11.0"}), \
+             patch("benchmarks.policy_requirements", return_value=[]), \
+             patch("benchmarks.extension_problems", return_value={"natten": "missing"}), \
+             patch("benchmarks.install_extensions", return_value=[]) as install, \
+             patch("benchmarks.subprocess.run") as process:
+            self.assertEqual(install_dependencies(policy="flux3"), 0)
+        install.assert_called_once_with("flux3", {"torch": "2.11.0"}, [])
+        process.assert_not_called()
+
     def test_robotwin_rejects_the_active_numpy_when_it_conflicts_with_mplib(self):
         with patch("benchmarks.util.find_spec", return_value=object()), \
              patch("benchmarks.robotwin_directory", return_value=Path("/installed")), \

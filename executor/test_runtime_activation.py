@@ -39,7 +39,7 @@ class RuntimeActivationTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory(prefix="convlex-activation-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.base = self.root / "source prefix"
         (self.base / "conda-meta").mkdir(parents=True)
         self.state = self.base / "conda-meta/state"
@@ -181,6 +181,173 @@ class RuntimeActivationTests(unittest.TestCase):
         self.assertIn("sys.prefix", probe.call_args.args[0][-1])
         self.assertNotIn("env_vars", probe.call_args.args[0][-1])
         self.assertNotIn("HF_TOKEN", probe.call_args.args[0][-1])
+
+    def clone_prefix(self, name):
+        prefix = self.root / name
+        (prefix / "conda-meta").mkdir(parents=True, exist_ok=True)
+        return prefix
+
+    def run_clone_child(self, prefix, command, environment=None):
+        bootstrap = ("import sys; sys.path.insert(0, " + repr(str(Path(activation.__file__).parent)) + "); "
+                     "import runtime_activation; sys.prefix=" + repr(str(prefix)) + "; "
+                     "sys.exit(runtime_activation.main(['run', '--', *sys.argv[1:]]))")
+        return subprocess.run([sys.executable, "-B", "-c", bootstrap, *command],
+                              env=dict(os.environ if environment is None else environment),
+                              capture_output=True, text=True, timeout=20)
+
+    def test_named_clone_records_only_a_pointer_without_reading_credentials(self):
+        target = self.clone_prefix("named target")
+        secret = "dummy-token-not-for-marker"
+        self.write_state({"HF_TOKEN": secret, "HF_HUB_CACHE": "dummy-cache-path"})
+        original = self.state.read_bytes()
+        with patch.object(activation, "_environment_variables", side_effect=AssertionError("No state values at setup")):
+            record = activation.install_clone_inheritance(self.base, target)
+        self.assertEqual(record, {"schema": 1, "source_prefix": str(self.base)})
+        files = list(target.rglob("*"))
+        self.assertEqual([file.name for file in files if file.is_file()], [activation.CLONE_MARKER])
+        self.assertNotIn(secret, (target / "conda-meta" / activation.CLONE_MARKER).read_text())
+        self.assertEqual(self.state.read_bytes(), original)
+
+    def test_named_clone_inherits_caches_and_credentials_but_keeps_target_controls(self):
+        target = self.clone_prefix("named target")
+        self.write_state({"HF_TOKEN": "dummy-source", "HF_HUB_CACHE": "source-hub", "TORCH_HOME": "source-torch",
+                          "CUSTOM_SOURCE": "yes", "PATH": "unsafe-source-path", "PYTHONPATH": "unsafe-python",
+                          "CUDA_HOME": "unsafe-toolkit", "CONDA_PREFIX": "unsafe-conda"})
+        (target / "conda-meta/state").write_text(json.dumps({"env_vars": {"HF_TOKEN": "dummy-target",
+                                                                         "HF_HOME": "target-home"}}))
+        activation.install_clone_inheritance(self.base, target)
+        before = {"PATH": "target-path", "PYTHONPATH": "target-python", "CUDA_HOME": "target-toolkit",
+                  "CONDA_PREFIX": str(target), "HF_HOME": "parent-home", "HF_HUB_CACHE": "parent-cache"}
+        actual = activation.clone_environment(target, before)
+        self.assertEqual(actual["HF_TOKEN"], "dummy-target")
+        self.assertEqual(actual["HF_HUB_CACHE"], "source-hub")
+        self.assertEqual(actual["TORCH_HOME"], "source-torch")
+        self.assertEqual(actual["HF_HOME"], "target-home")
+        self.assertEqual(actual["CUSTOM_SOURCE"], "yes")
+        for name in ("PATH", "PYTHONPATH", "CUDA_HOME", "CONDA_PREFIX"):
+            self.assertEqual(actual[name], before[name])
+        self.assertEqual(before["HF_HUB_CACHE"], "parent-cache")
+
+    def test_clone_chains_apply_nearer_overrides_and_conda_unsets(self):
+        middle = self.clone_prefix("middle")
+        target = self.clone_prefix("target")
+        self.write_state({"HF_TOKEN": "dummy-base", "CUSTOM_BASE": "yes", "DROP_ME": "base"})
+        (middle / "conda-meta/state").write_text(json.dumps({"env_vars": {"HF_TOKEN": "dummy-middle"}}))
+        (target / "conda-meta/state").write_text(json.dumps({"env_vars": {"DROP_ME": activation.UNSET_SENTINEL}}))
+        activation.install_clone_inheritance(self.base, middle)
+        activation.install_clone_inheritance(middle, target)
+        actual = activation.clone_environment(target, {"DROP_ME": "parent"})
+        self.assertEqual(actual["HF_TOKEN"], "dummy-middle")
+        self.assertEqual(actual["CUSTOM_BASE"], "yes")
+        self.assertNotIn("DROP_ME", actual)
+        with self.assertRaisesRegex(activation.ActivationError, "cyclic"):
+            activation.install_clone_inheritance(target, self.base)
+        (middle / "conda-meta" / activation.CLONE_MARKER).write_text(
+            json.dumps({"schema": 1, "source_prefix": str(target)}))
+        with self.assertRaisesRegex(activation.ActivationError, "cyclic"):
+            activation.clone_environment(target, {})
+
+    def test_clone_preserves_managed_dataset_and_system_cache_paths(self):
+        target = self.clone_prefix("target")
+        self.write_state({"HF_LEROBOT_HOME": "source-datasets-outside-project",
+                          "XDG_CACHE_HOME": "source-system-cache", "HF_HUB_CACHE": "source-model-cache"})
+        (target / "conda-meta/state").write_text(json.dumps({"env_vars": {
+            "HF_LEROBOT_HOME": "target-declared-datasets-outside-project"}}))
+        activation.install_clone_inheritance(self.base, target)
+        before = {"HF_LEROBOT_HOME": "project/datasets/.hub", "XDG_CACHE_HOME": "managed-system-cache"}
+        actual = activation.clone_environment(target, before)
+        self.assertEqual(actual["HF_LEROBOT_HOME"], before["HF_LEROBOT_HOME"])
+        self.assertEqual(actual["XDG_CACHE_HOME"], before["XDG_CACHE_HOME"])
+        self.assertEqual(actual["HF_HUB_CACHE"], "source-model-cache")
+        self.assertNotIn("HF_LEROBOT_HOME", activation.clone_environment(target, {}))
+
+    def test_clone_chain_depth_is_bounded_before_new_marker_is_written(self):
+        middle, target = self.clone_prefix("middle"), self.clone_prefix("target")
+        activation.install_clone_inheritance(self.base, middle)
+        with patch.object(activation, "MAX_CLONE_DEPTH", 1):
+            with self.assertRaisesRegex(activation.ActivationError, "too deep"):
+                activation.install_clone_inheritance(middle, target)
+        self.assertFalse((target / "conda-meta" / activation.CLONE_MARKER).exists())
+
+    def test_unmarked_environment_passes_through_without_reading_state_or_writing_files(self):
+        target = self.clone_prefix("unmarked")
+        before = {"HF_TOKEN": "dummy-parent", "PATH": "parent-path"}
+        with patch.object(activation, "_environment_variables", side_effect=AssertionError("No inheritance")):
+            self.assertEqual(activation.clone_environment(target, before), before)
+        self.assertEqual(list((target / "conda-meta").iterdir()), [])
+        result = self.run_clone_child(target, [sys.executable, "-c", "import sys; sys.exit(7)"])
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX exec signal propagation")
+    def test_unmarked_command_replaces_wrapper_and_preserves_termination_signal(self):
+        import signal
+
+        target = self.clone_prefix("unmarked")
+        result = self.run_clone_child(target, [sys.executable, "-c",
+                                              "import os,signal; os.kill(os.getpid(), signal.SIGTERM)"])
+        self.assertEqual(result.returncode, -signal.SIGTERM)
+        self.assertEqual(result.stderr, "")
+
+    def test_conda_commands_use_the_same_portable_wrapper_and_keep_original_argument_tail(self):
+        from runner import conda_command
+
+        for name, selector in (("named", "-n"), (str(self.prefix), "--prefix")):
+            arguments = ["lerobot-train", "--job_name=literal ; $(false)"]
+            command = conda_command("conda", name, arguments)
+            self.assertEqual(command[:5], ["conda", "run", "--no-capture-output", selector, name])
+            self.assertEqual(command[5:10], ["python", "-B", str(Path(activation.__file__)), "run", "--"])
+            self.assertEqual(command[10:], arguments)
+
+    def test_real_clone_child_preserves_argv_and_literal_environment_values_without_shell(self):
+        target = self.clone_prefix("quoted target")
+        literal = "dummy'\"\n$(false); & %PATH% ! `false`"
+        self.write_state({"HF_TOKEN": literal, "HF_HUB_CACHE": "source cache with spaces"})
+        activation.install_clone_inheritance(self.base, target)
+        argument = "literal' \" ; $(false) & %PATH%"
+        child = ("import os,sys; assert os.environ['HF_TOKEN']==" + repr(literal) + "; "
+                 "assert os.environ['HF_HUB_CACHE']=='source cache with spaces'; "
+                 "assert sys.argv[1]==" + repr(argument) + "; print('child-ok')")
+        result = self.run_clone_child(target, [sys.executable, "-B", "-c", child, argument])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "child-ok\n")
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn(literal, (target / "conda-meta" / activation.CLONE_MARKER).read_text())
+
+    def test_bad_clone_source_state_fails_without_leaking_its_contents(self):
+        target = self.clone_prefix("target")
+        activation.install_clone_inheritance(self.base, target)
+        self.state.write_text('{"env_vars":{"HF_TOKEN":"dummy-secret-malformed"')
+        result = self.run_clone_child(target, [sys.executable, "-c", "raise SystemExit(99)"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Cannot read the source Conda", result.stderr)
+        self.assertNotIn("dummy-secret", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_clone_prefix_probe_reports_only_prefixes_and_uses_no_wrapper(self):
+        target = self.clone_prefix("target")
+        replies = [SimpleNamespace(returncode=0, stdout="CONVLEX_CLONE_PREFIX " + str(prefix) + "\n")
+                   for prefix in (self.base, target)]
+        with patch.object(activation.subprocess, "run", side_effect=replies) as probe:
+            activation.configure_clone_inheritance("conda", "source", "target", self.root)
+        self.assertEqual(len(probe.call_args_list), 2)
+        for call in probe.call_args_list:
+            command = call.args[0]
+            self.assertIn("sys.prefix", command[-1])
+            self.assertNotIn("env_vars", command[-1])
+            self.assertNotIn("runtime_activation.py", command)
+
+    @unittest.skipUnless(os.name == "posix", "Symlink marker ownership")
+    def test_clone_marker_cannot_redirect_writes_outside_new_target(self):
+        target = self.clone_prefix("target")
+        outside = self.root / "outside-marker"
+        outside.write_text("keep")
+        (target / "conda-meta" / activation.CLONE_MARKER).symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "inside the managed"):
+            activation.install_clone_inheritance(self.base, target)
+        self.assertEqual(outside.read_text(), "keep")
 
 
 if __name__ == "__main__":

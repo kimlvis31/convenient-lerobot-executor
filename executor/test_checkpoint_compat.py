@@ -1,5 +1,6 @@
 """Regression coverage for the legacy checkpoint preparation step."""
 
+import builtins
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import make_dataclass
 import io
@@ -290,6 +291,48 @@ class CheckpointCompatibilityTests(unittest.TestCase):
         self.assertEqual(original.call_args.kwargs["revision"], revision)
         self.assertIs(pretrained.get_peft_model, original)
         self.assertIs(actual.make_pre_post_processors, processor)
+
+    def test_pinned_evaluation_initializes_libero_plus_before_native_config_or_evaluator_imports(self):
+        events = []
+        revision = "d" * 40
+        class Image:
+            def __init__(self, **kwargs):
+                events.append("image")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *error):
+                events.append("image-close")
+
+        class Config:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                return SimpleNamespace()
+
+        evaluator = SimpleNamespace(main=lambda: events.append("evaluate") or 31,
+                                    make_pre_post_processors=Mock())
+        modules = {
+            "wand.image": SimpleNamespace(Image=Image),
+            "huggingface_hub": SimpleNamespace(hf_hub_download=Mock(
+                return_value=str(self.root / revision / "config.json"))),
+            "lerobot.configs": SimpleNamespace(PreTrainedConfig=Config),
+            "lerobot.scripts": SimpleNamespace(lerobot_eval=evaluator),
+        }
+        original = builtins.__import__
+
+        def ordered_import(name, *args, **kwargs):
+            if name in ("lerobot.configs", "lerobot.scripts"):
+                self.assertIn("image-close", events)
+                events.append(name)
+            return original(name, *args, **kwargs)
+
+        with patch.dict(sys.modules, modules), \
+             patch.object(sys, "argv", ["native", "--env.type=libero_plus"]), \
+             patch("builtins.__import__", side_effect=ordered_import), redirect_stdout(io.StringIO()):
+            self.assertEqual(pinned_entrypoint("eval", "team/policy", "release"), 31)
+        self.assertEqual(events[:2], ["image", "image-close"])
+        self.assertEqual(events[-1], "evaluate")
 
     def test_molmo_preserves_full_weight_topology_and_training_fields(self):
         config = {"type": "molmoact2", **dict.fromkeys(LEGACY_FLAGS, False), "model_dtype": "bfloat16",
