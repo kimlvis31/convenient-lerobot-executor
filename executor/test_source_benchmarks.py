@@ -1,6 +1,7 @@
 """Small offline checks for managed source recipe ownership and asset lifecycle."""
 
 import contextlib
+from importlib.util import find_spec
 import io
 import json
 import os
@@ -357,12 +358,14 @@ class SourceRecipeTests(unittest.TestCase):
                 return calls, error
         return calls, None
 
+    @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
     def test_ready_probe_executes_reset_then_action_step_and_closes(self):
         with tempfile.TemporaryDirectory() as root:
             calls, error = self.run_probe(root)
             self.assertIsNone(error)
             self.assertEqual([("reset", 0), ("step", (1, 7)), ("close",)], calls[-3:])
 
+    @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
     def test_failed_camera_probe_closes_the_environment_without_publishing_readiness(self):
         with tempfile.TemporaryDirectory() as root:
             calls, error = self.run_probe(root, black_camera=True)
@@ -370,12 +373,14 @@ class SourceRecipeTests(unittest.TestCase):
             self.assertEqual(("close",), calls[-1])
             self.assertFalse(any(call[0] == "step" for call in calls))
 
+    @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
     def test_shadowed_upstream_package_is_rejected_before_creating_the_simulator(self):
         with tempfile.TemporaryDirectory() as root:
             calls, error = self.run_probe(root, wrong_source=True)
             self.assertIn("outside the managed pinned source", str(error))
             self.assertEqual([], calls)
 
+    @unittest.skipUnless(find_spec("numpy"), "NumPy is required for simulator readiness probes")
     def test_nonfinite_joint_state_is_rejected_and_the_environment_is_closed(self):
         with tempfile.TemporaryDirectory() as root:
             calls, error = self.run_probe(root, nonfinite_state=True)
