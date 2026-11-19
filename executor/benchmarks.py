@@ -1,6 +1,7 @@
 """Inspect and install policy and simulation dependencies in the selected LeRobot environment."""
 
 import argparse
+import ast
 from dataclasses import fields, is_dataclass
 from importlib import metadata, util
 from importlib.machinery import PathFinder
@@ -155,6 +156,54 @@ SIMULATOR_REQUIREMENTS = {
 }
 
 
+def data_runtime_issue():
+    if util.find_spec("pyarrow") is None:
+        return None
+    try:
+        import pyarrow
+    except (ImportError, OSError, ValueError, AttributeError) as error:
+        return (f"PyArrow cannot load in this interpreter ({error}). Check the active NumPy and PyArrow "
+                "against the requirements of LeRobot and the simulator before installing packages.")
+    return None
+
+
+def maniskill_numpy_issue(spec):
+    from packaging.requirements import Requirement
+
+    # A source checkout can shadow an unrelated installed distribution.
+    root = Path(next(iter(spec.submodule_search_locations)))
+    setup = root.parent / "setup.py"
+    if setup.is_file() and root.name == "mani_skill":
+        try:
+            tree = ast.parse(setup.read_text(encoding="utf-8"))
+        except (OSError, ValueError, SyntaxError):
+            return None
+        requirements = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, (ast.List, ast.Tuple)):
+                continue
+            if any(isinstance(target, ast.Name) and target.id == "install_requires" for target in node.targets):
+                requirements.extend(item.value for item in node.value.elts
+                                    if isinstance(item, ast.Constant) and isinstance(item.value, str))
+    else:
+        try:
+            requirements = metadata.requires("mani_skill") or ()
+        except metadata.PackageNotFoundError:
+            return None
+    for text in requirements:
+        if not text.lower().startswith("numpy"):
+            continue
+        requirement = Requirement(text)
+        if requirement.name.lower() != "numpy" or (requirement.marker and not requirement.marker.evaluate()):
+            continue
+        import numpy
+
+        if not requirement.specifier.contains(numpy.__version__, prereleases=True):
+            return (f"RoboMME's ManiSkill requires {requirement}, but this interpreter loads NumPy "
+                    f"{numpy.__version__}. Select a compatible RoboMME environment.")
+    return None
+
+
 def simulator_runtime_issue(benchmark):
     modules, assets = SIMULATOR_REQUIREMENTS[benchmark]
     specs = {name: util.find_spec(name) for name in modules}
@@ -171,6 +220,8 @@ def simulator_runtime_issue(benchmark):
     for pattern in assets:
         if not any(root.glob(pattern)):
             return f"Missing simulator files under {root}: {pattern}."
+    if benchmark == "robomme":
+        return maniskill_numpy_issue(specs["mani_skill"])
     return None
 
 
@@ -202,6 +253,8 @@ def policy_training_options(config):
 
 def environment_catalog():
     distribution = metadata.distribution("lerobot")
+    if issue := data_runtime_issue():
+        return {"runtime_issue": issue}
     from lerobot.configs import PreTrainedConfig
     from lerobot.envs.configs import EnvConfig
     from lerobot.policies.factory import get_policy_class
@@ -313,6 +366,8 @@ def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False
         requirements.extend(declared)
     needed = sorted({str(req) for req in requirements if not installed(req, versions)})
     if not needed:
+        if runtime and (issue := data_runtime_issue()):
+            raise ValueError(issue)
         print("Requested dependencies are already installed.")
         return 0
 

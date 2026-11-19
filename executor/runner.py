@@ -667,8 +667,11 @@ def run_stage(command, stage, root, logfile, update, write_message=None, *, nati
     try:
         for item in stage.artifacts:
             require(item)
-        if stage.artifacts and not isinstance(read_json(stage.artifacts[0]), dict):
-            raise ValueError(f"Expected a result object ({stage.artifacts[0]}).")
+        if stage.artifacts:
+            result = read_json(stage.artifacts[0])
+            if not isinstance(result, dict):
+                raise ValueError(f"Expected a result object ({stage.artifacts[0]}).")
+            return result
     except (OSError, ValueError) as error:
         raise StageFailure(stage.name, code, logfile, artifact_error=error) from error
 
@@ -807,9 +810,9 @@ def run_job(job, run_dir):
                         write_message(f"Time estimate scope · {scope}")
                     eta_scope = scope
                 fraction = 1 if completed else progress.fraction()
-                count = stage.units if completed and stage.units is not None else progress.count
+                count = progress.total if completed and progress.total is not None else progress.count
                 completion = 100 * (index + fraction) / len(stages)
-                line = status_line(completion, count, stage.units, stage.name, display_eta, progress.average())
+                line = status_line(completion, count, progress.total, stage.name, display_eta, progress.average())
                 episode = None
                 if active_episodes and not completed:
                     task, (current, limit) = min(
@@ -817,7 +820,7 @@ def run_job(job, run_dir):
                     )
                     episode = (task, current, limit)
                 show_status(line, completion, episode)
-                saved.update(units_done=count, units_total=stage.units, eta_seconds=eta,
+                saved.update(units_done=count, units_total=progress.total, eta_seconds=eta,
                              overall_eta_seconds=overall)
                 if stage.name == "eval":
                     saved["average_seconds_per_episode"] = progress.average()
@@ -877,11 +880,16 @@ def run_job(job, run_dir):
                 save_status()
                 try:
                     native = (job["conda"], settings["model"]) if job.get("conda") and settings["adapter"] == "native" else None
-                    run_stage(stage.arguments, stage, root, stage_log / f"{stage.name}.log",
-                              update, write_message if job["verbose"] else None, native=native)
+                    result = run_stage(stage.arguments, stage, root, stage_log / f"{stage.name}.log",
+                                       update, write_message if job["verbose"] else None, native=native)
                 finally:
                     saved.update(seconds=time.monotonic()-begin, ended_at=datetime.now(timezone.utc).isoformat())
                 saved["status"] = "completed"
+                if stage.name == "eval" and result:
+                    overall = result.get("overall", result.get("aggregated"))
+                    episodes = overall.get("n_episodes") if isinstance(overall, dict) else None
+                    if type(episodes) is int and episodes >= 0:
+                        progress.total = episodes
                 report(time.monotonic(), completed=True)
                 save_status()
         status["status"] = "completed"

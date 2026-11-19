@@ -7,11 +7,39 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from benchmarks import libero_plus_issue, simulator_runtime_issue
+from benchmarks import data_runtime_issue, environment_catalog, install_dependencies, libero_plus_issue, maniskill_numpy_issue, simulator_runtime_issue
 from manage import LeRobotEnvironments
 
 
 class LiberoPlusRuntimeTests(unittest.TestCase):
+    def test_missing_arrow_binary_is_reported_before_launch(self):
+        issue = "PyArrow cannot load in this interpreter"
+        with patch("benchmarks.util.find_spec", return_value=object()), patch.dict(sys.modules, {"pyarrow": None}):
+            self.assertIn(issue, data_runtime_issue())
+            with patch("benchmarks.metadata.distribution"):
+                self.assertIn(issue, environment_catalog()["runtime_issue"])
+                with patch("benchmarks.installed_versions", return_value={}):
+                    with self.assertRaisesRegex(ValueError, issue):
+                        install_dependencies(runtime="evaluation")
+        envs = LeRobotEnvironments("conda", Path("."), "broken", {"broken", "ready"})
+        envs.catalogs = {"broken": {"runtime_issue": issue},
+                         "ready": {"policies": {"smolvla": True}, "manual_status": {"robomme": None}}}
+        with patch("manage.subprocess.run") as run:
+            self.assertEqual(envs.prepare("broken", model="smolvla", benchmark="robomme", runtime="evaluation"), "ready")
+            with self.assertRaisesRegex(RuntimeError, issue):
+                envs.prepare("broken", model="smolvla", benchmark="robomme", pinned=True, runtime="evaluation")
+            run.assert_not_called()
+
+    def test_maniskill_checks_the_effective_numpy_against_its_own_declaration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "mani_skill"
+            source.mkdir()
+            (source.parent / "setup.py").write_text("install_requires = ['numpy>=1.22,<2']")
+            spec = SimpleNamespace(submodule_search_locations=[str(source)])
+            for version, incompatible in (("1.26.4", False), ("2.2.5", True)):
+                with self.subTest(version=version), patch.dict(sys.modules, {"numpy": SimpleNamespace(__version__=version)}):
+                    self.assertEqual(bool(maniskill_numpy_issue(spec)), incompatible)
+
     def test_stock_libero_is_not_a_prepared_plus_runtime(self):
         with tempfile.TemporaryDirectory() as folder:
             package = SimpleNamespace(submodule_search_locations=[folder])

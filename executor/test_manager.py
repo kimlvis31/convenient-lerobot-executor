@@ -183,6 +183,21 @@ class ManagerTests(unittest.TestCase):
             execute([resumed], settings, self.logs / retry.run_name, self.root, "fake", False)
         self.assertEqual(read_json(retry.train_dir / "train/checkpoints/last/training_state/training_step.json")["step"], 10)
 
+    def test_completed_dynamic_suite_uses_the_total_reported_by_the_evaluator(self):
+        settings = sample_settings()
+        settings["eval"].update(env="vlabench", tasks=["select_poker"], task_ids=[], policy=str(self.root))
+        adapter = NativeAdapter(settings, "dynamic", self.root, self.external, self.envs)
+        stage = adapter.evaluate(False)
+        self.assertIsNone(stage.units)
+        self.backend.write_text(FAKE_BACKEND.replace('"pc_success":0', '"pc_success":0,"n_episodes":2'))
+        with patch("runner.resolve_environment", return_value=self.environment), \
+             patch("runner.conda_command", side_effect=lambda c, e, argv: [sys.executable, "-u", str(self.backend), *argv]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            execute([stage], settings, self.logs / "dynamic", self.root, "fake", False)
+        self.assertIn("100.000 % | 2/2 Episodes", output.getvalue())
+        status = read_json(self.logs / "dynamic/status.json")["stages"][0]
+        self.assertEqual((status["units_done"], status["units_total"]), (2, 2))
+
     def test_zero_exit_without_eval_artifact_is_failed(self):
         settings = sample_settings()
         run = self.logs / "failed"

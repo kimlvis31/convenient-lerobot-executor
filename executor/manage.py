@@ -696,6 +696,11 @@ class LeRobotEnvironments:
             catalogs[preferred] = catalog
         if not catalogs:
             return preferred
+        unavailable = {name: entry["runtime_issue"] for name, entry in catalogs.items() if entry.get("runtime_issue")}
+        catalogs = {name: entry for name, entry in catalogs.items() if name not in unavailable}
+        if not catalogs:
+            details = " ".join(f"{name}: {issue}" for name, issue in unavailable.items())
+            raise RuntimeError(f"No usable LeRobot runtime. {details}")
 
         check_policy = tiny or any(model in entry.get("policies", {}) for entry in catalogs.values())
         check_benchmark = benchmark is not None and any(
@@ -704,6 +709,8 @@ class LeRobotEnvironments:
             for entry in catalogs.values()
         )
         if pinned or (not check_policy and runtime != "dataset") or (benchmark is not None and not check_benchmark):
+            if preferred in unavailable:
+                raise RuntimeError(f"Cannot use Conda environment {preferred}: {unavailable[preferred]}")
             catalogs = {preferred: catalogs.get(preferred, {})}
 
         def policy_ready(entry):
@@ -757,11 +764,11 @@ class LeRobotEnvironments:
 
         def verify(target, description):
             refreshed = self.catalog(target, refresh=True)
-            if (refreshed and policy_ready(refreshed) and benchmark_ready(refreshed) and runtime_ready(refreshed)
-                    and (not peft or refreshed.get("peft_ready"))):
+            if (refreshed and not refreshed.get("runtime_issue") and policy_ready(refreshed)
+                    and benchmark_ready(refreshed) and runtime_ready(refreshed) and (not peft or refreshed.get("peft_ready"))):
                 print(f"  Dependencies ready in {target}.", flush=True)
                 return True
-            issue = refreshed.get("policy_issues", {}).get(model)
+            issue = refreshed.get("runtime_issue") or refreshed.get("policy_issues", {}).get(model)
             detail = f" ({issue})" if issue else ""
             failures.append(f"Could not verify {description} in {target} after installation{detail}.")
             return False
