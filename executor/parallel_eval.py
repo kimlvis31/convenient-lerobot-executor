@@ -167,6 +167,10 @@ def track_parallel_rollouts(evaluator):
         task_state.batch = env.num_envs
         task_state.label = f"{task_group}/{task_id}"
         try:
+            if "max_episodes_rendered" in options:
+                # The final vector batch can contain unused episode slots.
+                # Upstream discards their metrics; do not save extra videos.
+                options["max_episodes_rendered"] = min(options["max_episodes_rendered"], options["n_episodes"])
             policy = options["policy"]
             # TinyVLA already owns thread-local queues and a locked shared
             # worker. Copying its subprocess/channel would break that protocol.

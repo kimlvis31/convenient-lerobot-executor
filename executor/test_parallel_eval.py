@@ -160,6 +160,18 @@ class ParallelEvaluationTests(unittest.TestCase):
             self.assertIn("Parallel evaluation tasks: 1 (20 requested, 1 available)", output.getvalue())
             self.assertIn("[Eval progress] Episodes completed: 1", output.getvalue())
 
+    def test_render_limit_excludes_unused_final_batch_slots_and_preserves_lower_limits(self):
+        evaluator = evaluator_fixture()
+        evaluator.run_one = lambda group, task, env, **options: options["max_episodes_rendered"]
+        restore = track_parallel_rollouts(evaluator)
+        self.addCleanup(restore)
+        for requested, expected in ((10, 3), (2, 2), (0, 0)):
+            with self.subTest(requested=requested):
+                actual = evaluator.run_one("suite", 0, Environment(0), policy=Policy(), n_episodes=3,
+                                           max_episodes_rendered=requested, env_preprocessor={},
+                                           env_postprocessor={}, preprocessor={}, postprocessor={})
+                self.assertEqual(actual, expected)
+
     def test_one_available_task_does_not_require_copying_policy_runtime_objects(self):
         evaluator = self.instrument()
         policy = Policy()
