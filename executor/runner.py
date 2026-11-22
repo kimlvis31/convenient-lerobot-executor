@@ -28,6 +28,7 @@ NATIVE_STEP = re.compile(r"\bstep:\s*(\d+(?:\.\d+)?)([KMB]?)\b(?![/\d.])", re.I)
 TINY_STEP = re.compile(r"\bstep:(\d+)/(\d+)\b")
 CHECKPOINT_STEP = re.compile(r"\bCheckpoint policy after step (\d+)\b")
 PARALLEL_EPISODES = re.compile(r"^\[Eval progress\] Episodes completed: (\d+)$")
+EVAL_TOTAL_EPISODES = re.compile(r"^\[Eval progress\] Total episodes: (\d+)$")
 ROLLOUT_ENDED = re.compile(r"\[Eval progress\] Rollout ended: (\S+)$")
 EVAL_BATCH = re.compile(r"Stepping through eval batches[^|]*\|[^|]*\|\s*(\d+)\s*/\s*(\d+)")
 
@@ -196,6 +197,13 @@ class Progress:
         return None
 
     def update(self, line, when):
+        if self.stage.name == "eval" and (match := EVAL_TOTAL_EPISODES.fullmatch(line)):
+            total = int(match[1])
+            if total > 0 and total >= (self.count or 0):
+                self.total = total
+                self.stage.units = total
+                return True
+            return False
         count = self.parse(line)
         if count is None or (self.total is not None and count > self.total):
             return False
@@ -850,8 +858,8 @@ def run_job(job, run_dir):
                 if show_episode and (ended := ROLLOUT_ENDED.search(line)):
                     if active_episodes.pop(ended[1], None) is not None:
                         report(now)
-                previous_count = progress.count
-                if not progress.update(line, now) or progress.count == previous_count:
+                previous_count, previous_total = progress.count, progress.total
+                if not progress.update(line, now) or (progress.count, progress.total) == (previous_count, previous_total):
                     return
                 active_episodes.pop(None, None)
                 if now - last_print < TOTAL_REFRESH_SECONDS and progress.count != stage.units:

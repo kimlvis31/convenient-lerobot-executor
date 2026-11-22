@@ -576,7 +576,7 @@ def eval_settings(model, tiny, train, inventory, env_type):
     cfg = {"env": env_type, "tasks": tasks,
            "episodes": number("Episodes per Task", 5), "batch": number("Evaluation Batch Size", 1),
            "seed": number("Random Seed", 0, 0), "device": "cpu" if tiny else ask("Evaluation Device", "cuda")}
-    if tiny:
+    if env_type not in SINGLE_TASK_BENCHMARKS:
         cfg["parallel_tasks"] = number("Parallel Evaluation Tasks", 1)
     if train is None:
         cfg["policy"] = choose_model(inventory, model, optional=tiny)

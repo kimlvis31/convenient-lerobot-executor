@@ -382,12 +382,13 @@ class NativeAdapter:
         if type(parallel) is not int or parallel < 1:
             raise ValueError("Parallel evaluation tasks must be a positive integer.")
         if parallel > 1:
-            if self.key != "tinyvla" or kind != "libero":
-                raise ValueError("Parallel tasks are currently supported for TinyVLA LIBERO evaluation.")
+            if kind in SINGLE_TASK_BENCHMARKS:
+                raise ValueError(f"The {kind} benchmark has one task per job; use batch for parallel episodes.")
             command = ["python", "-u", str(Path(__file__).with_name("parallel_eval.py").resolve())]
         else:
             command = ["lerobot-eval"]
         args = [*command, flag("env.type", kind), flag("env.task", ",".join(tasks)),
+                flag("env.max_parallel_tasks", parallel),
                 flag("eval.n_episodes", episodes), flag("eval.batch_size", batch),
                 flag("seed", cfg["seed"]), flag("output_dir", output)]
         units = episodes if kind in SINGLE_TASK_BENCHMARKS else None
@@ -419,7 +420,7 @@ class NativeAdapter:
                 raise ValueError("LIBERO control mode must be absolute or relative.")
             if type(size) is not int or size < 1:
                 raise ValueError("LIBERO camera size must be a positive integer.")
-            args += [flag("env.max_parallel_tasks", parallel), flag("env.control_mode", control),
+            args += [flag("env.control_mode", control),
                      "--env.obs_type=pixels_agent_pos", flag("env.observation_width", size),
                      flag("env.observation_height", size)]
             if ids or kind == "libero" and set(tasks) <= set(SUITES):
@@ -447,7 +448,7 @@ class NativeAdapter:
             if mapping:
                 args.append(flag("rename_map", mapping))
                 automatic += ("rename_map",)
-            if mapping is None or kind in {"robotwin", "libero_plus"}:
+            if parallel == 1 and (mapping is None or kind in {"robotwin", "libero_plus"}):
                 # Resolve pending checkpoints and initialize source-specific evaluation runtimes.
                 helper = Path(__file__).with_name("evaluation_cameras.py").resolve()
                 args[:len(command)] = ["python", "-u", str(helper)]

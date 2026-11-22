@@ -5,7 +5,8 @@
 # eval.policy to a compatible Hugging Face repository ID or the local snapshot
 # shown in the inventory. Set eval.device to "cuda" or "cpu". Match the
 # checkpoint's environment, camera size, and control mode.
-# parallel_tasks and action_steps below are TinyVLA evaluation options.
+# parallel_tasks also works with native policies on multi-task benchmarks.
+# action_steps below is a TinyVLA evaluation option.
 # Optional TinyVLA training setting: "lora": {"rank": 16, "alpha": 16, "dropout": 0.0}.
 # This adds language-attention LoRA to the action head. Exact resume keeps the original settings.
 # Native train settings can include policy_options (for example, {"optimizer_lr": 0.0001}).

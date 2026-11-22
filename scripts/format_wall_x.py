@@ -60,6 +60,7 @@ JOBS = [
             "tasks": ["AlohaInsertion-v0"],  # Required. Task name for this simulator.
             "episodes": 1,  # Required. Episodes per task. Increase this for a benchmark run.
             "batch": 1,  # Required. Parallel episode slots per task, capped by episodes.
+            "parallel_tasks": 1,  # Optional. Distinct tasks concurrently; use 1 for single-task benchmarks.
             "seed": 0,  # Required. Evaluation seed.
             "device": "cuda",  # Required. Use a device supported by the policy.
             "episode_length": 0,  # Optional. Simulator default when 0.

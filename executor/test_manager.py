@@ -807,7 +807,7 @@ class ManagerTests(unittest.TestCase):
         cases = ((("x", "0,0", "-1", "10", "0,9"), [0, 9]), (("ALL",), []))
         for answers, expected in cases:
             with self.subTest(answers=answers):
-                inputs = "\n".join(("1", "", "", "", "", *answers, "", "", "", "", ""))
+                inputs = "\n".join(("1", "", "", "", "", "", *answers, "", "", "", "", ""))
                 with patch("sys.stdin", io.StringIO(inputs)), contextlib.redirect_stdout(io.StringIO()) as menu:
                     cfg = eval_settings("act", False, {"steps": 4}, Inventory(), "libero")
                 self.assertEqual(cfg["task_ids"], expected)
@@ -1475,7 +1475,7 @@ class ManagerTests(unittest.TestCase):
             adapter.evaluate(False)
 
     def test_libero_plus_wizard_defaults_to_one_variant(self):
-        answers = io.StringIO("1\n\n\n\n\n\n5\n\n224\n\n")
+        answers = io.StringIO("1\n\n\n\n\n\n\n5\n\n224\n\n")
         with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as screen:
             config = eval_settings("smolvla", False, {"steps": 4}, Inventory(), "libero_plus")
         self.assertIn("Variant IDs per Suite", screen.getvalue())
@@ -1495,6 +1495,59 @@ class ManagerTests(unittest.TestCase):
         config.update(env="pusht", tasks=["PushT-v0"])
         with self.assertRaisesRegex(ValueError, "does not support task IDs"):
             adapter.evaluate(False)
+
+    def test_native_parallel_evaluation_plans_all_models_and_multitask_benchmarks(self):
+        from manage import REFERENCE_MODEL_SIZES
+
+        for model in (REFERENCE_MODEL_SIZES.keys() | {"tdmpc", "gaussian_actor"}) - {"tinyvla"}:
+            for kind in ("libero", "libero_plus", "metaworld", "robomme", "robotwin",
+                         "robocasa", "vlabench", "isaaclab_arena", "custom_plugin"):
+                with self.subTest(model=model, kind=kind):
+                    settings = sample_settings()
+                    settings["model"] = model
+                    settings["eval"].update(env=kind, parallel_tasks=2, policy=None,
+                                            tasks=["libero_object"] if kind in ("libero", "libero_plus")
+                                            else ["first", "second"],
+                                            task_ids=[0, 1] if kind in ("libero", "libero_plus", "robomme") else [])
+                    stage = NativeAdapter(settings, "run", self.root, self.external, self.envs).evaluate(False)
+                    self.assertEqual(Path(stage.arguments[2]).name, "parallel_eval.py")
+                    self.assertEqual(stage.arguments.count("--env.max_parallel_tasks=2"), 1)
+                    self.assertIn(f"--policy.type={model}", stage.arguments)
+
+    def test_parallel_entrypoint_preserves_camera_mapping_and_source_simulator_hooks(self):
+        from manage import simulator_entrypoint
+
+        settings = sample_settings()
+        settings["eval"].update(parallel_tasks=2, policy=None)
+        for kind in ("libero", "libero_plus", "robotwin"):
+            with self.subTest(kind=kind):
+                settings["eval"].update(env=kind, task_ids=[])
+                with patch("adapters.camera_mapping", return_value={"source": "checkpoint"}):
+                    stage = NativeAdapter(settings, "run", self.root, self.external, self.envs).evaluate(True)
+                simulator_entrypoint(stage)
+                self.assertEqual(Path(stage.arguments[2]).name, "parallel_eval.py")
+                self.assertIn('--rename_map={"source":"checkpoint"}', stage.arguments)
+                self.assertIn("--env.max_parallel_tasks=2", stage.arguments)
+                self.assertTrue(any(a.startswith("--policy.path=") for a in stage.arguments))
+
+    def test_native_multitask_wizard_exposes_parallel_count_independently_of_batch(self):
+        answers = io.StringIO("1\n5\n2\n0\ncpu\n3\n0,1,2\n10\nrelative\n256\n\n")
+        with patch("sys.stdin", answers), contextlib.redirect_stdout(io.StringIO()) as menu:
+            cfg = eval_settings("smolvla", False, {"steps": 4}, Inventory(), "libero")
+        self.assertEqual((cfg["batch"], cfg["parallel_tasks"], cfg["task_ids"]), (2, 3, [0, 1, 2]))
+        self.assertIn("Parallel Evaluation Tasks", menu.getvalue())
+
+    def test_parallel_counts_are_validated_and_single_task_benchmarks_use_episode_batches(self):
+        settings = sample_settings()
+        settings["eval"]["policy"] = None
+        for invalid in (0, -1, 1.5, True, "2"):
+            settings["eval"]["parallel_tasks"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "positive integer"):
+                NativeAdapter(settings, "run", self.root, self.external, self.envs).evaluate(False)
+        for kind, task in (("pusht", "PushT-v0"), ("aloha", "AlohaInsertion-v0")):
+            settings["eval"].update(env=kind, tasks=[task], task_ids=[], parallel_tasks=2)
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "use batch"):
+                NativeAdapter(settings, "run", self.root, self.external, self.envs).evaluate(False)
 
 
 if __name__ == "__main__":
