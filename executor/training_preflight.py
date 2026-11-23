@@ -116,7 +116,53 @@ def wall_oss_camera_defaults(train, cameras, policy=None, manual=None):
     return {}
 
 
-def native_training_preflight(config):
+def molmo_feature_defaults(train, dataset, policy=None):
+    """Name only the documented coarse-labelled standard LIBERO feature layout."""
+    policy = policy or {}
+    extra = train.get("extra", ())
+    if (train.get("dataset") not in {"lerobot/libero", "HuggingFaceVLA/libero"}
+            or dataset.get("robot_type") != "panda"
+            or any(isinstance(token, str) and token.startswith(
+                ("--policy.dataset_feature_names=", "--policy.dataset_feature_names.")) for token in extra)
+            or policy.get("normalize_gripper") is True
+            or "--policy.normalize_gripper=true" in extra):
+        return {}
+    features = dataset.get("features", {})
+    documented = {
+        "action": ["delta_x", "delta_y", "delta_z", "delta_axis_angle_x", "delta_axis_angle_y",
+                   "delta_axis_angle_z", "gripper"],
+        "observation.state": ["eef_x", "eef_y", "eef_z", "eef_axis_angle_x", "eef_axis_angle_y",
+                              "eef_axis_angle_z", "gripper_left", "gripper_right"],
+    }
+    if any(features.get(key, {}).get("shape") != [len(names)]
+           or features.get(key, {}).get("dtype") != "float32" for key, names in documented.items()):
+        return {}
+    # These labels describe the target dataset. Native Molmo overwrites saved
+    # source-dataset labels during construction, so a coarse target needs its
+    # own documented dimension names even when the source labels were complete.
+    names = {}
+    coarse = {"action": (["actions"], None), "observation.state": (["state"], ["states"], None)}
+    for key, known in documented.items():
+        if features[key].get("names") in coarse[key]:
+            names[key] = known
+        elif isinstance(features[key].get("names"), list) and len(features[key]["names"]) == len(known):
+            names[key] = features[key]["names"]
+    coarse_target = any(features[key].get("names") in coarse[key] for key in documented)
+    return {"policy.dataset_feature_names": names} if coarse_target and len(names) == len(documented) else {}
+
+
+def molmo_camera_map(train, dataset, cameras, expected):
+    source = {"observation.images.image", "observation.images.image2"}
+    target = {"observation.images.image", "observation.images.wrist_image"}
+    if (train.get("dataset") in {"lerobot/libero", "HuggingFaceVLA/libero"}
+            and dataset.get("robot_type") == "panda" and set(cameras) == source and set(expected) == target
+            and all(cameras[name][0] == expected["observation.images.image" if name.endswith(".image")
+                                                    else "observation.images.wrist_image"][0] for name in source)):
+        return {"observation.images.image2": "observation.images.wrist_image"}
+    return {}
+
+
+def native_training_preflight(config, *, policy_config=None):
     """Return required automatic flags for a native job using known local metadata."""
     train = config["train"]
     if issue := native_training_issue(config["model"]):
@@ -143,16 +189,18 @@ def native_training_preflight(config):
                                                         "--policy.input_features.")) for token in extra):
         return {}
 
-    auto = {}
+    auto = molmo_feature_defaults(train, dataset, policy_config) if model == "molmoact2" else {}
     cameras = _dataset_cameras(features)
     pretrained = train.get("pretrained")
     if pretrained:
         checkpoint = Path(pretrained).expanduser()
-        policy = _read_optional_object(checkpoint / "config.json")
+        policy = policy_config if policy_config is not None else _read_optional_object(checkpoint / "config.json")
         if not policy:
             return {}
         if policy.get("type") and policy["type"] != model:
             raise ValueError(f"The selected checkpoint uses policy {policy['type']}, but this job uses {model}.")
+        if model == "molmoact2":
+            auto = molmo_feature_defaults(train, dataset, policy)
         if model == "wall_oss_05":
             # Wall-OSS derives its input features from the target dataset and resolves
             # physical camera slots using its own camera_key_mapping overrides.
@@ -165,9 +213,11 @@ def native_training_preflight(config):
             if not (expected.keys() <= provided or expected.keys() >= provided):
                 if manual is None:
                     mapping = _saved_camera_map(checkpoint, train.get("dataset"), features, cameras, expected)
+                    if not mapping and model == "molmoact2":
+                        mapping = molmo_camera_map(train, dataset, cameras, expected)
                     if mapping:
                         auto["rename_map"] = mapping
-                if not auto:
+                if "rename_map" not in auto:
                     missing = ", ".join(sorted(expected.keys() - provided))
                     unexpected = ", ".join(sorted(provided - expected.keys()))
                     raise ValueError(f"{model} checkpoint camera inputs do not match this dataset. "

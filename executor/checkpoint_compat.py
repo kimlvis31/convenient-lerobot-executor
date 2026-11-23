@@ -19,9 +19,9 @@ NORMALIZER_PREFIXES = (
 
 def checkpoint_candidate(reference, model, stage=None):
     """Filter explicit native policy references without network or model imports."""
-    molmo_eval = model == "molmoact2" and stage == "eval"
+    molmo_checkpoint = model == "molmoact2" and stage in {"train", "eval"}
     wallx_eval = model == "wall_x" and stage == "eval"
-    if model not in LEGACY_POLICIES and not (molmo_eval or wallx_eval):
+    if model not in LEGACY_POLICIES and not (molmo_checkpoint or wallx_eval):
         return False
     path = Path(reference).expanduser()
     if path.is_dir():
@@ -33,7 +33,7 @@ def checkpoint_candidate(reference, model, stage=None):
             except (OSError, ValueError):
                 return False
             return is_legacy_processor(processor)
-        if molmo_eval:
+        if molmo_checkpoint:
             from molmo_compat import LEGACY_FIELDS
 
             config = _read_config(path / "config.json", model)

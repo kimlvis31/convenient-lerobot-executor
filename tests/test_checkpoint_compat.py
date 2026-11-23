@@ -373,7 +373,7 @@ class CheckpointCompatibilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evaluation_config({**config, "dtype": "float32"})
 
-    def test_molmo_evaluation_writes_only_a_temporary_view_and_skips_training(self):
+    def test_molmo_new_training_and_evaluation_use_preserved_temporary_views(self):
         config = {"type": "molmoact2", **dict.fromkeys(LEGACY_FLAGS, False), "model_dtype": "bfloat16"}
         config_file = self.source / "config.json"
         original = json.dumps(config)
@@ -384,8 +384,9 @@ class CheckpointCompatibilityTests(unittest.TestCase):
         runtime = make_dataclass("Config", ["dtype", "train_mode_vlm"])
         imports = molmo_runtime_stubs(runtime)
         with patch.dict(sys.modules, imports):
-            self.assertIsNone(prepare_checkpoint(self.source, "molmoact2", self.destination, stage="train"))
-            self.assertEqual(prepare_checkpoint(self.source, "molmoact2", self.destination, stage="eval"), self.destination)
+            self.assertEqual(prepare_checkpoint(self.source, "molmoact2", self.destination, stage="train"), self.destination)
+            evaluation = self.destination.with_name("evaluation-view")
+            self.assertEqual(prepare_checkpoint(self.source, "molmoact2", evaluation, stage="eval"), evaluation)
         self.assertEqual(config_file.read_text(), original)
         self.assertEqual((self.destination / "stats.safetensors").read_bytes(), b"statistics")
         self.assertEqual((self.destination / WEIGHTS).read_bytes(), b"original")

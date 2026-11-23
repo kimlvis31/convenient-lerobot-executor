@@ -37,6 +37,7 @@ JOBS = [
                 # "optimizer_weight_decay": 0.0001,
                 # "optimizer_grad_clip_norm": 1,
                 # "scheduler_warmup_steps": 1000,
+                # "optimizer_betas": [0.9, 0.95],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--policy.attn_mode=flex",

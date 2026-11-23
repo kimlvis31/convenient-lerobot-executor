@@ -9,6 +9,13 @@ Policy configuration: https://github.com/huggingface/lerobot/tree/145cc7ea53e586
 
 # Training requires compatible LIBERO normalization statistics. Replace the norm_stats_path placeholder.
 # The model-specific train_mode_vlm option accepts fft, lora or freeze.
+# To fine-tune a complete native policy, set train.pretrained to its directory/repository
+# and remove the raw checkpoint_path and norm_stats_path overrides below. The saved
+# processor profile is then reused with the target dataset's normalization statistics.
+# Standard Panda LIBERO data receives required dimension names automatically.
+# For another dataset, provide its actual action/state names with
+# --policy.dataset_feature_names={"action":[...],"observation.state":[...]}.
+# Explicit names survive native dataset metadata initialization; exact resume keeps saved names.
 
 JOBS = [
     {
@@ -55,6 +62,7 @@ JOBS = [
                 # "scheduler_warmup_steps": 200,
                 # "scheduler_decay_steps": 24000,
                 # "scheduler_decay_lr": 0.000001,
+                # "optimizer_betas": [0.9, 0.95],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [
                 "--policy.checkpoint_path=allenai/MolmoAct2",  # Required. Raw policy initializer.

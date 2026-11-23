@@ -53,6 +53,7 @@ JOBS = [
                 # "scheduler_warmup_steps_heads": 0,
                 # "scheduler_decay_steps": 0,
                 # "scheduler_cooldown_steps": 0,
+                # "optimizer_betas": [0.9, 0.999],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [],  # Optional. Additional LeRobot options in --name=value form.
         },

@@ -37,6 +37,9 @@ JOBS = [
                 # "use_gradient_checkpointing": False,
                 # "optimizer_lr": 0.0001,
                 # "optimizer_weight_decay": 0.01,
+                # "video_scheduler": {'train_shift': 5.0, 'infer_shift': 5.0, 'num_train_timesteps': 1000},  # Optional. Native constructor default; omit to inherit saved settings. Named numeric settings.
+                # "action_scheduler": {'train_shift': 5.0, 'infer_shift': 5.0, 'num_train_timesteps': 1000},  # Optional. Native constructor default; omit to inherit saved settings. Named numeric settings.
+                # "loss": {'lambda_video': 1.0, 'lambda_action': 1.0},  # Optional. Native constructor default; omit to inherit saved settings. Named numeric settings.
             },
             "extra": [],  # Optional. Additional LeRobot options in --name=value form.
         },

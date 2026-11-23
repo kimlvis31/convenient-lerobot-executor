@@ -49,6 +49,7 @@ JOBS = [
                 # "scheduler_warmup_steps": 1500,
                 # "scheduler_decay_steps": 25000,
                 # "scheduler_decay_lr": 5e-7,
+                # "optimizer_betas": [0.9, 0.95],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--dataset.image_transforms.enable=false",

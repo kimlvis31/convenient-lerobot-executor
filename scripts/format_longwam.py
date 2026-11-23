@@ -37,6 +37,7 @@ JOBS = [
                 # "optimizer_weight_decay": 0.01,
                 # "loss_lambda_video": 1,
                 # "loss_lambda_action": 1,
+                # "optimizer_betas": [0.9, 0.95],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--policy.dtype=bfloat16",

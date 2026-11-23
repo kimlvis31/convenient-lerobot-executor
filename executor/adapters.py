@@ -49,7 +49,7 @@ TRAINING_SWITCHES = {
 PEFT_POLICIES = frozenset({"smolvla", "pi0", "pi05", "fineart_vla", "lingbot_vla_v2", "flux3"})
 SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {
     "train_mode_vlm", "lora_rank", "lora_alpha", "lora_dropout",
-    "tune_top_llm_layers", "unfreeze_llm_last_n_layers",
+    "lora_full_model", "tune_top_llm_layers", "unfreeze_llm_last_n_layers",
 }
 
 # Inference controls only; architecture/data dimensions belong in explicit
@@ -75,7 +75,7 @@ def is_policy_training_option(name):
         return False
     tokens = set(name.split("_"))
     return bool(tokens & {"loss", "gradient", "checkpointing", "insulation"}) or name.startswith("detach_") or (
-        name == "num_train_timesteps"
+        name in {"num_train_timesteps", "video_scheduler", "action_scheduler"}
     ) or name.startswith(("optimizer_", "scheduler_", "loss_", "freeze_", "tune_", "train_", "ema_")) or (
         name.endswith(("_dropout", "_loss_weight")) or name in {
             "dropout", "kl_weight", "use_ema", "gradient_checkpointing",
@@ -230,6 +230,11 @@ def training_flags(config, model):
         valid = name in TRAINING_SWITCHES and type(value) is bool
         if model == "groot" and name == "tune_top_llm_layers":
             valid = type(value) is int and value >= 0
+        if model == "groot":
+            valid = valid or name == "lora_rank" and type(value) is int and value >= 0
+            valid = valid or name == "lora_alpha" and type(value) is int and value > 0
+            valid = valid or name == "lora_dropout" and type(value) in (float, int) and 0 <= value <= 1
+            valid = valid or name == "lora_full_model" and type(value) is bool
         if model == "lawam" and name == "unfreeze_llm_last_n_layers":
             valid = type(value) is int and value >= -1
         if model == "molmoact2":
@@ -246,7 +251,7 @@ def training_flags(config, model):
         legacy = name in {"train_state_proj", "train_policy_transformer", "train_soft_prompts"} and type(value) is bool
         legacy = legacy or name == "tune_top_llm_layers" and type(value) is int and value >= 0
         if (not isinstance(name, str) or not (is_policy_training_option(name) or legacy) or name in scope
-                or value is not None and type(value) not in (bool, int, float, str)
+                or value is not None and type(value) not in (bool, int, float, str) and not numeric_policy_container(value)
                 or type(value) is float and not math.isfinite(value)):
             raise ValueError(f"Invalid policy option ({name}).")
         args.append(flag(f"policy.{name}", value))
@@ -273,6 +278,39 @@ def training_flags(config, model):
             raise ValueError(f"Invalid LoRA {key}.")
         args.append(flag(f"peft.{key}", value))
     return args
+
+
+def numeric_policy_container(value):
+    if isinstance(value, dict):
+        if not value or not all(isinstance(key, str) and key for key in value):
+            return False
+        values = value.values()
+    elif isinstance(value, (list, tuple)) and value:
+        values = value
+    else:
+        return False
+    try:
+        return all(type(item) in (int, float) and math.isfinite(item) for item in values)
+    except OverflowError:
+        return False
+
+
+def structured_policy_value(value, spec):
+    """Validate numeric optimizer/loss settings using inspected runtime defaults."""
+    if not numeric_policy_container(value):
+        raise ValueError("Expected finite numeric configuration values.")
+    if spec.get("value_type") == "numeric_object":
+        if not isinstance(value, dict) or value.keys() - spec["default"].keys():
+            raise ValueError("Unknown numeric configuration fields.")
+        if any(spec.get("members", {}).get(key) == "int" and type(item) is not int for key, item in value.items()):
+            raise ValueError("Expected an integer configuration member.")
+        return {**spec["default"], **value}
+    if not isinstance(value, (list, tuple)) or len(value) != len(spec["default"]):
+        raise ValueError("Configuration sequence length does not match the policy.")
+    if any("minimum" in spec and item < spec["minimum"]
+           or "maximum_exclusive" in spec and item >= spec["maximum_exclusive"] for item in value):
+        raise ValueError("Configuration sequence members are outside the supported range.")
+    return list(value)
 
 
 def evaluation_policy_flags(config):

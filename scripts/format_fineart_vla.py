@@ -52,6 +52,7 @@ JOBS = [
                 # "fast_action_loss_weight": 1,
                 # "text_ce_z_loss_weight": 0.0001,
                 # "optimizer_foreach": False,
+                # "optimizer_betas": [0.9, 0.95],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--policy.dtype=bfloat16",

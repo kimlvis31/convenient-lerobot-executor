@@ -31,6 +31,7 @@ from adapters import (
     native_checkpoint,
     native_peft_checkpoint,
     read_json,
+    structured_policy_value,
 )
 from benchmarks import BENCHMARKS, DEPENDENCY_CONFLICT
 from evaluation_capabilities import evaluation_notices, stock_evaluation_issue
@@ -466,6 +467,12 @@ def configure_policy_options(train, options, *, question="Policy Training Option
                 if name not in saved:
                     continue
                 value = saved[name]
+                if spec.get("value_type") in {"numeric_object", "numeric_sequence"}:
+                    try:
+                        spec["default"] = structured_policy_value(value, spec)
+                    except ValueError:
+                        pass
+                    continue
                 valid = value is None and spec.get("nullable")
                 value_type = {"bool": bool, "int": int, "float": float, "str": str}.get(
                     spec.get("value_type"), type(spec["default"]))
@@ -477,19 +484,31 @@ def configure_policy_options(train, options, *, question="Policy Training Option
     inference_labels = {"n_action_steps": "Actions to Execute per Prediction", "num_steps": "Inference Steps",
                         "num_denoise_steps": "Denoising Steps", "dtype": "Model Data Type",
                         "use_amp": "Automatic Mixed Precision"}
-    labels = {name: inference_labels.get(name, name.replace("_", " ").title().replace("Lora", "LoRA"))
+    labels = {name: options[name].get("label", inference_labels.get(name, name.replace("_", " ").title().replace("Lora", "LoRA")))
               for name in sorted(options)}
     while True:
         selection = choose(question, [("", "Finish / keep other defaults"), *[
             (name, f"{label} [{values.get(name, options[name]['default'])}]") for name, label in labels.items()
         ]])
         if not selection:
-            if values:
-                train["policy_options"] = values
+            for name, value in values.items():
+                target = options[name].get("setting_group", "policy_options")
+                if target not in {"policy_training", "policy_options"}:
+                    raise ValueError(f"Unsupported configuration group ({target}).")
+                train.setdefault(target, {})[name] = value
             return
         spec = options[selection]
         default = values.get(selection, spec["default"])
-        if "choices" in spec or type(default) is bool:
+        if spec.get("value_type") in {"numeric_object", "numeric_sequence"}:
+            while True:
+                response = ask(labels[selection] + " (JSON)", json.dumps(default))
+                try:
+                    values[selection] = structured_policy_value(json.loads(response), spec)
+                except (TypeError, ValueError):
+                    retry_question("Enter a valid JSON value using the displayed numeric fields and dimensions.")
+                    continue
+                break
+        elif "choices" in spec or type(default) is bool:
             allowed = spec.get("choices", [True, False])
             choices = [(value, "Automatic (null)" if value is None else str(value))
                        for value in allowed]
@@ -502,6 +521,9 @@ def configure_policy_options(train, options, *, question="Policy Training Option
                     value = (None if spec.get("nullable") and response.casefold() == "null"
                              else value_type(response))
                     if type(value) is float and not math.isfinite(value):
+                        raise ValueError
+                    if value is not None and ("minimum" in spec and value < spec["minimum"]
+                                              or "maximum" in spec and value > spec["maximum"]):
                         raise ValueError
                     if selection in EVALUATION_STEP_OPTIONS and value is not None and (type(value) is not int or value < 1):
                         retry_question("Enter a positive inference step count, or null when supported.")
@@ -1641,6 +1663,14 @@ def validate_model_training_fields(model, train, catalog):
             raise ValueError(f"Policy {model} in the selected LeRobot runtime does not support "
                              f"{field} fields: {', '.join(sorted(unknown))}. "
                              "Remove these fields or use a runtime version that declares them.")
+        if isinstance(options, dict):
+            for name, value in options.items():
+                spec = catalog.get("training_options", {}).get(model, {}).get(name, {})
+                if spec.get("value_type") in {"numeric_object", "numeric_sequence"}:
+                    try:
+                        structured_policy_value(value, spec)
+                    except ValueError as error:
+                        raise ValueError(f"Invalid {model} {field}.{name}: {error}") from error
 
 
 def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=False):
@@ -1667,6 +1697,8 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
         explicit_peft = any(arg.startswith("--peft.") for arg in train.get("extra", ()))
         uses_peft = uses_peft or explicit_peft or train.get("lora") is not None or (
             train.get("policy_training", {}).get("train_mode_vlm") == "lora"
+        ) or (
+            model == "groot" and train.get("policy_training", {}).get("lora_rank", 0) > 0
         ) or bool(source and Path(source).is_dir() and native_peft_checkpoint(Path(source)))
 
     for stage in stages:

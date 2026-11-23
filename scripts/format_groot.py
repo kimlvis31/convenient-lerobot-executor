@@ -30,7 +30,12 @@ JOBS = [
             "seed": 0,  # Required. Training seed.
             "steps": 100,  # Required. Target optimizer step count.
             "save_freq": 100,  # Required. Optimizer steps between checkpoints.
-            "policy_training": {},  # Optional. Inherit the policy or checkpoint scope.
+            "policy_training": {
+                # "lora_rank": 0,  # Optional. Native constructor default; omit to inherit saved settings. Zero disables native adapters.
+                # "lora_alpha": 16,  # Optional. Native constructor default; omit to inherit saved settings.
+                # "lora_dropout": 0.1,  # Optional. Native constructor default; omit to inherit saved settings.
+                # "lora_full_model": False,  # Optional. Native constructor default; omit to inherit saved settings.
+            },  # Optional. Inherit the policy or checkpoint scope.
             # Component settings exposed by this policy (constructor defaults shown).
             #   tune_llm = False
             #   tune_visual = False
@@ -38,14 +43,15 @@ JOBS = [
             #   tune_diffusion_model = True
             #   tune_vlln = True
             #   tune_top_llm_layers = 0
-            #   lora_rank = 0 (pass through extra)
-            #   lora_alpha = 16 (pass through extra)
-            #   lora_dropout = 0.1 (pass through extra)
+            #   lora_rank = 0 (native adapter setting)
+            #   lora_alpha = 16 (native adapter setting)
+            #   lora_dropout = 0.1 (native adapter setting)
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
                 # "optimizer_fused": None,  # Optional. None uses the policy's automatic/default behavior. Available: None, True, False.
                 # "optimizer_lr": 0.0001,
                 # "optimizer_eps": 1e-8,
                 # "optimizer_weight_decay": 0.00001,
+                # "optimizer_betas": [0.9, 0.999],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--policy.base_model_path=nvidia/GR00T-N1.7-3B",

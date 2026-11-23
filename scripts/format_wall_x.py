@@ -40,6 +40,7 @@ JOBS = [
                 # "scheduler_warmup_steps": 1000,
                 # "scheduler_decay_steps": 100000,
                 # "scheduler_decay_lr": 0.000001,
+                # "optimizer_betas": [0.9, 0.95],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--policy.pretrained_name_or_path=x-square-robot/wall-oss-flow",

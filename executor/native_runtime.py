@@ -60,6 +60,23 @@ def host_staged_weights(pretrained):
 
 
 @contextmanager
+def checkpoint_processors(evaluator):
+    original = getattr(evaluator, "make_pre_post_processors", None)
+    if not callable(original):
+        yield
+        return
+
+    @wraps(original)
+    def checked(*args, **kwargs):
+        from molmo_compat import checkpoint_processor_factory
+
+        return checkpoint_processor_factory(original, args, kwargs)
+
+    with patch.object(evaluator, "make_pre_post_processors", checked):
+        yield
+
+
+@contextmanager
 def evaluation_action_contract():
     """Check the native environment's declared policy action space before weights."""
     from lerobot.scripts import lerobot_eval
@@ -78,9 +95,58 @@ def evaluation_action_contract():
                                             getattr(environment, "type", type(environment).__name__))
             if issue:
                 raise ValueError(issue)
-        return original(*args, **kwargs)
+        from molmo_compat import checkpoint_policy_factory
 
-    with patch.object(lerobot_eval, "make_policy", checked):
+        return checkpoint_policy_factory(original, policy, args, kwargs)
+
+    with patch.object(lerobot_eval, "make_policy", checked), checkpoint_processors(lerobot_eval):
+        yield
+
+
+@contextmanager
+def dataset_preflight(trainer):
+    """Apply required settings immediately after native metadata resolution."""
+    prepare = getattr(trainer, "make_train_eval_datasets", None)
+    if not callable(prepare):
+        yield
+        return
+
+    @wraps(prepare)
+    def checked(cfg, *args, **kwargs):
+        policy = getattr(cfg, "policy", None)
+        if policy is None or getattr(cfg, "resume", False):
+            return prepare(cfg, *args, **kwargs)
+        from lerobot.datasets import factory as datasets
+        from training_preflight import native_training_preflight
+        import draccus
+
+        original = getattr(datasets, "load_dataset_metadata", None)
+        if not callable(original):
+            return prepare(cfg, *args, **kwargs)
+
+        @wraps(original)
+        def metadata(*parameters, **options):
+            result = original(*parameters, **options)
+            if not getattr(result, "root", None) or getattr(result, "repo_id", None) != cfg.dataset.repo_id:
+                return result
+            extra = list(sys.argv[1:])
+            if getattr(cfg, "rename_map", None):
+                extra.append("--rename_map=" + json.dumps(cfg.rename_map))
+            job = {"model": policy.type, "train": {"dataset": cfg.dataset.repo_id,
+                   "dataset_root": str(result.root), "pretrained": str(policy.pretrained_path)
+                   if getattr(policy, "pretrained_path", None) else None, "extra": extra}}
+            for name, value in native_training_preflight(job, policy_config=draccus.encode(policy)).items():
+                if name.startswith("policy."):
+                    setattr(policy, name.removeprefix("policy."), value)
+                else:
+                    setattr(cfg, name, value)
+                print(f"Automatic training option: --{name}=" + json.dumps(value), flush=True)
+            return result
+
+        with patch.object(datasets, "load_dataset_metadata", metadata):
+            return prepare(cfg, *args, **kwargs)
+
+    with patch.object(trainer, "make_train_eval_datasets", checked):
         yield
 
 
@@ -97,19 +163,49 @@ def training_dataset_contract():
     def checked(*args, **kwargs):
         bound = parameters.bind(*args, **kwargs)
         policy, metadata = bound.arguments.get("cfg"), bound.arguments.get("ds_meta")
-        if (getattr(policy, "type", None) == "wall_oss_05" and metadata is not None
+        molmo = getattr(policy, "type", None) == "molmoact2"
+        exact_resume = "--resume=true" in sys.argv[1:]
+        preserve_names = molmo and (exact_resume or any(argument.startswith(
+            ("--policy.dataset_feature_names=", "--policy.dataset_feature_names.")) for argument in sys.argv[1:]))
+        restored_names = getattr(policy, "dataset_feature_names", None) if preserve_names else None
+        post_construction = {}
+        if (getattr(policy, "type", None) in {"wall_oss_05", "molmoact2"} and metadata is not None
                 and getattr(metadata, "root", None)):
             features = getattr(metadata, "features", {})
             mapping = getattr(policy, "camera_key_mapping", {})
-            if not mapping or not set(mapping) <= set(features):
-                config = {"model": "wall_oss_05", "train": {"dataset": getattr(metadata, "repo_id", None),
-                          "dataset_root": str(metadata.root), "extra": sys.argv[1:]}}
-                for name, value in native_training_preflight(config).items():
+            if getattr(policy, "type", None) == "molmoact2" or not mapping or not set(mapping) <= set(features):
+                config = {"model": policy.type, "train": {"dataset": getattr(metadata, "repo_id", None),
+                          "dataset_root": str(metadata.root), "extra": sys.argv[1:],
+                          "pretrained": str(policy.pretrained_path) if getattr(policy, "pretrained_path", None) else None}}
+                if exact_resume:
+                    config["train"]["resume"] = True
+                resolved = None
+                if policy.type == "molmoact2":
+                    import draccus
+
+                    resolved = draccus.encode(policy)
+                for name, value in native_training_preflight(config, policy_config=resolved).items():
+                    if not name.startswith("policy."):
+                        continue  # Root settings are applied before dataset preparation.
+                    if name == "policy.dataset_feature_names":
+                        post_construction[name] = value
+                        continue
                     setattr(policy, name.removeprefix("policy."), value)
                     print(f"Automatic training option: --{name}=" + json.dumps(value), flush=True)
-        return original(*args, **kwargs)
+        from molmo_compat import checkpoint_policy_factory
 
-    with patch.object(lerobot_train, "make_policy", checked):
+        result = checkpoint_policy_factory(original, policy, args, kwargs)
+        if preserve_names:
+            policy.dataset_feature_names = restored_names
+            result.config.dataset_feature_names = restored_names
+        else:
+            for name, value in post_construction.items():
+                setattr(policy, name.removeprefix("policy."), value)
+                setattr(result.config, name.removeprefix("policy."), value)
+                print(f"Automatic training option: --{name}=" + json.dumps(value), flush=True)
+        return result
+
+    with patch.object(lerobot_train, "make_policy", checked), checkpoint_processors(lerobot_train), dataset_preflight(lerobot_train):
         yield
 
 

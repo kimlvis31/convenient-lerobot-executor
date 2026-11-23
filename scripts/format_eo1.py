@@ -42,6 +42,7 @@ JOBS = [
                 # "scheduler_warmup_steps": 900,
                 # "scheduler_decay_steps": 30000,
                 # "scheduler_decay_lr": 0,
+                # "optimizer_betas": [0.9, 0.999],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 # Matches the LeRobot revision above. Remove this pin when switching to your own checkpoint.

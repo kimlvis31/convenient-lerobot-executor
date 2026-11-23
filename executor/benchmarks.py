@@ -2,7 +2,7 @@
 
 import argparse
 import ast
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from importlib import metadata, util
 from importlib.machinery import PathFinder
 import json
@@ -13,7 +13,8 @@ import sys
 import tempfile
 from typing import Literal, get_args, get_origin, get_type_hints
 
-from adapters import EVALUATION_POLICY_OPTIONS, PEFT_POLICIES, TRAINING_SWITCHES, is_policy_training_option
+from adapters import (EVALUATION_POLICY_OPTIONS, PEFT_POLICIES, TRAINING_SWITCHES,
+                      is_policy_training_option, numeric_policy_container)
 from evaluation_cameras import robotwin_directory
 from policy_extensions import (POLICY_EXTENSIONS, extension_problems, extension_runtime_issue,
                                extension_specs, install_extensions)
@@ -316,7 +317,19 @@ def supported_here(name):
 
 
 def policy_training_options(config):
-    return scalar_policy_options(config, is_policy_training_option)
+    names = {item.name for item in fields(config)} if is_dataclass(config) else set()
+    native_lora = {"lora_rank", "lora_alpha", "lora_dropout", "lora_full_model"} if "lora_full_model" in names else set()
+    result = scalar_policy_options(config, lambda name: is_policy_training_option(name) or name in native_lora)
+    for name in native_lora & result.keys():
+        result[name]["setting_group"] = "policy_training"
+        result[name]["label"] = "Native " + name.replace("_", " ").title().replace("Lora", "LoRA")
+        if name == "lora_rank":
+            result[name]["label"] += " (0 disables adapters)"
+        if name != "lora_full_model":
+            result[name]["minimum"] = 1 if name == "lora_alpha" else 0
+        if name == "lora_dropout":
+            result[name]["maximum"] = 1
+    return result
 
 
 def policy_evaluation_options(config):
@@ -336,6 +349,8 @@ def scalar_policy_options(config, supported):
             continue
         hint = hints.get(item.name, item.type)
         default = item.default
+        if default is MISSING and item.default_factory is not MISSING:
+            default = item.default_factory()
         members = get_args(hint)
         nullable = type(None) in members
         if nullable and len(members) == 2:
@@ -351,7 +366,14 @@ def scalar_policy_options(config, supported):
             "discrete_loss_token_weighting": ["none", "token", "root_tokens", "root_subsegments",
                                               "root_subsegments_root_tokens"],
         }.get(item.name)
-        if type(default).__module__ == "torch" and type(default).__name__ == "dtype":
+        if isinstance(default, dict) and numeric_policy_container(default):
+            result[item.name] = {"default": default, "value_type": "numeric_object",
+                                 "members": {key: type(value).__name__ for key, value in default.items()}}
+        elif isinstance(default, (list, tuple)) and numeric_policy_container(default):
+            result[item.name] = {"default": list(default), "value_type": "numeric_sequence"}
+            if item.name == "optimizer_betas":
+                result[item.name].update(minimum=0, maximum_exclusive=1)
+        elif type(default).__module__ == "torch" and type(default).__name__ == "dtype":
             result[item.name] = {"default": str(default).removeprefix("torch."),
                                  "value_type": "str", "encoded_type": "torch.dtype"}
         elif choices and default in choices:

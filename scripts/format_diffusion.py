@@ -40,6 +40,7 @@ JOBS = [
                 # "optimizer_weight_decay": 0.000001,
                 # "scheduler_name": "cosine",
                 # "scheduler_warmup_steps": 500,
+                # "optimizer_betas": [0.95, 0.999],  # Optional. Native constructor default; omit to inherit saved settings. Exactly 2 numeric values.
             },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--policy.horizon=16",
