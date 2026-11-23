@@ -31,6 +31,8 @@ Imported component and training-option names are checked against the policy fiel
 
 Model-specific training options include supported loss controls and gradient-checkpointing settings. Nullable controls offer automatic/default behavior through `null`; leaving a field unselected preserves the checkpoint setting. The model templates document these optional values and available enumerated choices.
 
+The training option menu displays valid values from the selected local checkpoint instead of replacing them with constructor defaults. Unselected options remain inherited. For certified stock LIBERO evaluations, the executor reuses unchanged task descriptions and observation camera pixels for video recording. Custom environments and unknown renderer implementations retain native behavior. Simulator resets, settling steps, policy actions, and video orientation are preserved. This removes redundant requests; model inference and simulation initialization can still dominate evaluation time.
+
 For PushT, the executor selects environment-state observations when a checkpoint explicitly requires the supported 16-value environment state and 2-value agent state without image inputs. Image checkpoints retain pixel observations. An explicit observation setting takes precedence. Required arguments added during planning appear in green in Settings.
 
 Native checkpoint tensors are read through host memory before LeRobot places the policy on the requested device, avoiding a second full checkpoint allocation on the accelerator. Parallel evaluation also shares declared weights in auxiliary frozen modules while keeping buffers and rollout state separate. This reduces avoidable copies; the model, activations and simulators must still fit the available memory.

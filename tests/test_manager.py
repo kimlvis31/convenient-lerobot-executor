@@ -1277,6 +1277,30 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(train, {"policy_options": {"optimizer_lr": 0.0003}})
         self.assertEqual(training_flags(train, "act"), ["--policy.optimizer_lr=0.0003"])
 
+    def test_local_checkpoint_options_display_saved_values_without_changing_catalog(self):
+        folder = self.root / "saved-policy"
+        folder.mkdir()
+        (folder / "config.json").write_text(json.dumps({"optimizer_lr": 0.002}), encoding="utf-8")
+        train = {"pretrained": str(folder)}
+        options = {"optimizer_lr": {"default": 0.0001}}
+        with patch("sys.stdin", io.StringIO("2\n\n1\n")), contextlib.redirect_stdout(io.StringIO()) as output:
+            configure_policy_options(train, options)
+        self.assertIn("Optimizer Lr [0.002]", output.getvalue())
+        self.assertEqual(train["policy_options"], {"optimizer_lr": 0.002})
+        self.assertEqual(options["optimizer_lr"]["default"], 0.0001)
+
+    def test_invalid_checkpoint_option_types_keep_catalog_defaults_and_finish_keeps_inheritance(self):
+        folder = self.root / "bad-policy-options"
+        folder.mkdir()
+        (folder / "config.json").write_text(json.dumps({"optimizer_lr": "wrong", "gradient_checkpointing": 1}), encoding="utf-8")
+        train = {"pretrained": str(folder)}
+        options = {"optimizer_lr": {"default": 0.0001}, "gradient_checkpointing": {"default": False}}
+        with patch("sys.stdin", io.StringIO("1\n")), contextlib.redirect_stdout(io.StringIO()) as output:
+            configure_policy_options(train, options)
+        self.assertIn("Optimizer Lr [0.0001]", output.getvalue())
+        self.assertIn("Gradient Checkpointing [False]", output.getvalue())
+        self.assertNotIn("policy_options", train)
+
     def test_molmo_bias_options_reach_the_command_through_the_question_menu(self):
         from dataclasses import dataclass
         from benchmarks import policy_training_options

@@ -454,6 +454,24 @@ def configure_training_scope(train, model, catalog):
 def configure_policy_options(train, options):
     if not options:
         return
+    # A saved policy can override the constructor defaults inspected in the
+    # runtime catalog. Reading this local file must not download a Hub model.
+    options = {name: dict(spec) for name, spec in options.items()}
+    reference = train.get("pretrained")
+    if reference and (Path(reference).expanduser() / "config.json").is_file():
+        saved = read_json(Path(reference).expanduser() / "config.json")
+        if isinstance(saved, dict):
+            for name, spec in options.items():
+                if name not in saved:
+                    continue
+                value = saved[name]
+                valid = value is None and spec.get("nullable")
+                value_type = {"bool": bool, "int": int, "float": float, "str": str}.get(
+                    spec.get("value_type"), type(spec["default"]))
+                valid = valid or type(value) is value_type or value_type is float and type(value) is int
+                if (valid and ("choices" not in spec or value in spec["choices"])
+                        and (type(value) is not float or math.isfinite(value))):
+                    spec["default"] = value
     values = {}
     labels = {name: name.replace("_", " ").title().replace("Lora", "LoRA") for name in sorted(options)}
     while True:

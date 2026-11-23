@@ -136,6 +136,10 @@ def main(command=None):
         hooks.enter_context(host_staged_weights(pretrained))
         if evaluation:
             hooks.enter_context(evaluation_action_contract())
+            from evaluation_efficiency import standard_libero_rollouts
+            from lerobot.scripts import lerobot_eval
+
+            hooks.enter_context(standard_libero_rollouts(lerobot_eval))
         else:
             hooks.enter_context(training_dataset_contract())
         if entry == "lerobot-train":

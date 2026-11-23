@@ -71,7 +71,7 @@ class NativeRuntimeTests(unittest.TestCase):
         def factory(cfg, env_cfg=None):
             return pretrained.load_model_as_safetensor("model", "file", device="cuda", strict=True)
 
-        evaluator = SimpleNamespace(make_policy=factory)
+        evaluator = SimpleNamespace(make_policy=factory, make_env=lambda cfg: {}, rollout=lambda env: None)
         evaluator.main = lambda: evaluator.make_policy(policy, env_cfg=SimpleNamespace(type="libero"))
         modules = {"lerobot.policies": SimpleNamespace(pretrained=pretrained),
                    "lerobot.policies.factory": SimpleNamespace(env_to_policy_features=lambda env: {
