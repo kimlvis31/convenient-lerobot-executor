@@ -36,6 +36,48 @@ def apply_commands(commands, environment):
 
 
 class RuntimeActivationTests(unittest.TestCase):
+    def test_clone_pointer_is_not_in_condas_package_record_json_glob(self):
+        target = self.clone_prefix("target")
+        activation.install_clone_inheritance(self.base, target)
+        self.assertEqual(list((target / "conda-meta").glob("*.json")), [])
+        self.assertTrue((target / "conda-meta" / activation.CLONE_MARKER).is_file())
+
+    def test_legacy_clone_reading_is_readonly_and_confirmed_migration_preserves_inheritance(self):
+        target = self.clone_prefix("target")
+        self.write_state({"HF_TOKEN": "dummy-source", "CUSTOM_SOURCE": "yes"})
+        original_state = self.state.read_bytes()
+        legacy = target / "conda-meta" / activation.LEGACY_CLONE_MARKER
+        legacy.write_text(json.dumps({"schema": 1, "source_prefix": str(self.base)}))
+        before = legacy.read_bytes()
+        self.assertEqual(activation.clone_environment(target, {})["CUSTOM_SOURCE"], "yes")
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertFalse((target / "conda-meta" / activation.CLONE_MARKER).exists())
+        self.assertTrue(activation.migrate_clone_inheritance(target))
+        self.assertFalse(legacy.exists())
+        self.assertEqual(list((target / "conda-meta").glob("*.json")), [])
+        self.assertEqual(activation.clone_environment(target, {})["HF_TOKEN"], "dummy-source")
+        self.assertEqual(self.state.read_bytes(), original_state)
+        self.assertFalse(activation.migrate_clone_inheritance(target))
+
+    def test_clone_migration_does_not_touch_unmarked_environments(self):
+        self.write_state({"CUSTOM_SOURCE": "unchanged"})
+        before = self.state.read_bytes()
+        self.assertFalse(activation.migrate_clone_inheritance(self.base))
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertEqual([p.name for p in (self.base / "conda-meta").iterdir()], ["state"])
+
+    def test_conflicting_legacy_clone_metadata_is_not_silently_replaced(self):
+        target, other = self.clone_prefix("target"), self.clone_prefix("other")
+        activation.install_clone_inheritance(self.base, target)
+        current = target / "conda-meta" / activation.CLONE_MARKER
+        before = current.read_bytes()
+        legacy = target / "conda-meta" / activation.LEGACY_CLONE_MARKER
+        legacy.write_text(json.dumps({"schema": 1, "source_prefix": str(other)}))
+        with self.assertRaises(activation.ActivationError):
+            activation.migrate_clone_inheritance(target)
+        self.assertEqual(current.read_bytes(), before)
+        self.assertTrue(legacy.exists())
+
     def setUp(self):
         self.temp = TemporaryDirectory(prefix="convlex-activation-")
         self.addCleanup(self.temp.cleanup)
@@ -67,6 +109,14 @@ class RuntimeActivationTests(unittest.TestCase):
         restored = apply_commands(activation.deactivation_commands(SCOPE, live), live)
         self.assertEqual(restored, before)
         self.assertEqual(self.state.read_bytes(), original)
+
+    def test_clone_lineage_reads_paths_only_for_environment_selection(self):
+        target = self.clone_prefix("lineage target")
+        activation.install_clone_inheritance(self.base, target)
+        with patch.object(activation, "_environment_variables", side_effect=AssertionError("Do not read credentials")):
+            lineage = activation.clone_lineage(target)
+        self.assertEqual(lineage, {"prefix": str(target.resolve()), "clone_sources": [str(self.base.resolve())]})
+        self.assertEqual(activation.clone_lineage(self.base)["clone_sources"], [])
 
     def test_managed_paths_cache_and_compilers_are_never_overridden(self):
         protected = {name: "source-must-not-win" for name in (

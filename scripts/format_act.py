@@ -31,6 +31,7 @@ JOBS = [
             "save_freq": 100,  # Required. Optimizer steps between checkpoints.
             "policy_training": {},  # Optional. Inherit the policy or checkpoint scope.
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "optimizer_fused": None,  # Optional. None uses the policy's automatic/default behavior. Available: None, True, False.
                 # "dropout": 0.1,
                 # "kl_weight": 10,
                 # "optimizer_lr": 0.00001,

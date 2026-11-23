@@ -51,7 +51,7 @@ def prepare_evaluation_runtime(arguments):
         raise RuntimeError(f"LIBERO-plus ImageMagick initialization failed before evaluation: {error}") from error
 
 
-def checkpoint_directory(reference, revision, *, download):
+def checkpoint_directory(reference, revision, *, download, filename="policy_preprocessor.json"):
     path = Path(reference).expanduser()
     if path.is_dir():
         return path
@@ -63,20 +63,59 @@ def checkpoint_directory(reference, revision, *, download):
         from httpx import TransportError
     except ImportError:
         return None
-    processor = "policy_preprocessor.json"
     try:
         if download:
-            saved = hf_hub_download(reference, processor, revision=revision)
+            saved = hf_hub_download(reference, filename, revision=revision)
             path = Path(saved).parent
             hf_hub_download(reference, "config.json", revision=path.name)
         else:
-            saved = try_to_load_from_cache(reference, processor, revision=revision)
+            saved = try_to_load_from_cache(reference, filename, revision=revision)
             if not isinstance(saved, str):
                 return None
             path = Path(saved).parent
         return path if (path / "config.json").is_file() else None
     except (ValueError, OSError, HfHubHTTPError, OfflineModeIsEnabled, TransportError):
         return None
+
+
+def observation_arguments(arguments, *, download=False):
+    """Match a verified PushT checkpoint's nonvisual observation contract.
+
+    Legacy keypoint checkpoints use environment state instead of pixels. Do
+    not infer this from a policy name: modern checkpoints can use either mode.
+    None means that a Hub checkpoint must be inspected after downloading it.
+    """
+    options = dict(arg[2:].split("=", 1) for arg in arguments if arg.startswith("--") and "=" in arg)
+    reference = options.get("policy.path")
+    overrides = ("env.obs_type", "env.features", "env.features_map", "policy.input_features", "rename_map")
+    if options.get("env.type") != "pusht" or not reference or any(
+        key == field or key.startswith(field + ".") for key in options for field in overrides
+    ):
+        return []
+    directory = checkpoint_directory(reference, options.get("policy.pretrained_revision"),
+                                     download=download, filename="config.json")
+    if directory is None:
+        return None
+    try:
+        policy = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(policy, dict) and "input_features" not in policy:
+        from checkpoint_compat import legacy_tdmpc_config
+
+        policy = legacy_tdmpc_config(policy) or policy
+    inputs = policy.get("input_features") if isinstance(policy, dict) else None
+    if not isinstance(inputs, dict) or any(
+        isinstance(spec, dict) and spec.get("type") == "VISUAL" for spec in inputs.values()
+    ):
+        return []
+    environment = inputs.get("observation.environment_state")
+    state = inputs.get("observation.state")
+    if (isinstance(environment, dict) and environment.get("type") == "ENV"
+            and environment.get("shape") == [16] and isinstance(state, dict)
+            and state.get("type") == "STATE" and state.get("shape") == [2]):
+        return ["--env.obs_type=environment_state_agent_pos"]
+    return []
 
 
 def camera_mapping(arguments, *, download=False, model=None):
@@ -161,6 +200,9 @@ def camera_mapping(arguments, *, download=False, model=None):
 
 def restore_camera_arguments():
     """Use the now-available checkpoint for uncached Hub and train-then-evaluate jobs."""
+    for argument in observation_arguments(sys.argv[1:], download=True) or ():
+        sys.argv.append(argument)
+        print(f"Restored checkpoint observations: {argument}", flush=True)
     mapping = camera_mapping(sys.argv[1:], download=True)
     if mapping:
         argument = "--rename_map=" + json.dumps(mapping, separators=(",", ":"))

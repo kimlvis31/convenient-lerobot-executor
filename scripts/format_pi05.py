@@ -38,6 +38,7 @@ JOBS = [
             # LoRA requires pretrained weights and no explicit policy_training overrides.
             # Optional LoRA keys: target_modules (list or pattern), full_training_modules (list).
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "optimizer_fused": None,  # Optional. None uses the policy's automatic/default behavior. Available: None, True, False.
                 # "gradient_checkpointing": False,
                 # "optimizer_lr": 0.000025,
                 # "optimizer_eps": 1e-8,

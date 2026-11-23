@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from adapters import NativeAdapter
-from evaluation_cameras import main, prepare_evaluation_runtime, simulator_directory
+from evaluation_cameras import main, observation_arguments, prepare_evaluation_runtime, simulator_directory
 
 
 class EvaluationCameraTests(unittest.TestCase):
@@ -335,6 +335,73 @@ class EvaluationCameraTests(unittest.TestCase):
             main()
         resolve.assert_called_once_with("org/model", None, download=True)
         self.assertEqual(json.loads(invoked[0][-1].partition("=")[2]), self.mapping)
+
+    def test_pusht_keypoint_observations_follow_checkpoint_features_and_respect_overrides(self):
+        config = {"type": "tdmpc", "input_features": {
+            "observation.state": {"type": "STATE", "shape": [2]},
+            "observation.environment_state": {"type": "ENV", "shape": [16]},
+        }}
+        path = self.model / "config.json"
+        path.write_text(json.dumps(config))
+        original = path.read_bytes()
+        stage = self.stage("pusht", model="tdmpc")
+        self.assertIn("--env.obs_type=environment_state_agent_pos", stage.arguments)
+        self.assertIn("env.obs_type", stage.auto_flags)
+        self.assertEqual(path.read_bytes(), original)
+        for override in ("--env.obs_type=pixels_agent_pos", "--env.features={}",
+                         "--policy.input_features={}", "--rename_map={}"):
+            with self.subTest(override=override):
+                explicit = self.stage("pusht", [override], model="tdmpc")
+                self.assertIn(override, explicit.arguments)
+                self.assertNotIn("env.obs_type", explicit.auto_flags)
+        config["input_features"]["observation.images.top"] = {"type": "VISUAL", "shape": [3, 96, 96]}
+        path.write_text(json.dumps(config))
+        self.assertNotIn("env.obs_type", self.stage("pusht", model="tdmpc").auto_flags)
+        del config["input_features"]["observation.images.top"]
+        config["input_features"]["observation.environment_state"]["shape"] = [24]
+        path.write_text(json.dumps(config))
+        self.assertNotIn("env.obs_type", self.stage("pusht", model="tdmpc").auto_flags)
+        legacy = {"cem_iterations": 6, "q_ensemble_size": 5, "n_gaussian_samples": 512,
+                  "input_shapes": {"observation.state": [2], "observation.environment_state": [16]},
+                  "input_normalization_modes": {"observation.state": "min_max", "observation.environment_state": "min_max"},
+                  "output_shapes": {"action": [2]}, "output_normalization_modes": {"action": "min_max"}}
+        path.write_text(json.dumps(legacy))
+        self.assertIn("env.obs_type", self.stage("pusht", model="tdmpc").auto_flags)
+
+    def test_pusht_pending_checkpoint_is_resolved_at_runtime_without_a_processor_file(self):
+        config = {"type": "tdmpc", "input_features": {
+            "observation.state": {"type": "STATE", "shape": [2]},
+            "observation.environment_state": {"type": "ENV", "shape": [16]},
+        }}
+        (self.model / "config.json").write_text(json.dumps(config))
+        args = ["evaluate", "--env.type=pusht", "--policy.path=org/keypoints"]
+        with patch("evaluation_cameras.checkpoint_directory", return_value=None):
+            self.assertIsNone(observation_arguments(args[1:]))
+        with patch("adapters.observation_arguments", return_value=None):
+            stage = self.stage("pusht", model="tdmpc")
+            self.assertEqual(Path(stage.arguments[2]).name, "evaluation_cameras.py")
+        invoked = []
+        endpoint = ModuleType("lerobot.scripts.lerobot_eval")
+        endpoint.main = lambda: invoked.append(list(sys.argv))
+        with patch.dict(sys.modules, {endpoint.__name__: endpoint}), patch.object(sys, "argv", args), \
+             patch("evaluation_cameras.checkpoint_directory", return_value=self.model) as resolve:
+            main()
+        resolve.assert_called_once_with("org/keypoints", None, download=True, filename="config.json")
+        self.assertIn("--env.obs_type=environment_state_agent_pos", invoked[0])
+
+    def test_partial_episode_batch_uses_shared_video_and_progress_limits_for_one_task(self):
+        for kind in ("pusht", "libero"):
+            with self.subTest(kind=kind):
+                self.checkpoint(("image", "image2"), ("image", "image2"))
+                cfg = {"env": kind, "tasks": ["task"], "policy": str(self.model), "device": "cpu",
+                       "episodes": 3, "batch": 2, "parallel_tasks": 1, "seed": 0}
+                manager = NativeAdapter({"model": "smolvla", "eval": cfg}, "example", self.root,
+                                        self.root, {"native": "lerobot"})
+                stage = manager.evaluate(False)
+                self.assertEqual(Path(stage.arguments[2]).name, "parallel_eval.py")
+                self.assertIn("--env.max_parallel_tasks=1", stage.arguments)
+                cfg["episodes"] = 4
+                self.assertEqual(manager.evaluate(False).arguments[0], "lerobot-eval")
 
 
 if __name__ == "__main__":

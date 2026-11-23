@@ -39,6 +39,8 @@ JOBS = [
             # LoRA requires pretrained weights and no explicit policy_training overrides.
             # Optional LoRA keys: target_modules (list or pattern), full_training_modules (list).
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "sequence_wise_loss_coeff": 0.001,  # Optional.
+                # "router_z_loss_coeff": 0.0001,  # Optional.
                 # "gradient_checkpointing": False,
                 # "loss_type": "L1_fm",
                 # "optimizer_lr": 0.00001,

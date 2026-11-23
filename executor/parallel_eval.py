@@ -6,7 +6,7 @@ from functools import wraps
 from inspect import signature
 import logging
 from threading import Lock, RLock, local
-from types import MethodType
+from types import MethodType, ModuleType, FunctionType, BuiltinFunctionType
 from weakref import WeakMethod
 
 
@@ -42,8 +42,58 @@ def task_compiled_callable(original, memo, name):
     raise TypeError(f"cannot isolate compiled method {name}")
 
 
+def parameter_graph(policy):
+    """Find declared weights, including frozen modules outside _modules.
+
+    World models can deliberately keep a VAE/text encoder unregistered to
+    exclude it from training checkpoints. Sharing only policy.parameters()
+    would duplicate those large frozen weights for every evaluation task.
+    Tensor buffers remain outside the memo and are still copied per task.
+    """
+    memo = {id(parameter): parameter for parameter in policy.parameters()}
+    modules = list(policy.modules())
+    try:
+        import torch
+    except ImportError:
+        return memo, modules
+    if not hasattr(torch, "nn") or not hasattr(torch.nn, "Module"):
+        return memo, modules
+    seen, module_ids = set(), {id(module) for module in modules}
+    pending = [policy]
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, torch.nn.Parameter):
+            memo[id(value)] = value
+            continue
+        if isinstance(value, torch.Tensor):
+            continue  # Mutable caches/buffers require task-local copies.
+        if isinstance(value, (str, bytes, int, float, complex, bool, type(None), type,
+                              ModuleType, FunctionType, BuiltinFunctionType, MethodType)):
+            continue
+        if isinstance(value, torch.nn.Module):
+            for parameter in value.parameters(recurse=False):
+                memo[id(parameter)] = parameter
+            if id(value) not in module_ids:
+                modules.append(value)
+                module_ids.add(id(value))
+        if isinstance(value, dict):
+            items = value.values()
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            items = value
+        else:
+            try:
+                items = vars(value).values()
+            except TypeError:
+                continue
+        pending.extend(items)
+    return memo, modules
+
+
 def task_policy(policy, lock):
-    """Copy all mutable policy state, sharing only registered model parameters.
+    """Copy all mutable policy state, sharing declared model parameters.
 
     Copy the entire module graph, including buffers and nested streaming caches:
     resetting just the top-level action queue is insufficient for world models.
@@ -51,11 +101,14 @@ def task_policy(policy, lock):
     memory at a time. The template is never used for a native rollout.
     """
     try:
-        memo = {id(parameter): parameter for parameter in policy.parameters()}
+        memo, modules = parameter_graph(policy)
+        auxiliary = len(modules) - len(list(policy.modules()))
+        if auxiliary:
+            logging.info("Parallel evaluation shares declared weights from %s auxiliary modules too.", auxiliary)
         copied = deepcopy(policy, memo)
         if copied is policy:
             raise TypeError("the policy returned itself from deepcopy")
-        for module in policy.modules():
+        for module in modules:
             target = memo.get(id(module))
             if target is None or target is module:
                 raise TypeError(f"cannot isolate the {type(module).__name__} module")

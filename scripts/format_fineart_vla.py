@@ -36,6 +36,8 @@ JOBS = [
             #   train_expert_only = False
             #   freeze_vision_encoder = False
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "enable_fast_action_loss": True,  # Optional.
+                # "knowledge_insulation": True,  # Optional.
                 # "gradient_checkpointing": False,
                 # "optimizer_lr": 0.000025,
                 # "optimizer_eps": 1e-8,

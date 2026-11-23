@@ -353,7 +353,7 @@ class SourceManagerTests(unittest.TestCase):
                                   ("parallel_eval.py", ["-u"]),
                                   ("evaluation_cameras.py", ["-u"])):
             with self.subTest(helper=filename):
-                path = str(Path(__file__).with_name(filename).resolve())
+                path = str((Path(__file__).resolve().parents[1] / "executor" / filename).resolve())
                 command = ["python", options[0], path, *options[1:], "--policy.pretrained_revision=release",
                            "--env.type=robotwin"]
                 stage = SimpleNamespace(arguments=list(command))

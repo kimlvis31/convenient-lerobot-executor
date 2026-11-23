@@ -8,6 +8,11 @@ Policy configuration: https://github.com/huggingface/lerobot/tree/145cc7ea53e586
 """
 
 # Replace the dataset and simulator placeholders. Use a fine-tuned checkpoint with matching state, action and sensors.
+# For the standard lerobot/libero front/wrist camera pair, the executor supplies
+# camera_key_mapping automatically. Other datasets require an explicit verified
+# --policy.camera_key_mapping JSON object in train.extra when names differ.
+# The published checkpoint uses exactly 10 Euler flow steps; do not reduce them.
+# Its released 26-value action space is not the stock LIBERO 7-value action space.
 
 JOBS = [
     {

@@ -18,6 +18,7 @@ from manage import (LeRobotEnvironments, prepare_job_environments, ask, choose_e
                     delete_result_runs, eval_settings,
                     main, native_dataset, model_size, normalize_paths, number, plan,
                     settings_jobs, show_job_result, show_settings, wizard)
+from manage import validate_model_training_fields
 from questions import QuestionDisplay, QuestionHistory
 from runner import (Progress, StageFailure, available_environments, evaluation_timing_key, execute, history, load_settings,
                     prepare_stage_checkpoint, progress_display, resolve_arguments, seconds, status_line)
@@ -51,6 +52,63 @@ class RenderedTerminal(io.StringIO):
 
     def screen(self):
         return "\n".join(self.lines)
+
+
+class ModelTrainingFieldTests(unittest.TestCase):
+    def test_imported_options_follow_the_selected_runtime_model_fields(self):
+        catalog = {"policy_fields": {"fineart_vla": ["train_expert_only", "gradient_checkpointing"],
+                                     "smolvla": ["train_expert_only", "train_state_proj"]}}
+        train = {"policy_training": {"train_state_proj": True}}
+        validate_model_training_fields("smolvla", train, catalog)
+        with self.assertRaisesRegex(ValueError, "fineart_vla.*policy_training.*train_state_proj"):
+            validate_model_training_fields("fineart_vla", train, catalog)
+        validate_model_training_fields("fineart_vla", {"policy_options": {"gradient_checkpointing": True}}, catalog)
+        with self.assertRaisesRegex(ValueError, "policy_options.*train_state_proj"):
+            validate_model_training_fields("fineart_vla", {"policy_options": {"train_state_proj": True}}, catalog)
+
+    def test_unavailable_catalog_defers_and_exact_resume_keeps_saved_configuration(self):
+        train = {"policy_training": {"version_specific_field": True}}
+        validate_model_training_fields("new_policy", train, {})
+        validate_model_training_fields("new_policy", {**train, "resume": "checkpoint"},
+                                       {"policy_fields": {"new_policy": []}})
+
+
+class NativeOptionalArgumentTests(unittest.TestCase):
+    def test_fineart_inherited_native_lora_is_available(self):
+        arguments = training_flags({"pretrained": "team/fineart-checkpoint",
+                                    "lora": {"rank": 2, "alpha": 2}}, "fineart_vla")
+        self.assertIn("--peft.method_type=LORA", arguments)
+        self.assertIn("--peft.r=2", arguments)
+
+    def test_missing_checkpoint_setting_names_the_required_key_but_after_training_is_valid(self):
+        evaluation = {"env": "libero", "tasks": ["libero_object"], "episodes": 1,
+                      "batch": 1, "seed": 0, "device": "cpu"}
+        native = NativeAdapter({"model": "act", "eval": evaluation}, "test", Path.cwd(),
+                               None, {"native": "lerobot"})
+        with self.assertRaisesRegex(ValueError, "Missing evaluation settings: policy"):
+            native.evaluate(False)
+        self.assertEqual(native.evaluate(True).name, "eval")
+        self.assertNotIn("policy", TinyVLAAdapter.eval_required)
+        self.assertNotIn("device", TinyVLAAdapter.eval_required)
+
+    def test_native_evaluation_does_not_silently_ignore_the_external_action_setting(self):
+        native = NativeAdapter({"model": "act", "eval": {"action_steps": 8}}, "test",
+                               Path.cwd(), None, {"native": "lerobot"})
+        with self.assertRaisesRegex(ValueError, "TinyVLA.*policy.n_action_steps"):
+            native.evaluate(False)
+        self.assertIn("action_steps", TinyVLAAdapter.eval_fields)
+
+    def test_optional_seed_round_trips_through_the_native_evaluation_parser(self):
+        try:
+            import draccus
+            from lerobot.configs.eval import EvalPipelineConfig
+        except ImportError:
+            self.skipTest("The native LeRobot parser is not installed in this test environment")
+        from adapters import flag
+
+        config = draccus.parse(EvalPipelineConfig, args=["--policy.type=act", "--policy.device=cpu",
+                                                       "--env.type=pusht", flag("seed", None)])
+        self.assertIsNone(config.seed)
 
 
 FAKE_BACKEND = r'''
@@ -121,6 +179,68 @@ def sample_settings():
 
 
 class ManagerTests(unittest.TestCase):
+    def test_environment_setup_failure_keeps_retry_settings_and_hides_conda_environment_dump(self):
+        from manage import record_preparation_failure
+        from datetime import datetime, timezone
+        error = RuntimeError("Traceback:\nValueError: broken package record\n\nenvironment variables:\n"
+                             "HF_TOKEN=dummy-private-value\n")
+        run = self.root / "outputs/evaluation/setup-failed/executor"
+        settings = sample_settings()
+        failure = record_preparation_failure(error, settings, run, self.root, "conda",
+                                             datetime.now(timezone.utc))
+        self.assertIn("broken package record", failure.reason)
+        self.assertNotIn("dummy-private-value", (run / "setup.log").read_text())
+        self.assertEqual(load_settings(run / "script.py")["jobs"], [settings])
+        self.assertEqual(load_settings(run / "run.py")["jobs"], [settings])
+        state = json.loads((run / "status.json").read_text())
+        self.assertEqual((state["status"], state["phase"], state["stages"]),
+                         ("failed", "environment_setup", []))
+
+    def test_imported_jobs_do_not_silently_ignore_misspelled_fields(self):
+        settings = sample_settings()
+        settings["eval"]["parallel_task"] = 2
+        with self.assertRaisesRegex(ValueError, "Did you mean parallel_tasks"):
+            NativeAdapter(settings, "invalid", self.root, self.external, self.envs).evaluate(False)
+        settings = sample_settings()
+        settings["train"]["batch_size"] = 2
+        with self.assertRaisesRegex(ValueError, "Unknown training setting"):
+            NativeAdapter(settings, "invalid", self.root, self.external, self.envs).train()
+
+    def test_gaussian_actor_requires_its_separate_training_launcher(self):
+        settings = sample_settings()
+        settings["model"] = "gaussian_actor"
+        with self.assertRaisesRegex(ValueError, "separate reinforcement-learning"):
+            NativeAdapter(settings, "invalid", self.root, self.external, self.envs).train()
+
+    def test_gaussian_actor_wizard_explains_training_boundary_before_configuration(self):
+        with patch("manage.choose_policy", return_value=("native", "gaussian_actor")), \
+             patch("manage.choose", return_value="eval") as menu, \
+             patch("manage.eval_settings", return_value=sample_settings()["eval"]), \
+             patch("manage.confirm", return_value=True), contextlib.redirect_stdout(io.StringIO()) as screen:
+            result = configure_job(load_adapters([]), Inventory(), self.root, {"gaussian_actor"},
+                                   lambda model: self.fail("Unsupported training must not be configured"),
+                                   lambda model, tiny: ("libero", "lerobot", False))
+        self.assertEqual(menu.call_args.args[1], [("eval", "Evaluation")])
+        self.assertNotIn("train", result)
+        self.assertIn("separate reinforcement-learning", screen.getvalue())
+
+    def test_tinyvla_rejects_unknown_training_fields_before_loading_weights(self):
+        settings = sample_settings()
+        settings.update(adapter="tinyvla", model="tinyvla")
+        settings["train"]["batch_size"] = 2
+        with self.assertRaisesRegex(ValueError, "Unknown training setting"):
+            TinyVLAAdapter(settings, "invalid", self.root, self.external, self.envs).train()
+
+    def test_imported_native_jobs_reject_invalid_training_batch_and_checkpoint_interval(self):
+        for field in ("batch", "save_freq"):
+            for value in (0, -1, True, 1.5, "2"):
+                settings = sample_settings()
+                settings["train"][field] = value
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    ValueError, "positive integer"
+                ):
+                    NativeAdapter(settings, "invalid", self.root, self.external, self.envs).train()
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -872,6 +992,7 @@ class ManagerTests(unittest.TestCase):
         with patch("manage.subprocess.run", side_effect=results) as process, \
              patch("manage.available_environments", return_value=set()), \
              patch("manage.configure_clone_inheritance") as inherited, \
+             patch("manage.prepare_clone_source"), \
              patch("manage.environment_catalog", return_value=refreshed), \
              contextlib.redirect_stdout(io.StringIO()):
             selected = environments.prepare("preferred", model="act", benchmark="pusht")
@@ -1026,6 +1147,29 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("Simulator libero", eval_summary)
         self.assertIn("versions unverified", eval_summary)
 
+    def test_pinned_environment_reuses_only_a_ready_verified_descendant(self):
+        environments = LeRobotEnvironments("conda", self.root, "lerobot", {"ready", "unrelated", "incomplete"})
+        base = {"policies": {"act": True}, "runtime": {"evaluation": True}}
+        prefix = str(self.root / "lerobot")
+        catalogs = {"lerobot": {**base, "prefix": prefix, "benchmarks": {"pusht": False}},
+                    "ready": {**base, "clone_sources": [prefix], "benchmarks": {"pusht": True}},
+                    "unrelated": {**base, "clone_sources": [str(self.root / "other")], "benchmarks": {"pusht": True}},
+                    "incomplete": {**base, "clone_sources": [prefix], "benchmarks": {"pusht": False}}}
+        environments.catalogs = catalogs
+        with patch("manage.subprocess.run") as process, patch.object(environments, "lerobot", return_value=catalogs):
+            self.assertEqual(environments.prepare("lerobot", model="act", benchmark="pusht", pinned=True,
+                                                  runtime="evaluation"), "ready")
+            self.assertIn("Verified managed clone", environments.selection_reason)
+            self.assertEqual(environments.prepare("lerobot", model="act", benchmark="pusht", pinned=True,
+                                                  runtime="evaluation", preview=True), "ready")
+            process.assert_not_called()
+        environments.catalogs = {k: v for k, v in catalogs.items() if k != "ready"}
+        with patch("manage.subprocess.run") as process:
+            self.assertEqual(environments.prepare("lerobot", model="act", benchmark="pusht", pinned=True,
+                                                  runtime="evaluation", preview=True), "lerobot")
+            self.assertIn("setup required", environments.selection_reason)
+            process.assert_not_called()
+
     def test_dependency_install_tries_an_existing_alternate_before_cloning(self):
         environments = LeRobotEnvironments("conda", self.root, "preferred", {"alternate"})
         needs_eval = {"policies": {"act": True}, "runtime": {"evaluation": False}}
@@ -1045,6 +1189,7 @@ class ManagerTests(unittest.TestCase):
         results = [subprocess.CompletedProcess([], code, stdout="isolated error") for code in (3, 0, 1, 0)]
         with patch("manage.subprocess.run", side_effect=results) as process, \
              patch("manage.configure_clone_inheritance"), \
+             patch("manage.prepare_clone_source"), \
              patch("manage.available_environments", return_value=set()), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "isolated error"):
                 environments.prepare("preferred", model="act", benchmark="pusht")
@@ -1059,6 +1204,7 @@ class ManagerTests(unittest.TestCase):
         results = [subprocess.CompletedProcess([], code, stdout="") for code in (3, 0, 0)]
         with patch("manage.subprocess.run", side_effect=results) as process, \
              patch("manage.configure_clone_inheritance", side_effect=ActivationError("Safe clone setup failure")), \
+             patch("manage.prepare_clone_source"), \
              patch("manage.available_environments", return_value=set()), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "Safe clone setup failure"):
                 environments.prepare("preferred", model="act", benchmark="pusht")
@@ -1130,6 +1276,58 @@ class ManagerTests(unittest.TestCase):
             configure_policy_options(train, options)
         self.assertEqual(train, {"policy_options": {"optimizer_lr": 0.0003}})
         self.assertEqual(training_flags(train, "act"), ["--policy.optimizer_lr=0.0003"])
+
+    def test_molmo_bias_options_reach_the_command_through_the_question_menu(self):
+        from dataclasses import dataclass
+        from benchmarks import policy_training_options
+
+        @dataclass
+        class Configuration:
+            lora_bias: str = "none"
+
+        options = policy_training_options(Configuration)
+        self.assertEqual(options["lora_bias"]["choices"], ["none", "all", "lora_only"])
+        train = {}
+        with patch("sys.stdin", io.StringIO("2\n3\n1\n")), contextlib.redirect_stdout(io.StringIO()) as screen:
+            configure_policy_options(train, options)
+        self.assertIn("LoRA Bias", screen.getvalue())
+        self.assertEqual(training_flags(train, "molmoact2"), ["--policy.lora_bias=lora_only"])
+        for model, value in (("molmoact2", "invalid"), ("groot", "none")):
+            with self.subTest(model=model, value=value), self.assertRaisesRegex(ValueError, "MolmoAct2 lora_bias"):
+                training_flags({"policy_options": {"lora_bias": value}}, model)
+
+        @dataclass
+        class WeightedConfiguration:
+            discrete_loss_token_weighting: str = "root_subsegments_root_tokens"
+
+        self.assertEqual(policy_training_options(WeightedConfiguration)["discrete_loss_token_weighting"]["choices"],
+                         ["none", "token", "root_tokens", "root_subsegments", "root_subsegments_root_tokens"])
+
+    def test_optional_checkpointing_and_loss_options_are_typed_and_keep_inheritance(self):
+        from dataclasses import dataclass
+        from benchmarks import policy_training_options
+
+        @dataclass
+        class Configuration:
+            ae_gradient_checkpointing_layers: int | None = None
+            do_mask_loss_for_padding: bool = False
+            knowledge_insulation: bool = True
+            optimizer_lr: float = 0.001
+            vlm_gradient_checkpointing: bool | None = None
+
+        options = policy_training_options(Configuration)
+        self.assertEqual(set(options), set(Configuration.__dataclass_fields__))
+        self.assertTrue(options["ae_gradient_checkpointing_layers"]["nullable"])
+        self.assertEqual(options["vlm_gradient_checkpointing"]["choices"], [None, True, False])
+        for answers, expected in (("2\nbad\n2\n6\n3\n1\n", ["2", "false"]),
+                                  ("2\nnull\n6\n1\n1\n", ["null", "null"])):
+            with self.subTest(answers=answers):
+                train = {}
+                with patch("sys.stdin", io.StringIO(answers)), contextlib.redirect_stdout(io.StringIO()):
+                    configure_policy_options(train, options)
+                arguments = training_flags(train, "dm05")
+                self.assertEqual(arguments, ["--policy.ae_gradient_checkpointing_layers=" + expected[0],
+                                             "--policy.vlm_gradient_checkpointing=" + expected[1]])
 
     def test_training_scope_and_lora_map_to_native_flags(self):
         catalog = {"training": {"smolvla": ["freeze_vision_encoder"]},
@@ -1218,6 +1416,18 @@ class ManagerTests(unittest.TestCase):
             "observation.images.face_view": {"type": "VISUAL", "shape": [3, 448, 448]}}}))
         config = {"model": "wall_oss_05", "train": {"dataset_root": str(root), "pretrained": str(base),
                   "extra": ['--policy.camera_key_mapping={"observation.images.image":"face_view"}']}}
+        self.assertEqual(native_training_preflight(config), {})
+        info = root / "meta/info.json"
+        data = json.loads(info.read_text())
+        data["features"]["observation.images.image2"] = dict(data["features"]["observation.images.image"])
+        info.write_text(json.dumps(data))
+        config["train"].update(dataset="lerobot/libero", extra=[])
+        expected = {"policy.camera_key_mapping": {"observation.images.image": "face_view",
+                                                  "observation.images.image2": "right_wrist_view"}}
+        self.assertEqual(native_training_preflight(config), expected)
+        del config["train"]["pretrained"]
+        self.assertEqual(native_training_preflight(config), expected)
+        config["train"]["dataset"] = "user/unknown-cameras"
         self.assertEqual(native_training_preflight(config), {})
 
     def test_failed_stage_keeps_log_and_explains_feature_mismatch(self):

@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pprint import pformat
 import re
 import shlex
 import shutil
@@ -35,9 +36,10 @@ from evaluation_capabilities import evaluation_notices, stock_evaluation_issue
 from inventory import model_location, scan, show
 from questions import PreviousQuestion, QuestionDisplay, QuestionHistory, active_history, retry_question
 from runtime_setup import RuntimeSetupFailure
-from runtime_activation import ActivationError, configure_clone_inheritance
+from runtime_activation import ActivationError, configure_clone_inheritance, prepare_clone_source
+from training_preflight import native_training_issue
 from runner import (ANSI, StageFailure, available_environments, conda_command, conda_executable, environment_catalog,
-                    execute, load_settings, seconds, stage_title, styled)
+                    execute, load_settings, seconds, stage_failure_reason, stage_title, styled, write_json)
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -453,7 +455,7 @@ def configure_policy_options(train, options):
     if not options:
         return
     values = {}
-    labels = {name: name.replace("_", " ").title() for name in sorted(options)}
+    labels = {name: name.replace("_", " ").title().replace("Lora", "LoRA") for name in sorted(options)}
     while True:
         selection = choose("Policy Training Options", [("", "Finish / keep other defaults"), *[
             (name, f"{label} [{values.get(name, options[name]['default'])}]") for name, label in labels.items()
@@ -466,17 +468,21 @@ def configure_policy_options(train, options):
         default = values.get(selection, spec["default"])
         if "choices" in spec or type(default) is bool:
             allowed = spec.get("choices", [True, False])
-            choices = [(value, str(value)) for value in allowed]
+            choices = [(value, "Automatic (null)" if value is None else str(value))
+                       for value in allowed]
             values[selection] = choose(labels[selection], choices, default=allowed.index(default) + 1)
         else:
             while True:
-                response = ask(labels[selection], default)
+                response = ask(labels[selection], "null" if default is None else default)
+                value_type = {"int": int, "float": float, "str": str}.get(spec.get("value_type"), type(default))
                 try:
-                    value = type(default)(response)
+                    value = (None if spec.get("nullable") and response.casefold() == "null"
+                             else value_type(response))
                     if type(value) is float and not math.isfinite(value):
                         raise ValueError
                 except (TypeError, ValueError):
-                    retry_question(f"Enter a valid {type(default).__name__} value.")
+                    suffix = " or null for automatic/default behavior" if spec.get("nullable") else ""
+                    retry_question(f"Enter a valid {value_type.__name__} value{suffix}.")
                     continue
                 values[selection] = value
                 break
@@ -947,10 +953,15 @@ class LeRobotEnvironments:
             or benchmark in entry.get("manual_status", {})
             for entry in catalogs.values()
         )
+        pinned_clones = set()
+        if pinned and (source_prefix := catalogs.get(preferred, {}).get("prefix")):
+            pinned_clones = {name for name, entry in catalogs.items()
+                             if source_prefix in entry.get("clone_sources", ())}
         if pinned or (not check_policy and runtime != "dataset") or (benchmark is not None and not check_benchmark):
             if preferred in unavailable:
                 raise RuntimeError(f"Cannot use Conda environment {preferred}: {unavailable[preferred]}")
-            catalogs = {preferred: catalogs.get(preferred, {})}
+            catalogs = {preferred: catalogs.get(preferred, {}),
+                        **{name: catalogs[name] for name in pinned_clones}}
 
         def policy_ready(entry):
             if tiny:
@@ -985,6 +996,10 @@ class LeRobotEnvironments:
                 dependencies.append(("--peft", None))
             if not runtime_ready(entry):
                 dependencies.append(("--runtime", runtime))
+            if name in pinned_clones and dependencies:
+                # A pin permits reuse of a ready descendant, not installation
+                # into unrelated or partially prepared environments.
+                continue
             candidates.append((len(dependencies), name != preferred, name, dependencies))
 
         if not candidates:
@@ -1013,7 +1028,8 @@ class LeRobotEnvironments:
             return False
 
         for _, _, source, dependencies in sorted(candidates):
-            selection = "Preferred environment" if source == preferred else f"Alternative to {preferred}"
+            selection = (f"Verified managed clone of {preferred}" if source in pinned_clones else
+                         "Preferred environment" if source == preferred else f"Alternative to {preferred}")
             if not dependencies:
                 unknown = (runtime != "dataset" and not check_policy) or (benchmark and not check_benchmark)
                 detail = ("policy or simulator support unverified"
@@ -1050,6 +1066,11 @@ class LeRobotEnvironments:
                 target = f"{stem}_{index}"
                 index += 1
             print(f"  Dependency conflict in {source}. Creating {target}…", flush=True)
+            try:
+                prepare_clone_source(self.conda, source, self.root)
+            except ActivationError as error:
+                failures.append(str(error))
+                continue
             clone = subprocess.run([self.conda, "create", "--yes", "--name", target, "--clone", source],
                                    **process_options)
             if clone.returncode:
@@ -1261,13 +1282,17 @@ def configure_jobs(adapters, inventory, root, policies, display, training_catalo
 def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment):
     backend, model = choose_policy(adapters, policies, inventory)
     tiny = backend == "tinyvla"
-    operation = choose("Job Type", [
+    operations = [
         ("eval", "Evaluation"),
         ("train", "Training"),
         ("both", "Training + Evaluation"),
         ("resume", "Training Continuation"),
         ("resume_eval", "Training Continuation + Evaluation"),
-    ])
+    ]
+    if backend == "native" and (issue := native_training_issue(model)):
+        print(styled(issue, "33"))
+        operations = operations[:1]
+    operation = choose("Job Type", operations)
     continuation = operation in {"resume", "resume_eval"}
     cfg = {"schema": 1, "adapter": backend, "model": model}
     if operation != "eval":
@@ -1564,6 +1589,21 @@ def job_subheading(title):
     print(styled(f"  ({title})", "1;94"), flush=True)
 
 
+def validate_model_training_fields(model, train, catalog):
+    """Validate imported component/option names against the selected runtime version."""
+    if train.get("resume"):
+        return
+    declared = catalog.get("policy_fields", {}).get(model)
+    if declared is None:
+        return  # Older or unavailable runtime catalogs cannot establish support.
+    for field in ("policy_training", "policy_options"):
+        options = train.get(field) or {}
+        if isinstance(options, dict) and (unknown := options.keys() - set(declared)):
+            raise ValueError(f"Policy {model} in the selected LeRobot runtime does not support "
+                             f"{field} fields: {', '.join(sorted(unknown))}. "
+                             "Remove these fields or use a runtime version that declares them.")
+
+
 def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=False):
     backend = cfg["adapter"]
     if backend not in {"native", "tinyvla"}:
@@ -1627,6 +1667,8 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
                 raise
             target, reason = preferred, f"Cannot confirm readiness: {error}"
         role = "LeRobot dataset reader" if tiny_train else f"LeRobot {runtime}"
+        if backend == "native" and stage.name == "train":
+            validate_model_training_fields(model, train, session.catalogs.get(target, {}))
         notes.append(f"{role}: {target}. {reason}")
         if simulator_detail:
             notes.extend(simulator_detail)
@@ -1676,6 +1718,36 @@ def temporary_job_root(path, temporary_outputs):
     return next((root for root in temporary_outputs if path.is_relative_to(root)), None)
 
 
+def record_preparation_failure(error, cfg, run_dir, root, conda, started):
+    """Keep a retryable job and a concise diagnostic when no stage could start."""
+    run_dir.mkdir(parents=True, exist_ok=False)
+    details = str(error)
+    # Conda's crash report dumps activation variables after this heading.
+    details = re.split(r"(?im)^\s*environment variables:\s*$", details, maxsplit=1)[0]
+    details = re.sub(r"\bhf_[A-Za-z0-9]{8,}\b", "[redacted]", details)
+    details = re.sub(r"(?i)\bBearer\s+[^\s'\",;)\]]+", "Bearer [redacted]", details)
+    logfile = run_dir / "setup.log"
+    logfile.write_text(details + "\n", encoding="utf-8")
+    reason = stage_failure_reason(logfile) or (
+        error.reason if isinstance(error, RuntimeSetupFailure) else "Could not prepare the selected runtime.")
+    settings_text = "JOBS = " + pformat([cfg], sort_dicts=False, width=110) + "\n"
+    (run_dir / "script.py").write_text(settings_text, encoding="utf-8")
+    retry = ('"""AI-written retry launcher: environment setup failed before any model stage ran."""\n\n' +
+             settings_text + '\nif __name__ == "__main__":\n' +
+             '    from pathlib import Path\n    import sys\n' +
+             f'    sys.path.insert(0, {str(root / "executor")!r})\n' +
+             '    from manage import main\n' +
+             f'    sys.argv = ["manage.py", "--settings", str(Path(__file__).resolve()), "--conda", {str(conda)!r}]\n' +
+             '    raise SystemExit(main())\n')
+    (run_dir / "run.py").write_text(retry, encoding="utf-8")
+    ended = datetime.now(timezone.utc)
+    write_json(run_dir / "status.json", {"status": "failed", "phase": "environment_setup",
+               "started_at": started.isoformat(), "ended_at": ended.isoformat(),
+               "seconds": (ended - started).total_seconds(), "stages": [], "error": reason,
+               "setup_log": str(logfile)})
+    return RuntimeSetupFailure("Dependencies", reason, logfile)
+
+
 def run_plans(plans, conda, verbose, temporary_outputs, sessions=None):
     sessions = {} if sessions is None else sessions
     for index, (cfg, stages, run_dir, root) in enumerate(plans, 1):
@@ -1683,7 +1755,11 @@ def run_plans(plans, conda, verbose, temporary_outputs, sessions=None):
             print()
         print(job_title(index, cfg), flush=True)
         job_subheading("Status")
-        prepare_job_environments(cfg, stages, root, conda, sessions)
+        started = datetime.now(timezone.utc)
+        try:
+            prepare_job_environments(cfg, stages, root, conda, sessions)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            raise record_preparation_failure(error, cfg, run_dir, root, conda, started) from error
         execute(stages, cfg, run_dir, root, conda, verbose)
         show_job_result(stages, save_outputs=cfg.get("save_outputs", True))
         if scratch := temporary_job_root(run_dir, temporary_outputs):
@@ -1826,8 +1902,9 @@ def main():
                        reason=error.reason, logfile=None if temporary else error.logfile, temporary=temporary)
         return 1
     except RuntimeSetupFailure as error:
+        temporary = bool(error.logfile and temporary_job_root(error.logfile, temporary_outputs) is not None)
         report_failure("Environment setup failed.", in_job=executing,
-                       reason=error.reason, logfile=error.logfile)
+                       reason=error.reason, logfile=None if temporary else error.logfile, temporary=temporary)
         return 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError, SyntaxError,
             subprocess.SubprocessError) as error:

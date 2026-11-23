@@ -328,7 +328,24 @@ def policy_training_options(config):
             continue
         hint = hints.get(item.name, item.type)
         default = item.default
-        if get_origin(hint) is Literal and type(default) in (bool, int, float, str):
+        members = get_args(hint)
+        nullable = type(None) in members
+        if nullable and len(members) == 2:
+            hint = next(member for member in members if member is not type(None))
+        if default is None and nullable and hint in (bool, int, float, str):
+            spec = {"default": None, "nullable": True, "value_type": hint.__name__}
+            if hint is bool:
+                spec["choices"] = [None, True, False]
+            result[item.name] = spec
+            continue
+        choices = {
+            "lora_bias": ["none", "all", "lora_only"],
+            "discrete_loss_token_weighting": ["none", "token", "root_tokens", "root_subsegments",
+                                              "root_subsegments_root_tokens"],
+        }.get(item.name)
+        if choices and default in choices:
+            result[item.name] = {"default": default, "choices": choices}
+        elif get_origin(hint) is Literal and type(default) in (bool, int, float, str):
             values = [value for value in get_args(hint) if type(value) is type(default)]
             if values:
                 result[item.name] = {"default": default, "choices": values}
@@ -338,7 +355,13 @@ def policy_training_options(config):
 
 
 def environment_catalog():
+    from runtime_activation import ActivationError, clone_lineage
+
     distribution = metadata.distribution("lerobot")
+    try:
+        lineage = clone_lineage()
+    except ActivationError as error:
+        return {"runtime_issue": str(error)}
     if issue := data_runtime_issue():
         return {"runtime_issue": issue}
     from lerobot.configs import PreTrainedConfig
@@ -350,6 +373,7 @@ def environment_catalog():
     register_third_party_plugins()
     versions = installed_versions()
     policies, trainable, options, issues, policy_installable = {}, {}, {}, {}, []
+    policy_fields = {}
     for name, config in PreTrainedConfig.get_known_choices().items():
         if config.__module__.startswith("lerobot.policies."):
             missing = sorted({req.name for req in policy_requirements(distribution, name)
@@ -376,6 +400,7 @@ def environment_catalog():
                 options[name] = editable
             if is_dataclass(config):
                 names = {item.name for item in fields(config)}
+                policy_fields[name] = sorted(names)
                 switches = [key for key in TRAINING_SWITCHES if key in names]
                 if name == "molmoact2" and {"train_mode_vlm", "lora_rank", "lora_alpha", "lora_dropout"} <= names:
                     switches.append("train_mode_vlm")
@@ -411,13 +436,14 @@ def environment_catalog():
     peft_requirements = optional_requirements(distribution, "peft")
     runtime = {extra: all(installed(req, versions) for req in optional_requirements(distribution, extra))
                for extra in LEROBOT_RUNTIME_EXTRAS}
-    return {"policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
+    return {**lineage, "policies": policies, "benchmarks": benchmarks, "plugins": plugins, "manual_benchmarks": manual,
             "manual_status": manual_status, "runtime": runtime, "split_robomme": split_robomme,
             "tinyvla_bridge": util.find_spec("lerobot_policy_tinyvla") is not None,
             "peft_ready": "peft" in versions and all(installed(req, versions) for req in peft_requirements),
             "peft_installable": bool(peft_requirements),
             "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable,
-            "policy_issues": issues, "policy_installable": sorted(policy_installable), "training_options": options}
+            "policy_issues": issues, "policy_installable": sorted(policy_installable), "training_options": options,
+            "policy_fields": policy_fields}
 
 
 def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False, runtime=None, isolated=False):

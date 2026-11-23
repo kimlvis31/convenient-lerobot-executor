@@ -38,6 +38,11 @@ JOBS = [
             #   lora_alpha = 16
             #   lora_dropout = 0.05
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "enable_knowledge_insulation": False,  # Optional.
+                # "softmax_auxiliary_loss": True,  # Optional.
+                # "softmax_auxiliary_loss_scale": 0.0001,  # Optional.
+                # "discrete_loss_token_weighting": 'root_subsegments_root_tokens',  # Optional. Available: 'none', 'token', 'root_tokens', 'root_subsegments', 'root_subsegments_root_tokens'.
+                # "lora_bias": "none",  # Optional. Internal LoRA bias mode: none, all, or lora_only.
                 # "gradient_checkpointing": False,
                 # "llm_residual_dropout": 0.1,
                 # "optimizer_lr": 0.00001,

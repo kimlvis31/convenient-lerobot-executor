@@ -41,6 +41,7 @@ JOBS = [
             #   train_policy_transformer = True
             #   train_soft_prompts = True
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "optimizer_soft_prompt_warmup_lr_scale": None,  # Optional. None uses the policy's automatic/default behavior.
                 # "optimizer_lr": 0.0001,
                 # "optimizer_eps": 1e-8,
                 # "optimizer_weight_decay": 0,

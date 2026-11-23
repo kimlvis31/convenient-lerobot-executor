@@ -33,6 +33,9 @@ JOBS = [
             # Component settings exposed by this policy (constructor defaults shown).
             #   freeze_vlm_embedding = True
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "vlm_gradient_checkpointing": None,  # Optional. None uses the policy's automatic/default behavior. Available: None, True, False.
+                # "ae_gradient_checkpointing": None,  # Optional. None uses the policy's automatic/default behavior. Available: None, True, False.
+                # "ae_gradient_checkpointing_layers": None,  # Optional. None uses the policy's automatic/default behavior.
                 # "optimizer_lr": 0.000025,
                 # "optimizer_eps": 1e-8,
                 # "optimizer_weight_decay": 1e-10,

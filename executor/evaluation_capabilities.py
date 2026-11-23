@@ -12,6 +12,27 @@ UNITREE_SOURCE = (
 FINEART_REPOSITORY = "lerobot/FineART-VLA-subtask-midtrained"
 
 
+def checkpoint_action_issue(policy, features, environment):
+    """Compare raw action metadata; never reshape another robot's controls."""
+    if not getattr(policy, "pretrained_path", None):
+        return None
+    declared = (getattr(policy, "output_features", None) or {}).get("action")
+    observed = features.get("action") if isinstance(features, dict) else None
+
+    def shape(feature):
+        values = feature.get("shape") if isinstance(feature, dict) else getattr(feature, "shape", None)
+        if isinstance(values, (tuple, list)) and values and all(type(n) is int and n > 0 for n in values):
+            return tuple(values)
+        return None
+
+    wanted, actual = shape(declared), shape(observed)
+    if wanted and actual and wanted != actual:
+        return (f"Checkpoint action shape {wanted} does not match {environment} action shape {actual}. "
+                "Use a checkpoint trained for this environment or a matching environment/task adapter. "
+                "Changing dimensions alone cannot establish compatible robot control.")
+    return None
+
+
 def hub_repository(reference):
     """Read LeRobot's repository@revision:file reference without fetching it."""
     if not isinstance(reference, str):

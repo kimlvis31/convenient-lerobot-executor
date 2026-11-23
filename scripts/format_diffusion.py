@@ -32,6 +32,8 @@ JOBS = [
             "save_freq": 100,  # Required. Optimizer steps between checkpoints.
             "policy_training": {},  # Optional. Inherit the policy or checkpoint scope.
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "num_train_timesteps": 100,  # Optional.
+                # "do_mask_loss_for_padding": False,  # Optional.
                 # "gradient_checkpointing": False,
                 # "optimizer_lr": 0.0001,
                 # "optimizer_eps": 1e-8,

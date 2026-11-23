@@ -31,10 +31,12 @@ def pinned_command(command, stage, reference, revision, root):
         start = command.index(entry)
         end = start + 1
     else:
-        camera_helper = str(Path(__file__).with_name("evaluation_cameras.py").resolve())
-        if stage != "eval" or camera_helper not in command:
+        helpers = [str(Path(__file__).with_name(name).resolve())
+                   for name in ("evaluation_cameras.py", "parallel_eval.py")]
+        helper = next((path for path in helpers if path in command), None)
+        if stage != "eval" or helper is None:
             raise ValueError(f"Unexpected LeRobot {stage} entry point.")
-        end = command.index(camera_helper) + 1
+        end = command.index(helper) + 1
         start = end - 3  # NativeAdapter emits python -u followed by the helper.
         if start < 0 or command[start:end - 1] != ["python", "-u"]:
             raise ValueError("Unexpected camera evaluation entry point.")
@@ -87,6 +89,14 @@ def pinned_entrypoint(stage, reference, revision):
                 return original_processors(*args, **kwargs)
 
             hooks.enter_context(patch.object(lerobot_eval, "make_pre_post_processors", load_processors))
+            flags = dict(arg[2:].split("=", 1) for arg in sys.argv[1:] if arg.startswith("--") and "=" in arg)
+            parallel = int(flags.get("env.max_parallel_tasks", 1))
+            episodes = int(flags.get("eval.n_episodes", 1))
+            batch = int(flags.get("eval.batch_size", 1))
+            if parallel > 1 or min(batch, episodes) > 0 and episodes % min(batch, episodes):
+                from parallel_eval import track_parallel_rollouts
+
+                hooks.callback(track_parallel_rollouts(lerobot_eval))
             from robomme_split import simulator_context
             from simulator_worker import simulator_context as source_context
             from evaluation_cameras import simulator_directory

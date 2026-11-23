@@ -39,6 +39,8 @@ JOBS = [
             #   unfreeze_lam_decoder = True
             #   unfreeze_llm_last_n_layers = -1
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "enable_loss_distill": True,  # Optional.
+                # "detach_future_feature": True,  # Optional.
                 # "lam_dropout": 0,
                 # "optimizer_lr": 0.0001,
                 # "optimizer_eps": 1e-8,

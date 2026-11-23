@@ -14,6 +14,7 @@ from evaluation_capabilities import (
     UNITREE_REPOSITORY,
     UNITREE_REVISION,
     UNITREE_SOURCE,
+    checkpoint_action_issue,
     evaluation_notices,
     stock_evaluation_issue,
 )
@@ -21,6 +22,18 @@ from manage import choose_evaluation_environment, prepare_job_environments, show
 
 
 class EvaluationCapabilityTests(unittest.TestCase):
+    def test_checkpoint_action_shape_is_checked_without_overriding_control(self):
+        policy = SimpleNamespace(pretrained_path="team/robot", output_features={"action": {"shape": [26]}})
+        message = checkpoint_action_issue(policy, {"action": SimpleNamespace(shape=(7,))}, "libero")
+        self.assertIn("(26,)", message)
+        self.assertIn("(7,)", message)
+        self.assertIn("task adapter", message)
+        policy.output_features["action"]["shape"] = [7]
+        self.assertIsNone(checkpoint_action_issue(policy, {"action": {"shape": [7]}}, "libero"))
+        self.assertIsNone(checkpoint_action_issue(policy, {}, "plugin"))
+        policy.pretrained_path = None
+        self.assertIsNone(checkpoint_action_issue(policy, {"action": {"shape": [2]}}, "pusht"))
+
     def settings(self, *, kind="unitree_g1_mujoco", extra=()):
         return {
             "adapter": "native", "model": "act",

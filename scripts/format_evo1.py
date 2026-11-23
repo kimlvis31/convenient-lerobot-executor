@@ -36,6 +36,8 @@ JOBS = [
                 "finetune_action_head": True,
             },
             "policy_options": {  # Optional. Uncomment or change supported values as needed.
+                # "enable_gradient_checkpointing": True,  # Optional.
+                # "gradient_checkpointing_use_reentrant": False,  # Optional.
                 # "dropout": 0,
                 # "optimizer_lr": 0.00001,
                 # "optimizer_eps": 1e-8,

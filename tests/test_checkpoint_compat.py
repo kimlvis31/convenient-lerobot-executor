@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 from checkpoint_compat import PROCESSORS, WEIGHTS, checkpoint_candidate, main, prepare_checkpoint, validate_processor_states
 from molmo_compat import LEGACY_FIELDS, LEGACY_FLAGS, evaluation_config
 from pinned_policy import pinned_command, pinned_entrypoint, requested_revision
+from tests import EXECUTOR
 
 
 def molmo_runtime_stubs(runtime):
@@ -243,12 +244,14 @@ class CheckpointCompatibilityTests(unittest.TestCase):
             requested_revision([*command, "--policy.pretrained_revision=main"])
 
     def test_pinning_with_deferred_camera_detection_uses_one_worker(self):
-        camera = str(Path(__file__).with_name("evaluation_cameras.py").resolve())
-        command = ["conda", "run", "-n", "test", "python", "-u", camera, "--env.type=vlabench"]
-        result = pinned_command(command, "eval", "org/policy", "v1", self.root)
-        self.assertEqual(result[:6], ["conda", "run", "-n", "test", "python", "-B"])
-        self.assertEqual(result[-2:], ["eval", "--env.type=vlabench"])
-        self.assertNotIn(camera, result)
+        for name in ("evaluation_cameras.py", "parallel_eval.py"):
+            with self.subTest(helper=name):
+                helper = str((EXECUTOR / name).resolve())
+                command = ["conda", "run", "-n", "test", "python", "-u", helper, "--env.type=vlabench"]
+                result = pinned_command(command, "eval", "org/policy", "v1", self.root)
+                self.assertEqual(result[:6], ["conda", "run", "-n", "test", "python", "-B"])
+                self.assertEqual(result[-2:], ["eval", "--env.type=vlabench"])
+                self.assertNotIn(helper, result)
 
     def test_pinned_policy_preserves_other_sources_and_records_adapter_base(self):
         revision = "c" * 40
@@ -291,6 +294,29 @@ class CheckpointCompatibilityTests(unittest.TestCase):
         self.assertEqual(original.call_args.kwargs["revision"], revision)
         self.assertIs(pretrained.get_peft_model, original)
         self.assertIs(actual.make_pre_post_processors, processor)
+
+    def test_pinned_parallel_and_partial_batch_evaluation_preserve_instrumentation(self):
+        revision = "e" * 40
+
+        class Config:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                return SimpleNamespace()
+
+        evaluator = SimpleNamespace(main=lambda: 23, make_pre_post_processors=Mock())
+        modules = {"huggingface_hub": SimpleNamespace(hf_hub_download=Mock(
+                       return_value=str(self.root / revision / "config.json"))),
+                   "lerobot.configs": SimpleNamespace(PreTrainedConfig=Config),
+                   "lerobot.scripts": SimpleNamespace(lerobot_eval=evaluator)}
+        for parallel in (1, 2):
+            restore = Mock()
+            args = ["native", f"--env.max_parallel_tasks={parallel}", "--eval.n_episodes=3", "--eval.batch_size=2"]
+            with patch.dict(sys.modules, modules), patch.object(sys, "argv", args), \
+                 patch("parallel_eval.track_parallel_rollouts", return_value=restore) as tracking, \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(pinned_entrypoint("eval", "team/policy", "release"), 23)
+                tracking.assert_called_once_with(evaluator)
+                restore.assert_called_once_with()
 
     def test_pinned_evaluation_initializes_libero_plus_before_native_config_or_evaluator_imports(self):
         events = []

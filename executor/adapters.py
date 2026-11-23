@@ -1,6 +1,7 @@
 """Convert manager settings to the existing training and evaluation entry points."""
 
 from dataclasses import dataclass, field
+from difflib import get_close_matches
 import importlib
 import json
 import math
@@ -9,7 +10,7 @@ from pathlib import Path
 import re
 import sys
 
-from evaluation_cameras import camera_mapping
+from evaluation_cameras import camera_mapping, observation_arguments
 from evaluation_capabilities import stock_evaluation_issue
 from training_preflight import native_training_preflight
 
@@ -45,7 +46,7 @@ TRAINING_SWITCHES = {
     "unfreeze_vision_merger": "Vision merger",
     "unfreeze_lam_decoder": "Latent action decoder",
 }
-PEFT_POLICIES = frozenset({"smolvla", "pi0", "pi05", "lingbot_vla_v2", "flux3"})
+PEFT_POLICIES = frozenset({"smolvla", "pi0", "pi05", "fineart_vla", "lingbot_vla_v2", "flux3"})
 SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {
     "train_mode_vlm", "lora_rank", "lora_alpha", "lora_dropout",
     "tune_top_llm_layers", "unfreeze_llm_last_n_layers",
@@ -55,10 +56,13 @@ SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {
 def is_policy_training_option(name):
     if name in SCOPE_OPTIONS or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
         return False
-    return name.startswith(("optimizer_", "scheduler_", "loss_", "freeze_", "tune_", "train_", "ema_")) or (
+    tokens = set(name.split("_"))
+    return bool(tokens & {"loss", "gradient", "checkpointing", "insulation"}) or name.startswith("detach_") or (
+        name == "num_train_timesteps"
+    ) or name.startswith(("optimizer_", "scheduler_", "loss_", "freeze_", "tune_", "train_", "ema_")) or (
         name.endswith(("_dropout", "_loss_weight")) or name in {
             "dropout", "kl_weight", "use_ema", "gradient_checkpointing",
-            "use_gradient_checkpointing", "weight_decay", "max_grad_norm",
+            "use_gradient_checkpointing", "weight_decay", "max_grad_norm", "lora_bias",
         }
     )
 
@@ -79,7 +83,7 @@ class Stage:
 
 
 def flag(name, value):
-    if isinstance(value, (bool, list, dict)):
+    if value is None or isinstance(value, (bool, list, dict)):
         value = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
     return f"--{name}={value}"
 
@@ -94,6 +98,24 @@ def additional_flags(tokens, owned, prefixes=()):
             raise ValueError(f"The executor manages this option ({name}).")
         result.append(token)
     return result
+
+
+def validate_settings_fields(config, allowed, label, required=()):
+    if not isinstance(config, dict):
+        raise ValueError(f"{label} settings must be a dictionary.")
+    unknown = config.keys() - allowed
+    if unknown:
+        name = sorted(unknown, key=str)[0]
+        if label == "Evaluation" and name == "action_steps":
+            raise ValueError("action_steps is a TinyVLA evaluation setting. For a native policy, use "
+                             "--policy.n_action_steps in extra if the selected policy supports it.")
+        matches = get_close_matches(str(name), allowed, n=1, cutoff=0.6)
+        hint = (f" Did you mean {matches[0]}?" if matches else
+                " Use extra for supported LeRobot flags." if "extra" in allowed else
+                " Remove this unsupported field.")
+        raise ValueError(f"Unknown {label.lower()} setting {name!r}.{hint}")
+    if missing := set(required) - config.keys():
+        raise ValueError(f"Missing {label.lower()} settings: {', '.join(sorted(missing))}.")
 
 
 def read_json(path):
@@ -202,10 +224,12 @@ def training_flags(config, model):
         args.append(flag(f"policy.{name}", value))
 
     for name, value in options.items():
+        if name == "lora_bias" and (model != "molmoact2" or value not in ("none", "all", "lora_only")):
+            raise ValueError("MolmoAct2 lora_bias must be none, all, or lora_only.")
         legacy = name in {"train_state_proj", "train_policy_transformer", "train_soft_prompts"} and type(value) is bool
         legacy = legacy or name == "tune_top_llm_layers" and type(value) is int and value >= 0
         if (not isinstance(name, str) or not (is_policy_training_option(name) or legacy) or name in scope
-                or type(value) not in (bool, int, float, str)
+                or value is not None and type(value) not in (bool, int, float, str)
                 or type(value) is float and not math.isfinite(value)):
             raise ValueError(f"Invalid policy option ({name}).")
         args.append(flag(f"policy.{name}", value))
@@ -260,6 +284,13 @@ def required_scope_flags(cfg, model, explicit):
 class NativeAdapter:
     key = "native"
     label = "Native LeRobot policy"
+    train_fields = frozenset({"dataset", "dataset_root", "episodes", "pretrained", "batch", "device",
+                              "seed", "steps", "save_freq", "policy_training", "policy_options",
+                              "lora", "resume", "extra"})
+    eval_fields = frozenset({"policy", "env", "tasks", "episodes", "batch", "parallel_tasks", "seed",
+                             "device", "task_ids", "episode_length", "control", "size",
+                             "robomme_runtime", "simulator_environment", "environment", "extra"})
+    eval_required = frozenset({"policy", "env", "tasks", "episodes", "batch", "seed", "device"})
 
     def __init__(self, settings, run_name, root, external, environments):
         self.settings = settings
@@ -276,10 +307,18 @@ class NativeAdapter:
 
     def train(self):
         cfg = self.settings["train"]
+        required = {"steps", "save_freq"}
+        if isinstance(cfg, dict) and not cfg.get("resume"):
+            required |= {"dataset", "batch", "device", "seed"}
+        validate_settings_fields(cfg, self.train_fields, "Training", required)
         output = self.train_dir / "train"
         steps = cfg["steps"]
         if type(steps) is not int or steps < 1:
             raise ValueError("Training steps must be a positive integer.")
+        if type(cfg["save_freq"]) is not int or cfg["save_freq"] < 1:
+            raise ValueError("Checkpoint interval must be a positive integer.")
+        if not cfg.get("resume") and (type(cfg["batch"]) is not int or cfg["batch"] < 1):
+            raise ValueError("Training batch size must be a positive integer.")
         start = 0
         args = ["lerobot-train"]
         extra = cfg.get("extra", [])
@@ -353,6 +392,8 @@ class NativeAdapter:
 
     def evaluate(self, after_training):
         cfg = self.settings["eval"]
+        validate_settings_fields(cfg, self.eval_fields, "Evaluation",
+                                 self.eval_required - ({"policy"} if after_training else set()))
         output = self.eval_dir
         kind, tasks = cfg["env"], cfg["tasks"]
         if self.key == "native" and (issue := stock_evaluation_issue(kind, cfg.get("extra", ()))):
@@ -384,6 +425,9 @@ class NativeAdapter:
         if parallel > 1:
             if kind in SINGLE_TASK_BENCHMARKS:
                 raise ValueError(f"The {kind} benchmark has one task per job; use batch for parallel episodes.")
+        if parallel > 1 or episodes % min(batch, episodes):
+            # Share the native evaluator instrumentation for a partial final
+            # vector batch too: it caps rendered videos at counted episodes.
             command = ["python", "-u", str(Path(__file__).with_name("parallel_eval.py").resolve())]
         else:
             command = ["lerobot-eval"]
@@ -444,11 +488,15 @@ class NativeAdapter:
             args.append("--eval.use_async_envs=false")
             automatic = ("eval.use_async_envs",)
         if self.key == "native":
+            observations = observation_arguments(args)
+            if observations:
+                args.extend(observations)
+                automatic += tuple(argument[2:].partition("=")[0] for argument in observations)
             mapping = camera_mapping(args, model=self.settings["model"])
             if mapping:
                 args.append(flag("rename_map", mapping))
                 automatic += ("rename_map",)
-            if parallel == 1 and (mapping is None or kind in {"robotwin", "libero_plus"}):
+            if command == ["lerobot-eval"] and (mapping is None or observations is None or kind in {"robotwin", "libero_plus"}):
                 # Resolve pending checkpoints and initialize source-specific evaluation runtimes.
                 helper = Path(__file__).with_name("evaluation_cameras.py").resolve()
                 args[:len(command)] = ["python", "-u", str(helper)]
@@ -470,6 +518,11 @@ class NativeAdapter:
 class TinyVLAAdapter(NativeAdapter):
     key = "tinyvla"
     label = "TinyVLA"
+    eval_fields = NativeAdapter.eval_fields | {"action_steps"}
+    eval_required = NativeAdapter.eval_required - {"policy", "device"}
+    train_fields = frozenset({"dataset_root", "selection", "task", "updates", "batch", "lr", "seed",
+                              "save_freq", "resume", "warm_start", "base_model", "lora",
+                              "policy_training", "policy_options"})
 
     @property
     def environment(self):
@@ -485,6 +538,7 @@ class TinyVLAAdapter(NativeAdapter):
 
     def train(self):
         cfg = self.settings["train"]
+        validate_settings_fields(cfg, self.train_fields, "Training", {"updates", "batch", "lr", "seed", "save_freq"})
         output = self.train_dir / "train"
         if cfg.get("policy_training") or cfg.get("policy_options"):
             raise ValueError("TinyVLA supports action-head training with optional language-attention LoRA.")

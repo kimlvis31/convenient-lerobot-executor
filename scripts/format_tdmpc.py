@@ -60,6 +60,9 @@ JOBS = [
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--env.observation_width=96",
                 "--env.observation_height=96",
+                # Keypoint checkpoints with ENV[16] + STATE[2] automatically select
+                # environment_state_agent_pos. Image checkpoints keep pixels_agent_pos.
+                # Optional override: "--env.obs_type=environment_state_agent_pos".
                 "--policy.use_mpc=true",
             ],
         },

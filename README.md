@@ -14,6 +14,7 @@ The executor runs from this checkout and uses LeRobot from the selected Conda en
 convLexecutor/
 ├── executor/           # Interactive executor and example preparation
 ├── scripts/            # Job queue files
+├── tests/              # Automated checks; separate from runtime scripts
 ├── datasets/           # Local datasets and the LeRobot dataset cache
 ├── externals/TinyVLA/   # TinyVLA adapter and local base model
 └── outputs/
@@ -23,6 +24,20 @@ convLexecutor/
 ```
 
 ## Manual setup
+
+Job configuration is validated before execution: unknown training/evaluation keys and invalid batch or checkpoint intervals produce an actionable error. Use `policy_options` for native policy fields and `extra` for additional supported LeRobot flags. Gaussian Actor supports evaluation here; training requires LeRobot's separate reinforcement-learning actor/learner launcher.
+
+Imported component and training-option names are checked against the policy fields declared by the selected LeRobot runtime version. An unavailable runtime catalog defers that check until preparation; exact resume keeps the saved configuration.
+
+Model-specific training options include supported loss controls and gradient-checkpointing settings. Nullable controls offer automatic/default behavior through `null`; leaving a field unselected preserves the checkpoint setting. The model templates document these optional values and available enumerated choices.
+
+For PushT, the executor selects environment-state observations when a checkpoint explicitly requires the supported 16-value environment state and 2-value agent state without image inputs. Image checkpoints retain pixel observations. An explicit observation setting takes precedence. Required arguments added during planning appear in green in Settings.
+
+Native checkpoint tensors are read through host memory before LeRobot places the policy on the requested device, avoiding a second full checkpoint allocation on the accelerator. Parallel evaluation also shares declared weights in auxiliary frozen modules while keeping buffers and rollout state separate. This reduces avoidable copies; the model, activations and simulators must still fit the available memory.
+
+Before loading evaluation weights, the executor checks a checkpoint's declared action shape against the environment. Matching shapes still require matching control semantics. For Wall-OSS training on the standard `lerobot/libero` front/wrist camera pair, it supplies the verified camera-slot mapping unless explicitly overridden. A dataset downloaded during execution receives the same check once its metadata is available.
+
+When dependency preparation fails before a model stage starts, the result includes a concise cause and a link to `executor/setup.log`. Saved runs also include reusable settings, a retry `run.py`, and a failed `status.json` with no completed model stages. Managed Conda clones use a metadata marker that Conda does not treat as a package record; confirmed preparation migrates the older executor marker before re-cloning, while inventory and dry runs remain read-only. A pinned evaluation environment can reuse a verified, already compatible managed descendant of that exact source; unrelated environments are excluded. Partial final episode batches save videos only for the requested episodes.
 
 The following commands use Bash on Linux with Git and Conda available.
 

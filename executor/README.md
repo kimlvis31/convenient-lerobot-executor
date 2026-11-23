@@ -90,6 +90,20 @@ The status line shows overall completion, the current stage's completed and tota
 
 Extend `NativeAdapter` and give the class a unique `key` and a `label`. Return a `Stage` from `train()` and `evaluate(after_training)` with its environment, command, output directory, and expected files. Keep the module importable and register it with `--plugin module:Class`.
 
+Adapters that reuse the base planners must extend `train_fields` and `eval_fields` for their own setting names. Unknown keys are rejected with a spelling hint instead of silently ignored. Native policy dataclass values belong in `policy_options`; other supported LeRobot arguments belong in `extra`. Validate adapter-specific values in the corresponding planner. Gaussian Actor cannot use the ordinary supervised training planner: its actor/learner training requires a separate launcher.
+
+Optional native values such as `seed=None` are serialized as LeRobot's `null` value. TinyVLA's `eval.action_steps` is adapter-specific; for native policies, use `--policy.n_action_steps=<count>` in `eval.extra` when the selected policy supports that field.
+
+The training-options menu includes declared loss controls, knowledge insulation, detach switches, diffusion training timesteps, and gradient checkpointing. Optional Boolean and numeric fields accept `null` for the policy's automatic/default behavior. Leave an option unselected to preserve the checkpoint's existing setting. MolmoAct2 uses its internal vision-language LoRA mode and exposes its bias and discrete-loss weighting choices; the executor does not stack a second outer adapter on that recipe.
+
+Native PushT evaluation inspects checkpoint input features and automatically selects `environment_state_agent_pos` only for the verified ENV[16] + STATE[2] nonvisual contract. Explicit observation, feature, or rename overrides take precedence. An uncached Hub checkpoint is inspected after download, before the evaluator starts. The source checkpoint is unchanged.
+
+`native_runtime.py` wraps only native training/evaluation entrypoints in the child process. It keeps LeRobot's strict checkpoint loading and final device placement, but reads temporary safetensors through host memory when the destination is CUDA or MPS. Other commands and the original LeRobot installation remain unchanged. Parallel task copies share declared parameters in registered and auxiliary frozen modules; mutable tensor buffers, caches and processors remain task-local, and inference is serialized.
+
+Evaluation compares the checkpoint's canonical action shape with the native environment's declared action shape before constructing the policy. A mismatch requires a compatible checkpoint or task adapter; equal dimensions do not verify robot-control semantics. Wall-OSS training recognizes only the standard `lerobot/libero` front/wrist camera pair for automatic `policy.camera_key_mapping`. Explicit camera overrides and saved valid mappings take precedence. For a cold dataset download, the native child resolves the mapping after dataset metadata becomes available and records the added flag in the stage log.
+
+Dependency preparation failures are saved under the job's `executor/` directory as `setup.log`, `status.json`, reusable `script.py`, and a retry `run.py`. The retry script does not imply a model stage ran. Managed Conda clones store a value-free `conda-meta/convlex-source` pointer. During confirmed preparation, older validated `convlex-source.json` pointers are migrated before re-cloning; preview and inventory do not migrate them. A pinned source can reuse an already compatible managed descendant with verified path provenance; other environments remain excluded. Partial final episode batches use the shared native evaluator wrapper to cap video saving at the requested episode count.
+
 ## Verification
 
-Run the local tests with `python -B -m unittest discover -s ~/convLexecutor/executor -v`.
+Automated checks live in `tests/`, separately from the executor's runtime modules. Run them with `python -B -m unittest discover -s ~/convLexecutor/tests -t ~/convLexecutor -v`, or run `python -B -m unittest discover -v` from the project root. Keep machine-specific audit scripts, downloaded weights, and run artifacts outside the source checkout.

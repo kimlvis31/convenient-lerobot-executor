@@ -94,9 +94,33 @@ def _check_camera_constraints(model, cameras):
         raise ValueError(f"{model} requires camera inputs with matching image shapes.")
 
 
+def native_training_issue(model):
+    if model == "gaussian_actor":
+        return ("Gaussian Actor uses LeRobot's separate reinforcement-learning actor/learner launcher. "
+                "The supervised lerobot-train command does not implement its training objective. "
+                "Use Evaluation here, or train with the reinforcement-learning launcher first.")
+    return None
+
+
+def wall_oss_camera_defaults(train, cameras, policy=None, manual=None):
+    """Use the documented front/hand cameras of the standard LIBERO dataset."""
+    explicit = any(isinstance(token, str) and token.startswith(
+        ("--policy.camera_key_mapping=", "--policy.camera_key_mapping.")) for token in train.get("extra", ()))
+    existing = (policy or {}).get("camera_key_mapping")
+    if isinstance(existing, dict) and existing and set(existing) <= set(cameras):
+        return {}
+    known = {"observation.images.image": "face_view", "observation.images.image2": "right_wrist_view"}
+    if (train.get("dataset") == "lerobot/libero" and set(cameras) == set(known)
+            and manual is None and not explicit):
+        return {"policy.camera_key_mapping": known}
+    return {}
+
+
 def native_training_preflight(config):
     """Return required automatic flags for a native job using known local metadata."""
     train = config["train"]
+    if issue := native_training_issue(config["model"]):
+        raise ValueError(issue)
     if train.get("resume"):
         return {}
 
@@ -132,7 +156,7 @@ def native_training_preflight(config):
         if model == "wall_oss_05":
             # Wall-OSS derives its input features from the target dataset and resolves
             # physical camera slots using its own camera_key_mapping overrides.
-            return {}
+            return wall_oss_camera_defaults(train, cameras, policy, manual)
         inputs = policy.get("input_features")
         if inputs and isinstance(inputs, dict):
             expected = _policy_cameras(inputs)
@@ -149,5 +173,7 @@ def native_training_preflight(config):
                     raise ValueError(f"{model} checkpoint camera inputs do not match this dataset. "
                                      f"Missing {missing}. Unexpected {unexpected}.")
             cameras = expected
+    if model == "wall_oss_05":
+        return wall_oss_camera_defaults(train, cameras, manual=manual)
     _check_camera_constraints(model, cameras)
     return auto

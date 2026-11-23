@@ -22,7 +22,8 @@ import sys
 UNSET_SENTINEL = "***unset***"  # conda.base.constants.CONDA_ENV_VARS_UNSET_VAR
 VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 SCOPE = re.compile(r"[0-9a-f]{16}\Z")
-CLONE_MARKER = "convlex-source.json"
+CLONE_MARKER = "convlex-source"
+LEGACY_CLONE_MARKER = "convlex-source.json"
 MAX_CLONE_DEPTH = 16
 MODEL_CACHE_VARIABLES = {
     "HF_HOME", "HF_HUB_CACHE", "HF_TOKEN_PATH", "HF_ASSETS_CACHE", "HF_XET_CACHE",
@@ -90,6 +91,8 @@ def _clone_source(prefix):
         target = Path(prefix).resolve()
         path = target / "conda-meta" / CLONE_MARKER
         if not path.exists() and not path.is_symlink():
+            path = target / "conda-meta" / LEGACY_CLONE_MARKER
+        if not path.exists() and not path.is_symlink():
             return None
         if path.is_symlink() or not path.resolve().is_relative_to(target) or path.stat().st_size > 16384:
             raise ValueError("Invalid clone marker location.")
@@ -119,6 +122,12 @@ def _clone_sources(prefix):
     return sources
 
 
+def clone_lineage(prefix=None):
+    """Expose verified path-only clone provenance without reading env values."""
+    target = Path(sys.prefix if prefix is None else prefix).resolve()
+    return {"prefix": str(target), "clone_sources": [str(source) for source in _clone_sources(target)]}
+
+
 def install_clone_inheritance(source_prefix, target_prefix):
     """Record only a source path in a newly created, caller-owned Conda clone."""
     source, target = Path(source_prefix), Path(target_prefix)
@@ -136,25 +145,60 @@ def install_clone_inheritance(source_prefix, target_prefix):
     return record
 
 
+def migrate_clone_inheritance(prefix):
+    """Move a validated legacy pointer out of Conda's package-record JSON glob.
+
+    Call only during confirmed preparation; inventory and child inheritance stay
+    read-only. Original environments without our marker are left untouched.
+    """
+    target = Path(prefix).resolve()
+    legacy = target / "conda-meta" / LEGACY_CLONE_MARKER
+    if not legacy.exists() and not legacy.is_symlink():
+        return False
+    if legacy.is_symlink() or not legacy.resolve().is_relative_to(target) or legacy.stat().st_size > 16384:
+        raise ActivationError("Cannot migrate the managed clone source configuration.")
+    try:
+        raw = legacy.read_bytes()
+        record = json.loads(raw)
+        source = _clone_source(target)
+        if (type(record) is not dict or set(record) != {"schema", "source_prefix"}
+                or type(record.get("schema")) is not int or record["schema"] != 1
+                or not isinstance(record.get("source_prefix"), str)
+                or source is None or Path(record["source_prefix"]).resolve() != source):
+            raise ValueError("Conflicting clone metadata.")
+        _atomic_text(target / "conda-meta" / CLONE_MARKER, json.dumps(record) + "\n", target)
+        if legacy.read_bytes() != raw:
+            raise ValueError("Clone metadata changed during migration.")
+        legacy.unlink()
+    except (OSError, ValueError, TypeError, UnicodeError):
+        raise ActivationError("Cannot migrate the managed clone source configuration.") from None
+    return True
+
+
+def _clone_prefix(conda, selected, root):
+    selector = "--prefix" if Path(selected).is_absolute() else "--name"
+    command = [str(conda), "run", "--no-capture-output", selector, selected,
+               "python", "-B", "-c", "import sys; print('CONVLEX_CLONE_PREFIX '+sys.prefix)"]
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60)
+        prefix = next((line.removeprefix("CONVLEX_CLONE_PREFIX ")
+                       for line in reversed(result.stdout.splitlines())
+                       if line.startswith("CONVLEX_CLONE_PREFIX ")), None)
+        if result.returncode or not prefix or not Path(prefix).is_absolute():
+            raise ValueError("Missing clone prefix.")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise ActivationError("Cannot determine the managed clone environment prefixes.") from None
+    return prefix
+
+
+def prepare_clone_source(conda, source, root):
+    return migrate_clone_inheritance(_clone_prefix(conda, source, root))
+
+
 def configure_clone_inheritance(conda, source, target, root):
     """Resolve prefixes without activation wrappers, then configure the new clone."""
-    prefixes = []
-    for selected in (source, target):
-        selector = "--prefix" if Path(selected).is_absolute() else "--name"
-        command = [str(conda), "run", "--no-capture-output", selector, selected,
-                   "python", "-B", "-c", "import sys; print('CONVLEX_CLONE_PREFIX '+sys.prefix)"]
-        try:
-            result = subprocess.run(command, cwd=root, capture_output=True, text=True,
-                                    encoding="utf-8", errors="replace", timeout=60)
-            prefix = next((line.removeprefix("CONVLEX_CLONE_PREFIX ")
-                           for line in reversed(result.stdout.splitlines())
-                           if line.startswith("CONVLEX_CLONE_PREFIX ")), None)
-            if result.returncode or not prefix or not Path(prefix).is_absolute():
-                raise ValueError("Missing clone prefix.")
-        except (OSError, ValueError, subprocess.SubprocessError):
-            raise ActivationError("Cannot determine the managed clone environment prefixes.") from None
-        prefixes.append(prefix)
-    return install_clone_inheritance(*prefixes)
+    return install_clone_inheritance(*(_clone_prefix(conda, item, root) for item in (source, target)))
 
 
 def clone_environment(prefix=None, environment=None):
@@ -184,6 +228,10 @@ def run_command(command):
         if not command:
             raise ActivationError("A command is required for the Conda environment.")
         environment = clone_environment()
+        from native_runtime import native_invocation
+
+        if native_invocation(command) is not None:
+            command = [sys.executable, "-B", str(Path(__file__).with_name("native_runtime.py")), "--", *command]
         if os.name == "nt":
             # Windows CRT exec does not preserve Python's argv quoting or child
             # exit status. subprocess uses Windows-safe list quoting, no shell.

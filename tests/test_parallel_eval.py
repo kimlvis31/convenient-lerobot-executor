@@ -286,6 +286,13 @@ class ParallelEvaluationTests(unittest.TestCase):
                 self.model = torch.nn.Linear(2, 2)
                 self.model.register_buffer("counter", torch.zeros(1))
                 self.model.cache = []
+                frozen = torch.nn.Linear(2, 2).requires_grad_(False)
+                frozen.register_buffer("counter", torch.zeros(1))
+                frozen.cache = []
+                object.__setattr__(self, "frozen", frozen)
+                nested = torch.nn.Linear(2, 2).requires_grad_(False)
+                nested.register_buffer("counter", torch.zeros(1))
+                self.pipeline = SimpleNamespace(components={"text_encoder": nested})
                 self.queue = deque()
 
             def reset(self):
@@ -294,18 +301,32 @@ class ParallelEvaluationTests(unittest.TestCase):
             def select_action(self, task):
                 self.model.counter.add_(1)
                 self.model.cache.append(task)
+                self.frozen.counter.add_(1)
+                self.frozen.cache.append(task)
+                self.pipeline.components["text_encoder"].counter.add_(1)
                 self.queue.append(task)
                 return self.queue.popleft()
 
         template = NativePolicy()
+        self.assertNotIn(id(template.frozen.weight), {id(p) for p in template.parameters()})
         one, two = (task_policy(template, RLock()) for _ in range(2))
         self.assertIs(one.model.weight, template.model.weight)
         self.assertEqual(one.model.weight.data_ptr(), two.model.weight.data_ptr())
         self.assertNotEqual(one.model.counter.data_ptr(), two.model.counter.data_ptr())
+        self.assertIs(one.frozen.weight, template.frozen.weight)
+        self.assertIs(two.frozen.weight, template.frozen.weight)
+        self.assertIs(one.pipeline.components["text_encoder"].weight,
+                      template.pipeline.components["text_encoder"].weight)
+        self.assertNotEqual(one.frozen.counter.data_ptr(), two.frozen.counter.data_ptr())
+        self.assertNotEqual(one.pipeline.components["text_encoder"].counter.data_ptr(),
+                            two.pipeline.components["text_encoder"].counter.data_ptr())
         one.select_action(1)
         two.select_action(2)
         self.assertEqual((one.model.cache, two.model.cache, template.model.cache), ([1], [2], []))
         self.assertEqual(template.model.counter.item(), 0)
+        self.assertEqual((one.frozen.cache, two.frozen.cache, template.frozen.cache), ([1], [2], []))
+        self.assertEqual(template.frozen.counter.item(), 0)
+        self.assertEqual(template.pipeline.components["text_encoder"].counter.item(), 0)
 
     @unittest.skipUnless(find_spec("torch"), "PyTorch is not installed")
     def test_torch_contexts_are_established_in_each_worker_and_restored_afterward(self):

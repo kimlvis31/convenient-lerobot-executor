@@ -8,6 +8,7 @@ Policy configuration: https://github.com/huggingface/lerobot/tree/145cc7ea53e586
 """
 
 # Training block: settings reference only. Gaussian Actor learns through LeRobot's HIL-SERL actor and learner, which need a separate training launcher.
+# The manager rejects this training block before launching lerobot-train; it does not return a supervised loss.
 # Keep only the evaluation job in JOBS when importing this example. Supply a Gaussian Actor checkpoint with matching observation and action features.
 
 JOBS = [
