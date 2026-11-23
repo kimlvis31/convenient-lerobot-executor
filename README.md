@@ -165,3 +165,7 @@ Managed source environments preserve the selected policy environment's Hugging F
 Fresh setup, physical reset and step, rendered cameras, and environment reuse were verified for all four source recipes with LeRobot 0.6.2 on Linux x86-64. RoboTwin also completed two queued synchronous jobs and an asynchronous job with batch size 2, six short episodes in total, using a temporary initialized policy. Script/log storage and worker cleanup after unexpected parent termination were verified. These checks establish installation and execution behavior; policy performance requires trained checkpoints and a separate evaluation.
 
 For development smoke tests, point `CONVLEX_RUNTIME_CACHE` and job outputs to dedicated temporary folders and remove only those folders when the check finishes. Persistent simulator environments and assets are application dependencies needed for future runs; clearing them causes setup to run again. A missing driver, incompatible hardware, upstream download restriction, or unavailable source version produces a setup diagnosis and its log instead of a false ready status.
+
+## Integration verification
+
+See the [27-policy audit matrix](tests/reports/model-audit-2026-11-23.md) for verified options, actual short training/evaluation/resume results, hardware/access limits and cleanup. These are functional integration checks, not policy-performance results. Original LeRobot/model source files are preserved; executor child-process compatibility hooks can adjust loading, device placement and evaluation helpers during execution.

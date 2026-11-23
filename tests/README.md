@@ -29,3 +29,5 @@ Keep machine-specific drivers, raw logs, temporary datasets, downloaded weights
 and disposable runs in a separate verification workspace outside the checkout.
 Retain sanitized results and model revisions before deleting owned temporary
 assets. Preserve user datasets, checkpoints, original environments and sources.
+
+The [27-policy audit of 23 November 2026](reports/model-audit-2026-11-23.md) records option coverage, actual runs, limits and cleanup. Its [asset manifest](reports/model-assets-2026-11-23.json) distinguishes temporary downloads from original cached weights.
