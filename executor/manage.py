@@ -484,6 +484,8 @@ def configure_policy_options(train, options, *, question="Policy Training Option
     inference_labels = {"n_action_steps": "Actions to Execute per Prediction", "num_steps": "Inference Steps",
                         "num_denoise_steps": "Denoising Steps", "dtype": "Model Data Type",
                         "use_amp": "Automatic Mixed Precision"}
+    if question == "Policy Evaluation Options":
+        inference_labels["use_amp"] = "CUDA Automatic Mixed Precision"
     labels = {name: options[name].get("label", inference_labels.get(name, name.replace("_", " ").title().replace("Lora", "LoRA")))
               for name in sorted(options)}
     while True:
@@ -1650,11 +1652,13 @@ def job_subheading(title):
     print(styled(f"  ({title})", "1;94"), flush=True)
 
 
-def validate_model_training_fields(model, train, catalog):
+def validate_model_training_fields(model, train, catalog, *, evaluation=False):
     """Validate imported component/option names against the selected runtime version."""
     if train.get("resume"):
         return
     declared = catalog.get("policy_fields", {}).get(model)
+    if evaluation and model in catalog.get("evaluation_options", {}):
+        declared = catalog["evaluation_options"][model]
     if declared is None:
         return  # Older or unavailable runtime catalogs cannot establish support.
     for field in ("policy_training", "policy_options"):
@@ -1720,6 +1724,8 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
         else:
             preferred = evaluation.get("environment") or (native if tiny else cfg.get("environments", {}).get(model, native))
             runtime = "evaluation" if evaluation else "training"
+        if preview and conda and preferred not in session.catalogs and callable(getattr(session, 'catalog', None)):
+            session.catalog(preferred)  # Read-only: imported queues need the same option/compatibility preview.
         try:
             simulator_detail = None
             if not tiny and benchmark == "robomme":
@@ -1742,7 +1748,7 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
             validate_model_training_fields(model, train, session.catalogs.get(target, {}))
         elif backend == "native" and stage.name == "eval":
             validate_model_training_fields(model, {"policy_options": evaluation.get("policy_options", {})},
-                                           session.catalogs.get(target, {}))
+                                           session.catalogs.get(target, {}), evaluation=True)
         notes.append(f"{role}: {target}. {reason}")
         if simulator_detail:
             notes.extend(simulator_detail)

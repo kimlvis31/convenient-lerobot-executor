@@ -9,6 +9,7 @@ Policy configuration: https://github.com/huggingface/lerobot/tree/145cc7ea53e586
 
 # Supply a fine-tuned LIBERO checkpoint for this LeRobot revision and its Qwen2.5-VL backbone.
 # The training initializer is the public base. Review dataset camera names and use --rename_map for differences.
+# The pinned public base omits evaluation processor/statistics files; evaluate a trained export.
 
 JOBS = [
     {

@@ -13,6 +13,14 @@ from unittest.mock import patch
 HELPERS = frozenset({"evaluation_cameras.py", "parallel_eval.py", "pinned_policy.py"})
 
 
+def complete_checkpoint_policy(factory, policy, args, kwargs):
+    from checkpoint_initialization import checkpoint_model_placement
+    from molmo_compat import checkpoint_policy_factory
+
+    with checkpoint_model_placement(factory, policy, args, kwargs):
+        return checkpoint_policy_factory(factory, policy, args, kwargs)
+
+
 def native_invocation(command):
     """Recognize only native console commands and this checkout's exact helpers."""
     if not command:
@@ -95,9 +103,11 @@ def evaluation_action_contract():
                                             getattr(environment, "type", type(environment).__name__))
             if issue:
                 raise ValueError(issue)
-        from molmo_compat import checkpoint_policy_factory
+        from checkpoint_compat import validate_evaluation_processor_files
+        from importlib import import_module
 
-        return checkpoint_policy_factory(original, policy, args, kwargs)
+        validate_evaluation_processor_files(policy, import_module('lerobot.policies.factory'))
+        return complete_checkpoint_policy(original, policy, args, kwargs)
 
     with patch.object(lerobot_eval, "make_policy", checked), checkpoint_processors(lerobot_eval):
         yield
@@ -192,9 +202,7 @@ def training_dataset_contract():
                         continue
                     setattr(policy, name.removeprefix("policy."), value)
                     print(f"Automatic training option: --{name}=" + json.dumps(value), flush=True)
-        from molmo_compat import checkpoint_policy_factory
-
-        result = checkpoint_policy_factory(original, policy, args, kwargs)
+        result = complete_checkpoint_policy(original, policy, args, kwargs)
         if preserve_names:
             policy.dataset_feature_names = restored_names
             result.config.dataset_feature_names = restored_names

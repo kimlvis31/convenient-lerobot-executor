@@ -13,6 +13,40 @@ from manage import configure_policy_options, validate_model_training_fields
 
 
 class StructuredOptionTests(unittest.TestCase):
+    def test_imported_preview_reads_selected_runtime_before_validating_policy_options(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from adapters import Stage
+        from manage import LeRobotEnvironments, prepare_job_environments
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            session = LeRobotEnvironments('conda', root, 'native', {'native'})
+            catalog = {'policies': {'act': True}, 'runtime': {'training': True},
+                       'policy_fields': {'act': ['optimizer_lr']}}
+            settings = {'adapter': 'native', 'model': 'act', 'train': {'device': 'cpu'},
+                        'environments': {'native': 'native'}}
+            stage = Stage('train', 'native', ['lerobot-train'], (), 1)
+            with patch('manage.environment_catalog', return_value=catalog) as probe, \
+                 patch.object(session, 'packages', return_value={}), patch('manage.subprocess.run') as install:
+                prepare_job_environments(settings, [stage], root, 'conda', {(root, 'native'): session}, preview=True)
+                settings['train']['policy_options'] = {'train_unknown': True}
+                with self.assertRaisesRegex(ValueError, 'train_unknown'):
+                    prepare_job_environments(settings, [stage], root, 'conda', {(root, 'native'): session}, preview=True)
+            probe.assert_called_once()
+            install.assert_not_called()
+
+    def test_imported_evaluation_options_require_actual_runtime_controls(self):
+        catalog = {'policy_fields': {'wall_x': ['dtype', 'use_amp']},
+                   'evaluation_options': {'wall_x': {'use_amp': {'default': True}}}}
+        with self.assertRaisesRegex(ValueError, 'dtype'):
+            validate_model_training_fields('wall_x', {'policy_options': {'dtype': 'float32'}},
+                                           catalog, evaluation=True)
+        validate_model_training_fields('wall_x', {'policy_options': {'use_amp': True}}, catalog, evaluation=True)
+        # An older runtime catalog can only check its declared fields.
+        validate_model_training_fields('wall_x', {'policy_options': {'dtype': 'float32'}},
+                                       {'policy_fields': catalog['policy_fields']}, evaluation=True)
+
     def test_inspection_exposes_default_factory_losses_and_optimizer_tuples(self):
         @dataclass
         class Config:

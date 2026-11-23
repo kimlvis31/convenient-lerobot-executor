@@ -595,12 +595,21 @@ def stage_failure_reason(logfile):
                 return "Required files are missing from the Hugging Face cache and network access is disabled."
             if access := hub_access_reason(index, error_type, detail):
                 return access
+            if error_type == 'ProcessorMigrationError':
+                return ('Evaluation processor files are missing. Use a complete trained checkpoint, '
+                        'or migrate a legacy export with its saved normalization statistics.')
             if "CUDA out of memory" in detail:
                 requested = re.search(r"Tried to allocate (\d+(?:\.\d+)? [KMG]iB)", detail)
                 free = re.search(r"of which (\d+(?:\.\d+)? [KMG]iB) is free", detail)
                 if requested and free:
                     return f"CUDA out of memory. Requested {requested[1]} with {free[1]} free."
                 return "CUDA out of memory."
+            if error_type == 'RuntimeError' and 'CUDNN_STATUS_INTERNAL_ERROR' in detail:
+                return ('cuDNN kernel execution failed (CUDNN_STATUS_INTERNAL_ERROR). '
+                        'Retry with a smaller batch or fewer parallel evaluation tasks.')
+            if error_type == 'RuntimeError' and re.search(r'\b(?:mat1 and mat2|m1 and m2)\b.*same dtype', detail):
+                return ('Model/input tensor data types differ. Review model storage precision '
+                        'and automatic mixed precision for the selected device.')
             related = []
             for followup in lines[index + 1:index + 7]:
                 feature = re.match(r"(?:[-*•]\s*)?((?:missing|extra|unexpected)(?: [^:]+)?:\s*.+)",

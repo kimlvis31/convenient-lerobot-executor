@@ -71,6 +71,49 @@ def validate_processor_states(reference):
         )
 
 
+def validate_evaluation_processor_files(config, native_factory):
+    """Fail before model loading when the native default pipeline files are absent."""
+    reference = getattr(config, 'pretrained_path', None)
+    if not reference:
+        return
+    directory = Path(reference).expanduser()
+    local = directory.is_dir()
+    if local and all((directory / name).is_file() for name in PROCESSORS):
+        return
+    resolver = getattr(native_factory, '_import_sibling_policy_module', None)
+    if not callable(resolver):
+        return  # Preserve older runtimes and unknown processor extension APIs.
+    module = resolver(type(config), 'processor')
+    if module is None or callable(getattr(module, f'make_{config.type}_pre_post_processors_from_pretrained', None)):
+        return  # A model-specific factory owns its checkpoint format.
+    if local:
+        available = {name for name in PROCESSORS if (directory / name).is_file()}
+    else:
+        if directory.is_absolute() or not re.fullmatch(r'[\w][\w.-]*/[\w][\w.-]*', str(reference), re.ASCII):
+            return
+        from huggingface_hub import HfApi, constants
+        from huggingface_hub.errors import HfHubHTTPError
+        from httpx import TransportError
+
+        if constants.HF_HUB_OFFLINE:
+            return
+        try:
+            info = HfApi().model_info(str(reference), revision=getattr(config, 'pretrained_revision', None), timeout=10)
+        except (HfHubHTTPError, TransportError, TimeoutError):
+            return  # Let native loading retain cached/offline/authentication behavior.
+        if info.siblings is None:
+            return
+        available = {item.rfilename for item in info.siblings}
+    missing = ', '.join(name for name in PROCESSORS if name not in available)
+    if not missing:
+        return
+    raise FileNotFoundError(
+        f'Evaluation processor files are missing ({missing}). Use a complete trained checkpoint '
+        'with its saved normalization statistics, or migrate a legacy export that contains them. '
+        'A training initializer without these files cannot be evaluated directly.'
+    )
+
+
 def legacy_tdmpc_config(config):
     """Translate the original TD-MPC feature and normalization schema."""
     if (not isinstance(config, dict) or config.get("type") not in (None, "tdmpc")
