@@ -75,6 +75,14 @@ JOBS = [
             "control": "relative",  # Required for LIBERO. Match the checkpoint's action controller.
             "size": 256,  # Required for LIBERO. Square camera input size in pixels.
             "environment": None,  # Optional. Conda override. None selects a compatible environment.
+            "policy_options": {  # Optional. Omit entries to inherit the checkpoint settings.
+                # Constructor defaults below are references, not automatic overrides.
+                # "dtype": 'bfloat16',
+                # "use_amp": False,
+                # "n_action_steps": None, None selects the native automatic behavior.
+                # "diffusion_steps": 10,
+                # "compile_model": False,
+            },
             "extra": [  # Optional. Additional LeRobot options in --name=value form.
                 "--env.camera_name_mapping={\"agentview_image\":\"front\",\"robot0_eye_in_hand_image\":\"wrist\"}",
             ],

@@ -68,6 +68,13 @@ JOBS = [
             "device": "cuda",  # Required. Use a device supported by the policy.
             "episode_length": 0,  # Optional. Simulator default when 0.
             "environment": None,  # Optional. Conda override. None selects a compatible environment.
+            "policy_options": {  # Optional. Omit entries to inherit the checkpoint settings.
+                # Constructor defaults below are references, not automatic overrides.
+                # "dtype": 'bfloat16',
+                # "use_amp": False,
+                # "n_action_steps": 32,
+                # "num_inference_timesteps": 10,
+            },
             "extra": [],  # Optional. Additional LeRobot options in --name=value form.
         },
     },

@@ -16,6 +16,7 @@ import signal
 import sys
 import subprocess
 from tempfile import TemporaryDirectory
+from threading import current_thread, main_thread
 import time
 
 from adapters import Stage, read_json, require
@@ -40,6 +41,28 @@ STAGE_LABELS = {"train": "Training", "eval": "Evaluation"}
 TOTAL_REFRESH_SECONDS = 0.5
 EPISODE_REFRESH_SECONDS = 0.1
 STATUS_SAVE_SECONDS = 2.0
+
+
+@contextmanager
+def interrupt_on_termination():
+    """Unwind owned jobs on POSIX termination, preserving custom signal handlers."""
+    if os.name != "posix" or current_thread() is not main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous != signal.SIG_DFL:
+        yield
+        return
+
+    def terminate(signum, frame):
+        raise KeyboardInterrupt("Termination requested.")
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        if signal.getsignal(signal.SIGTERM) is terminate:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def write_json(path, data):
@@ -766,6 +789,7 @@ def execute(stages, settings, run_dir, root, conda, verbose):
     runpy.run_path(str(script), run_name="__main__")
 
 
+@interrupt_on_termination()
 def run_job(job, run_dir):
     settings, runtime = job["settings"], job["runtime"]
     root = Path(job["root"])

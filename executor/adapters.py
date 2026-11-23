@@ -52,6 +52,23 @@ SCOPE_OPTIONS = set(TRAINING_SWITCHES) | {
     "tune_top_llm_layers", "unfreeze_llm_last_n_layers",
 }
 
+# Inference controls only; architecture/data dimensions belong in explicit
+# additional native options and must never be guessed from a policy's name.
+EVALUATION_STEP_OPTIONS = frozenset({
+    "n_action_steps", "num_steps", "num_inference_steps", "num_denoise_steps",
+    "diffusion_steps", "action_num_inference_steps", "sampling_steps",
+    "num_inference_timesteps", "num_denoising_steps", "num_flow_timesteps", "imagine_steps", "cem_iterations",
+})
+EVALUATION_POLICY_OPTIONS = EVALUATION_STEP_OPTIONS | {
+    "dtype", "use_amp", "compile_model", "compile_action_infer", "compile_mode",
+    "temperature", "top_k", "top_p", "deterministic", "inference_seed",
+    "temporal_ensemble_coeff", "use_mpc", "n_gaussian_samples", "n_pi_samples", "n_elites",
+    "min_std", "max_std", "elite_weighting_temperature", "gaussian_mean_momentum",
+    "bet_softmax_temperature", "sequentially_select", "denoising", "imagine_sigma", "flow_shift",
+    "guidance_scale", "action_guidance_scale", "snr_shift", "action_snr_shift", "use_flash_attn",
+    "save_predicted_video", "return_predicted_video", "per_episode_seed", "enable_inference_cuda_graph",
+}
+
 
 def is_policy_training_option(name):
     if name in SCOPE_OPTIONS or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
@@ -258,6 +275,22 @@ def training_flags(config, model):
     return args
 
 
+def evaluation_policy_flags(config):
+    options = config.get("policy_options", {})
+    if not isinstance(options, dict):
+        raise ValueError("Evaluation policy_options must be a dictionary.")
+    args = []
+    for name, value in options.items():
+        if (name not in EVALUATION_POLICY_OPTIONS
+                or value is not None and type(value) not in (bool, int, float, str)
+                or type(value) is float and not math.isfinite(value)):
+            raise ValueError(f"Invalid evaluation policy option ({name}).")
+        if name in EVALUATION_STEP_OPTIONS and value is not None and (type(value) is not int or value < 1):
+            raise ValueError(f"Evaluation policy option {name} must be a positive integer or null.")
+        args.append(flag(f"policy.{name}", value))
+    return args
+
+
 def required_scope_flags(cfg, model, explicit):
     scope = cfg.get("policy_training", {})
     required = {}
@@ -289,7 +322,7 @@ class NativeAdapter:
                               "lora", "resume", "extra"})
     eval_fields = frozenset({"policy", "env", "tasks", "episodes", "batch", "parallel_tasks", "seed",
                              "device", "task_ids", "episode_length", "control", "size",
-                             "robomme_runtime", "simulator_environment", "environment", "extra"})
+                             "robomme_runtime", "simulator_environment", "environment", "policy_options", "extra"})
     eval_required = frozenset({"policy", "env", "tasks", "episodes", "batch", "seed", "device"})
 
     def __init__(self, settings, run_name, root, external, environments):
@@ -475,6 +508,10 @@ class NativeAdapter:
             names = {name.strip() for task in tasks for name in task.split(",") if name.strip()}
             units = episodes * len(names)
         args += self.eval_policy(after_training)
+        if self.key == "native":
+            args += evaluation_policy_flags(cfg)
+        elif cfg.get("policy_options"):
+            raise ValueError("Evaluation policy_options apply to native policies; TinyVLA uses action_steps.")
         args += additional_flags(cfg.get("extra", []),
                                  {a[2:].split("=")[0] for a in args if a.startswith("--")} |
                                  {"config_path", "policy.type", "policy.path", "env.max_parallel_tasks",

@@ -4,13 +4,78 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import json
+import os
+import signal
+import subprocess
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
 from native_runtime import (evaluation_action_contract, host_staged_weights, main,
                             native_invocation, training_dataset_contract)
 from tests import EXECUTOR
+
+
+class TerminationHandlingTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX signal semantics required")
+    def test_termination_unwinds_stage_child_and_temporary_files(self):
+        code = '''
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from runner import Stage,interrupt_on_termination,run_stage
+root=Path(sys.argv[2])
+try:
+    with interrupt_on_termination(), TemporaryDirectory(dir=root,prefix="owned-") as scratch:
+        def update(line):
+            if line.startswith("CHILD "):
+                (root/"ready.json").write_text(json.dumps({"pid":int(line.split()[1]),"scratch":scratch}))
+        command=[sys.executable,"-u","-c","import os,time;print('CHILD '+str(os.getpid()),flush=True);time.sleep(60)"]
+        run_stage(command,Stage("eval","test",command,(),1),root,root/"stage.log",update)
+except KeyboardInterrupt:
+    (root/"interrupted").write_text("cleaned")
+    raise SystemExit(130)
+'''
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = subprocess.Popen([sys.executable, "-B", "-c", code, str(EXECUTOR), str(root)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                for _ in range(160):
+                    if (root / "ready.json").is_file() or process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                self.assertTrue((root / "ready.json").is_file())
+                ready = json.loads((root / "ready.json").read_text())
+                process.send_signal(signal.SIGTERM)
+                output, _ = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 130, output)
+                self.assertTrue((root / "interrupted").is_file())
+                self.assertFalse(Path(ready["scratch"]).exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(ready["pid"], 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal semantics required")
+    def test_custom_handler_is_preserved_and_default_is_restored(self):
+        from runner import interrupt_on_termination
+        previous = signal.getsignal(signal.SIGTERM)
+        custom = lambda *_: None
+        try:
+            signal.signal(signal.SIGTERM, custom)
+            with interrupt_on_termination():
+                self.assertIs(signal.getsignal(signal.SIGTERM), custom)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            with interrupt_on_termination():
+                self.assertTrue(callable(signal.getsignal(signal.SIGTERM)))
+            self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 class NativeRuntimeTests(unittest.TestCase):

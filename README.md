@@ -25,6 +25,8 @@ convLexecutor/
 
 ## Manual setup
 
+From this checkout, `./run.sh` runs `executor/manage.py` with the current Python 3 interpreter. Arguments are forwarded unchanged.
+
 Job configuration is validated before execution: unknown training/evaluation keys and invalid batch or checkpoint intervals produce an actionable error. Use `policy_options` for native policy fields and `extra` for additional supported LeRobot flags. Gaussian Actor supports evaluation here; training requires LeRobot's separate reinforcement-learning actor/learner launcher.
 
 Imported component and training-option names are checked against the policy fields declared by the selected LeRobot runtime version. An unavailable runtime catalog defers that check until preparation; exact resume keeps the saved configuration.
@@ -32,6 +34,8 @@ Imported component and training-option names are checked against the policy fiel
 Model-specific training options include supported loss controls and gradient-checkpointing settings. Nullable controls offer automatic/default behavior through `null`; leaving a field unselected preserves the checkpoint setting. The model templates document these optional values and available enumerated choices.
 
 The training option menu displays valid values from the selected local checkpoint instead of replacing them with constructor defaults. Unselected options remain inherited. For certified stock LIBERO evaluations, the executor reuses unchanged task descriptions and observation camera pixels for video recording. Custom environments and unknown renderer implementations retain native behavior. Simulator resets, settling steps, policy actions, and video orientation are preserved. This removes redundant requests; model inference and simulation initialization can still dominate evaluation time.
+
+**Policy Evaluation Options** lists inference controls declared by the selected runtime's model configuration, including action steps per prediction, denoising steps, data type and compilation where supported. Imported jobs use `eval.policy_options`; the model templates document each discovered field. Unselected entries preserve checkpoint values. Increasing action steps reduces prediction frequency and changes the control policy; it is an explicit user choice. These controls do not make an oversized model fit every device or guarantee faster low-precision execution on a CPU.
 
 For PushT, the executor selects environment-state observations when a checkpoint explicitly requires the supported 16-value environment state and 2-value agent state without image inputs. Image checkpoints retain pixel observations. An explicit observation setting takes precedence. Required arguments added during planning appear in green in Settings.
 

@@ -90,6 +90,17 @@ JOBS = [
             "control": "relative",  # Required for LIBERO. Match the checkpoint's action controller.
             "size": 256,  # Required for LIBERO. Square camera input size in pixels.
             "environment": None,  # Optional. Conda override. None selects a compatible environment.
+            "policy_options": {  # Optional. Omit entries to inherit the checkpoint settings.
+                # Constructor defaults below are references, not automatic overrides.
+                # "dtype": 'bfloat16',
+                # "use_amp": False,
+                # "n_action_steps": 30,
+                # "num_flow_timesteps": 8,
+                # "num_inference_steps": None, None selects the native automatic behavior.
+                # "enable_inference_cuda_graph": True,
+                # "per_episode_seed": False,
+                # "compile_model": False,
+            },
             "extra": [
                 "--policy.checkpoint_path=allenai/MolmoAct2-LIBERO",  # Required. Original LIBERO release.
                 "--policy.norm_tag=libero",  # Required. Selects the original release's normalization profile.

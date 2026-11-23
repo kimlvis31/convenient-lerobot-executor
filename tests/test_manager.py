@@ -466,7 +466,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(settings_jobs(settings), [{"schema": 1, **job} for job in jobs])
 
     def test_back_edits_the_previous_question_and_the_add_job_decision(self):
-        def configure(*_):
+        def configure(*_, **__):
             settings = sample_settings()
             settings["label"] = ask("Job Name")
             settings["train"]["steps"] = number("Training Steps", 20)
@@ -514,6 +514,7 @@ class ManagerTests(unittest.TestCase):
                 if evaluate:
                     configure_evaluation.assert_called_once_with(
                         "pi05", False, train if resume is not None else None, inventory, "libero",
+                        catalog if resume is not None else {},
                     )
                     self.assertEqual(settings["eval"], evaluation)
                 else:
@@ -542,7 +543,7 @@ class ManagerTests(unittest.TestCase):
                 if warm:
                     train.assert_called_once_with(True, inventory, self.root)
                     restore.assert_not_called()
-                    evaluate.assert_called_once_with("tinyvla", True, weights, inventory, "libero")
+                    evaluate.assert_called_once_with("tinyvla", True, weights, inventory, "libero", {})
                 else:
                     restore.assert_called_once_with(inventory)
                     train.assert_not_called()
@@ -1288,6 +1289,63 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("Optimizer Lr [0.002]", output.getvalue())
         self.assertEqual(train["policy_options"], {"optimizer_lr": 0.002})
         self.assertEqual(options["optimizer_lr"]["default"], 0.0001)
+
+    def test_evaluation_menu_reads_saved_action_chunk_count_and_forwards_explicit_selection(self):
+        folder = self.root / "evaluation-policy"
+        folder.mkdir()
+        (folder / "config.json").write_text('{"n_action_steps": 1}', encoding="utf-8")
+        settings = sample_settings()
+        options = {"n_action_steps": {"default": 50}, "num_steps": {"default": 10}}
+        settings["eval"]["policy"] = str(folder)
+        selected = {"pretrained": str(folder)}
+        with patch("sys.stdin", io.StringIO("2\n0\n8\n1\n")), contextlib.redirect_stdout(io.StringIO()) as menu:
+            configure_policy_options(selected, options, question="Policy Evaluation Options")
+        self.assertIn("Policy Evaluation Options", menu.getvalue())
+        self.assertIn("Actions to Execute per Prediction [1]", menu.getvalue())
+        settings["eval"]["policy_options"] = selected["policy_options"]
+        stage = NativeAdapter(settings, "eval-options", self.root, self.external, self.envs).evaluate(False)
+        self.assertIn("--policy.n_action_steps=8", stage.arguments)
+        self.assertFalse(any(arg.startswith("--policy.num_steps=") for arg in stage.arguments))
+        settings["eval"]["extra"] = ["--policy.n_action_steps=4"]
+        with self.assertRaises(ValueError):
+            NativeAdapter(settings, "duplicate-eval-options", self.root, self.external, self.envs).evaluate(False)
+
+    def test_evaluation_options_reject_training_fields_invalid_step_counts_and_nonfinite_values(self):
+        from adapters import evaluation_policy_flags
+        for options in ({"optimizer_lr": 0.01}, {"n_action_steps": 0}, {"num_steps": True},
+                        {"temperature": float("nan")}, {"device": "cuda"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                evaluation_policy_flags({"policy_options": options})
+        self.assertEqual(evaluation_policy_flags({"policy_options": {"use_amp": True, "num_steps": None}}),
+                         ["--policy.use_amp=true", "--policy.num_steps=null"])
+
+    def test_runtime_catalog_lists_only_declared_inference_controls(self):
+        from dataclasses import dataclass
+        from typing import Literal
+        from benchmarks import policy_evaluation_options
+        @dataclass
+        class Configuration:
+            n_action_steps: int = 16
+            optimizer_lr: float = 0.0001
+            dtype: Literal["float32", "bfloat16"] = "float32"
+            num_steps: int | None = None
+        options = policy_evaluation_options(Configuration)
+        self.assertNotIn("optimizer_lr", options)
+        self.assertEqual(options["dtype"]["choices"], ["float32", "bfloat16"])
+        self.assertEqual(options["num_steps"]["value_type"], "int")
+        self.assertTrue(options["num_steps"]["nullable"])
+
+    def test_standalone_evaluation_uses_its_selected_runtime_catalog(self):
+        catalog = {"evaluation_options": {"smolvla": {"n_action_steps": {"default": 50}}}}
+        with patch("manage.choose_policy", return_value=("native", "smolvla")), \
+             patch("manage.choose", return_value="eval"), \
+             patch("manage.eval_settings", return_value={"env": "libero"}) as settings, \
+             patch("manage.confirm", return_value=True), contextlib.redirect_stdout(io.StringIO()):
+            configure_job(load_adapters([]), Inventory(), self.root, {"smolvla"},
+                          lambda _: self.fail("Evaluation must not configure training"),
+                          lambda *_: ("libero", "selected-runtime", False),
+                          evaluation_catalog=lambda name: catalog if name == "selected-runtime" else {})
+        self.assertIs(settings.call_args.args[-1], catalog)
 
     def test_invalid_checkpoint_option_types_keep_catalog_defaults_and_finish_keeps_inheritance(self):
         folder = self.root / "bad-policy-options"

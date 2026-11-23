@@ -13,7 +13,7 @@ import sys
 import tempfile
 from typing import Literal, get_args, get_origin, get_type_hints
 
-from adapters import PEFT_POLICIES, TRAINING_SWITCHES, is_policy_training_option
+from adapters import EVALUATION_POLICY_OPTIONS, PEFT_POLICIES, TRAINING_SWITCHES, is_policy_training_option
 from evaluation_cameras import robotwin_directory
 from policy_extensions import (POLICY_EXTENSIONS, extension_problems, extension_runtime_issue,
                                extension_specs, install_extensions)
@@ -316,6 +316,14 @@ def supported_here(name):
 
 
 def policy_training_options(config):
+    return scalar_policy_options(config, is_policy_training_option)
+
+
+def policy_evaluation_options(config):
+    return scalar_policy_options(config, lambda name: name in EVALUATION_POLICY_OPTIONS)
+
+
+def scalar_policy_options(config, supported):
     if not is_dataclass(config):
         return {}
     try:
@@ -324,7 +332,7 @@ def policy_training_options(config):
         hints = {}
     result = {}
     for item in fields(config):
-        if not is_policy_training_option(item.name):
+        if not supported(item.name):
             continue
         hint = hints.get(item.name, item.type)
         default = item.default
@@ -343,7 +351,10 @@ def policy_training_options(config):
             "discrete_loss_token_weighting": ["none", "token", "root_tokens", "root_subsegments",
                                               "root_subsegments_root_tokens"],
         }.get(item.name)
-        if choices and default in choices:
+        if type(default).__module__ == "torch" and type(default).__name__ == "dtype":
+            result[item.name] = {"default": str(default).removeprefix("torch."),
+                                 "value_type": "str", "encoded_type": "torch.dtype"}
+        elif choices and default in choices:
             result[item.name] = {"default": default, "choices": choices}
         elif get_origin(hint) is Literal and type(default) in (bool, int, float, str):
             values = [value for value in get_args(hint) if type(value) is type(default)]
@@ -373,7 +384,7 @@ def environment_catalog():
     register_third_party_plugins()
     versions = installed_versions()
     policies, trainable, options, issues, policy_installable = {}, {}, {}, {}, []
-    policy_fields = {}
+    policy_fields, evaluation_options = {}, {}
     for name, config in PreTrainedConfig.get_known_choices().items():
         if config.__module__.startswith("lerobot.policies."):
             missing = sorted({req.name for req in policy_requirements(distribution, name)
@@ -398,6 +409,8 @@ def environment_catalog():
             editable = policy_training_options(config)
             if editable:
                 options[name] = editable
+            if inference := policy_evaluation_options(config):
+                evaluation_options[name] = inference
             if is_dataclass(config):
                 names = {item.name for item in fields(config)}
                 policy_fields[name] = sorted(names)
@@ -443,7 +456,7 @@ def environment_catalog():
             "peft_installable": bool(peft_requirements),
             "peft_policies": sorted(PEFT_POLICIES.intersection(policies)), "training": trainable,
             "policy_issues": issues, "policy_installable": sorted(policy_installable), "training_options": options,
-            "policy_fields": policy_fields}
+            "policy_fields": policy_fields, "evaluation_options": evaluation_options}
 
 
 def install_dependencies(*, benchmark=None, policy=None, plugin=None, peft=False, runtime=None, isolated=False):

@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from adapters import (
     EPISODE_LENGTH_BENCHMARKS,
+    EVALUATION_STEP_OPTIONS,
     LIBERO_BENCHMARKS,
     SINGLE_TASK_BENCHMARKS,
     SUITES,
@@ -39,7 +40,7 @@ from runtime_setup import RuntimeSetupFailure
 from runtime_activation import ActivationError, configure_clone_inheritance, prepare_clone_source
 from training_preflight import native_training_issue
 from runner import (ANSI, StageFailure, available_environments, conda_command, conda_executable, environment_catalog,
-                    execute, load_settings, seconds, stage_failure_reason, stage_title, styled, write_json)
+                    execute, interrupt_on_termination, load_settings, seconds, stage_failure_reason, stage_title, styled, write_json)
 
 
 DEFAULT_ENVIRONMENTS = {"native": "lerobot", "tinyvla": "tinyvla_infer"}
@@ -451,7 +452,7 @@ def configure_training_scope(train, model, catalog):
         train["lora"] = lora
 
 
-def configure_policy_options(train, options):
+def configure_policy_options(train, options, *, question="Policy Training Options"):
     if not options:
         return
     # A saved policy can override the constructor defaults inspected in the
@@ -473,9 +474,13 @@ def configure_policy_options(train, options):
                         and (type(value) is not float or math.isfinite(value))):
                     spec["default"] = value
     values = {}
-    labels = {name: name.replace("_", " ").title().replace("Lora", "LoRA") for name in sorted(options)}
+    inference_labels = {"n_action_steps": "Actions to Execute per Prediction", "num_steps": "Inference Steps",
+                        "num_denoise_steps": "Denoising Steps", "dtype": "Model Data Type",
+                        "use_amp": "Automatic Mixed Precision"}
+    labels = {name: inference_labels.get(name, name.replace("_", " ").title().replace("Lora", "LoRA"))
+              for name in sorted(options)}
     while True:
-        selection = choose("Policy Training Options", [("", "Finish / keep other defaults"), *[
+        selection = choose(question, [("", "Finish / keep other defaults"), *[
             (name, f"{label} [{values.get(name, options[name]['default'])}]") for name, label in labels.items()
         ]])
         if not selection:
@@ -498,6 +503,9 @@ def configure_policy_options(train, options):
                              else value_type(response))
                     if type(value) is float and not math.isfinite(value):
                         raise ValueError
+                    if selection in EVALUATION_STEP_OPTIONS and value is not None and (type(value) is not int or value < 1):
+                        retry_question("Enter a positive inference step count, or null when supported.")
+                        continue
                 except (TypeError, ValueError):
                     suffix = " or null for automatic/default behavior" if spec.get("nullable") else ""
                     retry_question(f"Enter a valid {value_type.__name__} value{suffix}.")
@@ -580,7 +588,7 @@ def evaluation_suites(train, tiny):
     return [choice]
 
 
-def eval_settings(model, tiny, train, inventory, env_type):
+def eval_settings(model, tiny, train, inventory, env_type, catalog=None):
     if env_type in LIBERO_BENCHMARKS:
         tasks = evaluation_suites(train, tiny)
     elif env_type in SINGLE_TASK_BENCHMARKS:
@@ -633,6 +641,13 @@ def eval_settings(model, tiny, train, inventory, env_type):
                    size=256 if tiny else number("Camera Image Width and Height", 448 if model == "evo1" else 256))
     if tiny:
         cfg["action_steps"] = number("Actions to Execute per Prediction", 16, 1, 16)
+    else:
+        options = (catalog or {}).get("evaluation_options", {}).get(model, {})
+        reference = cfg.get("policy") or (train or {}).get("pretrained")
+        configured = {"pretrained": reference}
+        configure_policy_options(configured, options, question="Policy Evaluation Options")
+        if "policy_options" in configured:
+            cfg["policy_options"] = configured["policy_options"]
     cfg["extra"] = extra_flags()
     return cfg
 
@@ -1242,7 +1257,7 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
                         return details, None
 
                     return configure_jobs(adapters, inventory, root, policies, display, training_catalog,
-                                          evaluation_environment)
+                                          evaluation_environment, evaluation_catalog=catalog_for)
                 if action == "reuse":
                     files = [(p, str(p)) for p in inventory.settings]
                     path = history.run(lambda: select_path("Settings File", files))
@@ -1274,9 +1289,11 @@ def wizard(adapters, inventory, root, conda=None, native_env="lerobot", *,
                 display.notice(f"Could not complete the selection ({error}).")
 
 
-def configure_jobs(adapters, inventory, root, policies, display, training_catalog, evaluation_environment):
+def configure_jobs(adapters, inventory, root, policies, display, training_catalog, evaluation_environment,
+                   *, evaluation_catalog=None):
     def configure():
-        job = configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment)
+        job = configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment,
+                            evaluation_catalog=evaluation_catalog)
         return job, confirm("Add Another Job? (Y/N)", "N")
 
     jobs = []
@@ -1297,9 +1314,11 @@ def configure_jobs(adapters, inventory, root, policies, display, training_catalo
         histories.append(QuestionHistory(display))
 
 
-def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment):
+def configure_job(adapters, inventory, root, policies, training_catalog, evaluation_environment,
+                  *, evaluation_catalog=None):
     backend, model = choose_policy(adapters, policies, inventory)
     tiny = backend == "tinyvla"
+    catalog = {}
     operations = [
         ("eval", "Evaluation"),
         ("train", "Training"),
@@ -1335,7 +1354,9 @@ def configure_job(adapters, inventory, root, policies, training_catalog, evaluat
     if operation in {"eval", "both", "resume_eval"}:
         print("\n" + styled("Evaluation Setup", "1;36"))
         benchmark, environment, override = evaluation_environment(model, tiny)
-        cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, benchmark)
+        if not tiny and evaluation_catalog is not None:
+            catalog = evaluation_catalog(environment)
+        cfg["eval"] = eval_settings(model, tiny, cfg.get("train"), inventory, benchmark, catalog)
         if override:
             cfg["eval"]["environment"] = environment
     cfg["save_outputs"] = confirm("Save Job Outputs? (Y/N)", "Y")
@@ -1687,6 +1708,9 @@ def prepare_job_environments(cfg, stages, root, conda, sessions, *, preview=Fals
         role = "LeRobot dataset reader" if tiny_train else f"LeRobot {runtime}"
         if backend == "native" and stage.name == "train":
             validate_model_training_fields(model, train, session.catalogs.get(target, {}))
+        elif backend == "native" and stage.name == "eval":
+            validate_model_training_fields(model, {"policy_options": evaluation.get("policy_options", {})},
+                                           session.catalogs.get(target, {}))
         notes.append(f"{role}: {target}. {reason}")
         if simulator_detail:
             notes.extend(simulator_detail)
@@ -1866,6 +1890,7 @@ def report_failure(message, in_job, *, reason=None, logfile=None, temporary=Fals
     divider()
 
 
+@interrupt_on_termination()
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate LeRobot policies and external models")
     parser.add_argument("--lerobot-root", help="Base for older relative input paths outside datasets, outputs, and externals")

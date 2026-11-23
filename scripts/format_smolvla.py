@@ -78,6 +78,14 @@ JOBS = [
             # "robomme_runtime": "auto",  # auto/shared/split. Auto reuses or prepares compatible runtimes.
             # "simulator_environment": None,  # Existing simulator Conda name or absolute prefix. None discovers it.
             "environment": None,  # Optional. Conda override. None selects a compatible environment.
+            "policy_options": {  # Optional. Omit entries to inherit the checkpoint settings.
+                # Constructor defaults below are references, not automatic overrides.
+                # "use_amp": False,
+                # "n_action_steps": 50,
+                # "num_steps": 10,
+                # "compile_model": False,
+                # "compile_mode": 'max-autotune',
+            },
             "extra": [],  # Optional. Additional LeRobot options in --name=value form.
         },
     },
