@@ -22,6 +22,7 @@ import time
 from adapters import Stage, read_json, require
 from checkpoint_compat import RESULT_PREFIX, checkpoint_candidate, validate_processor_states
 from pinned_policy import REVISION_FLAG, pinned_command, requested_revision
+from process_lifecycle import deferred_interrupts, owned_process, stop_process
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -324,24 +325,6 @@ def history(outputs, root=None):
         except (OSError, ValueError, KeyError, TypeError, SyntaxError, StopIteration, IndexError):
             continue
     return rates
-
-
-def stop_process(process):
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGINT)
-        except ProcessLookupError:
-            return
-    elif process.poll() is None:
-        process.terminate()
-    try:
-        process.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
-        process.wait()
 
 
 def print_status_detail(message):
@@ -657,14 +640,10 @@ def prepare_stage_checkpoint(command, stage, root, env, logfile, log, native):
             options.extend(("--revision", revision))
         log.write(f"Checking checkpoint processor format: {reference}\n")
         log.flush()
-        process = subprocess.Popen(conda_command(conda, stage.environment, options), cwd=root, env=env,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                                   errors="replace", start_new_session=os.name == "posix")
-        try:
+        with owned_process(conda_command(conda, stage.environment, options), cwd=root, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                           errors="replace") as process:
             output, _ = process.communicate()
-        except BaseException:
-            stop_process(process)
-            raise
         report = None
         for line in output.splitlines():
             if line.startswith(RESULT_PREFIX):
@@ -692,26 +671,27 @@ def run_stage(command, stage, root, logfile, update, write_message=None, *, nati
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", **stage.env}
     with logfile.open("x", encoding="utf-8") as log, \
          prepare_stage_checkpoint(command, stage, root, env, logfile, log, native) as command:
-        process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                                   start_new_session=os.name == "posix")
-        try:
-            for line in process.stdout:
-                log.write(line)
-                log.flush()
-                clean = ANSI.sub("", line).strip()
-                if write_message and clean and not (
-                    ROLLOUT_STEPS.search(clean) or ROLLOUT_ENDED.search(clean)
-                    or EVAL_BATCH.search(clean) or PARALLEL_EPISODES.fullmatch(clean)
-                ):
-                    write_message(clean)
-                update(clean)
-            code = process.wait()
-        except BaseException:
-            stop_process(process)
-            raise
-        finally:
-            process.stdout.close()
+        with owned_process(command, cwd=root, env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace") as process:
+            try:
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                    clean = ANSI.sub("", line).strip()
+                    if write_message and clean and not (
+                        ROLLOUT_STEPS.search(clean) or ROLLOUT_ENDED.search(clean)
+                        or EVAL_BATCH.search(clean) or PARALLEL_EPISODES.fullmatch(clean)
+                    ):
+                        write_message(clean)
+                    update(clean)
+                code = process.wait()
+            finally:
+                # Terminate before closing the pipe: workers may still write
+                # while unwinding their own interrupt handlers.
+                with deferred_interrupts():
+                    if process.poll() is None:
+                        stop_process(process)
+                    process.stdout.close()
     if code != 0:
         raise StageFailure(stage.name, code, logfile)
     try:
@@ -958,5 +938,6 @@ def run_job(job, run_dir):
                 stage_status["ended_at"] = datetime.now(timezone.utc).isoformat()
         raise
     finally:
-        status.update(ended_at=datetime.now(timezone.utc).isoformat(), seconds=time.monotonic()-job_start)
-        save_status()
+        with deferred_interrupts():
+            status.update(ended_at=datetime.now(timezone.utc).isoformat(), seconds=time.monotonic()-job_start)
+            save_status()
