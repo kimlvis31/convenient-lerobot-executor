@@ -6,13 +6,16 @@ import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier, Lock
+from threading import Event
+import signal
 import time
 from types import SimpleNamespace
 import unittest
 
 from adapters import NativeAdapter
-from parallel_eval import track_parallel_rollouts
+from parallel_eval import cancel_on_interrupt, track_parallel_rollouts
 from tests.test_parallel_eval import Policy
+from tests.test_parallel_eval import evaluator_fixture
 
 
 class EvaluationPlanningTests(unittest.TestCase):
@@ -48,6 +51,119 @@ class EvaluationPlanningTests(unittest.TestCase):
 
 
 class EvaluationLifetimeTests(unittest.TestCase):
+    def test_interrupt_cancels_in_process_task_threads_before_pool_shutdown_waits(self):
+        ready = Barrier(3)
+        timing = {}
+        evaluator = evaluator_fixture()
+
+        class Env:
+            num_envs = 1
+            closed = False
+
+            def step(self):
+                time.sleep(.005)
+
+            def close(self):
+                self.closed = True
+
+        def run_one(group, task, env, **options):
+            ready.wait(timeout=5)
+            for _ in range(200):
+                env.step()
+
+        def evaluate_all(envs, policy, n_episodes, max_parallel_tasks=1):
+            options = {name:{} for name in ("env_preprocessor", "env_postprocessor", "preprocessor", "postprocessor")}
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                for task,env in envs["suite"].items():
+                    pool.submit(evaluator.run_one,"suite",task,env,policy=policy,n_episodes=1,**options)
+                ready.wait(timeout=5)
+                timing["interrupted"] = time.monotonic()
+                signal.raise_signal(signal.SIGINT)
+
+        evaluator.run_one, evaluator.eval_policy_all = run_one, evaluate_all
+        envs = {0:Env(), 1:Env()}
+        previous = signal.getsignal(signal.SIGINT)
+        if previous is not signal.default_int_handler:
+            self.skipTest("Requires Python's normal interrupt handler")
+        restore = track_parallel_rollouts(evaluator)
+        try:
+            with redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                evaluator.eval_policy_all({"suite":envs}, Policy(), 1, max_parallel_tasks=2)
+        finally:
+            restore()
+        self.assertLess(time.monotonic()-timing["interrupted"], .5)
+        self.assertTrue(all(env.closed for env in envs.values()))
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
+
+    def test_cancelling_other_tasks_does_not_hide_the_original_failure(self):
+        ready = Barrier(2)
+        evaluator = evaluator_fixture()
+
+        class Env:
+            num_envs = 1
+
+            def step(self):
+                time.sleep(.005)
+
+            def close(self):
+                pass
+
+        def run_one(group, task, env, **options):
+            ready.wait(timeout=5)
+            if task == 1:
+                raise ValueError("original policy failure")
+            for _ in range(200):
+                env.step()
+
+        def evaluate_all(envs, policy, n_episodes, max_parallel_tasks=1):
+            options = {name:{} for name in ("env_preprocessor", "env_postprocessor", "preprocessor", "postprocessor")}
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures=[pool.submit(evaluator.run_one,"suite",task,env,policy=policy,n_episodes=1,**options)
+                         for task,env in envs["suite"].items()]
+                # Consume the cancelled task before the original failing task.
+                return futures[0].result()
+
+        evaluator.run_one, evaluator.eval_policy_all = run_one, evaluate_all
+        restore = track_parallel_rollouts(evaluator)
+        try:
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "original policy failure"):
+                evaluator.eval_policy_all({"suite":{0:Env(),1:Env()}}, Policy(), 1, max_parallel_tasks=2)
+        finally:
+            restore()
+
+    def test_custom_interrupt_handler_is_not_replaced(self):
+        previous = signal.getsignal(signal.SIGINT)
+        custom = lambda *_: None
+        try:
+            signal.signal(signal.SIGINT, custom)
+            with cancel_on_interrupt(Event()):
+                self.assertIs(signal.getsignal(signal.SIGINT), custom)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+    def test_failure_still_closes_environments_with_readonly_close_methods(self):
+        class Env:
+            __slots__ = ("closed",)
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        evaluator = evaluator_fixture()
+        def fail(envs, policy, n_episodes, max_parallel_tasks=1):
+            raise RuntimeError("task failed")
+        evaluator.eval_policy_all = fail
+        env = Env()
+        restore = track_parallel_rollouts(evaluator)
+        try:
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "task failed"):
+                evaluator.eval_policy_all({"suite":{0:env}}, Policy(), 1)
+        finally:
+            restore()
+        self.assertTrue(env.closed)
+
     def test_next_task_cannot_allocate_before_previous_environment_has_closed(self):
         state = SimpleNamespace(active=0, peak=0, lock=Lock(), barrier=Barrier(2))
 

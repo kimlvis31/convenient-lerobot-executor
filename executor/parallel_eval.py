@@ -5,7 +5,9 @@ from copy import deepcopy
 from functools import wraps
 from inspect import signature
 import logging
-from threading import Lock, RLock, local
+import signal
+from concurrent.futures import CancelledError
+from threading import Event, Lock, RLock, current_thread, local, main_thread
 from types import MethodType, ModuleType, FunctionType, BuiltinFunctionType
 from weakref import WeakMethod
 from unittest.mock import patch
@@ -24,6 +26,26 @@ class TaskEnvironmentLifetime:
             if not self.closed:
                 self.original()
                 self.closed = True
+
+
+@contextmanager
+def cancel_on_interrupt(cancelled):
+    """Notify task threads before ThreadPoolExecutor waits during Ctrl+C."""
+    previous = signal.getsignal(signal.SIGINT) if current_thread() is main_thread() else None
+    if previous is not signal.default_int_handler:
+        yield
+        return
+
+    def interrupt(number, frame):
+        cancelled.set()
+        previous(number, frame)
+
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        yield
+    finally:
+        if signal.getsignal(signal.SIGINT) is interrupt:
+            signal.signal(signal.SIGINT, previous)
 
 
 def weak_method(method):
@@ -199,6 +221,8 @@ def track_parallel_rollouts(evaluator):
     original_all = evaluator.eval_policy_all
     call_signature = signature(original_all)
     lifetimes = set()
+    cancelled = Event()
+    failures = []
 
     @wraps(original_all)
     def evaluate_all(*args, **kwargs):
@@ -216,10 +240,12 @@ def track_parallel_rollouts(evaluator):
         bound.arguments["max_parallel_tasks"] = min(requested, len(tasks))
         isolate_policy = bound.arguments["max_parallel_tasks"] > 1
         completed = 0
+        cancelled.clear()
+        failures.clear()
         print(f"[Eval progress] Total episodes: {len(tasks) * episodes}", flush=True)
         print(f"Parallel evaluation tasks: {min(requested, len(tasks))} "
               f"({requested} requested, {len(tasks)} available)", flush=True)
-        with ExitStack() as ownership:
+        with ExitStack() as ownership, cancel_on_interrupt(cancelled):
             for env in tasks:
                 lifetime = TaskEnvironmentLifetime(env)
                 try:
@@ -227,13 +253,20 @@ def track_parallel_rollouts(evaluator):
                 except (AttributeError, TypeError):
                     continue  # Preserve an unknown environment's native lifetime.
                 lifetimes.add(id(env))
+            failed = True
             try:
-                return original_all(*bound.args, **bound.kwargs)
+                result = original_all(*bound.args, **bound.kwargs)
+                failed = False
+                return result
+            except CancelledError:
+                if failures:
+                    raise failures[0]
+                raise
             finally:
                 # Include waiting tasks and exceptions. close() is guarded while
                 # upstream also closes each consumed future's environment.
                 for env in tasks:
-                    if id(env) in lifetimes:
+                    if failed or id(env) in lifetimes:
                         try:
                             env.close()
                         except Exception:
@@ -246,6 +279,8 @@ def track_parallel_rollouts(evaluator):
         task_state.batch = env.num_envs
         task_state.label = f"{task_group}/{task_id}"
         try:
+            if cancelled.is_set():
+                raise CancelledError("Evaluation interrupted.")
             if "max_episodes_rendered" in options:
                 # The final vector batch can contain unused episode slots.
                 # Upstream discards their metrics; do not save extra videos.
@@ -258,8 +293,29 @@ def track_parallel_rollouts(evaluator):
                     options["policy"] = task_policy(policy, policy_lock)
             for name in ("env_preprocessor", "env_postprocessor", "preprocessor", "postprocessor"):
                 options[name] = deepcopy(options[name])
-            with inference_context(evaluator, options["policy"]):
+            with inference_context(evaluator, options["policy"]), ExitStack() as runtime:
+                for name in ("reset", "step", "call"):
+                    method = getattr(env, name, None)
+                    if not callable(method):
+                        continue
+
+                    def checked(*args, _method=method, **kwargs):
+                        if cancelled.is_set():
+                            raise CancelledError("Evaluation interrupted.")
+                        return _method(*args, **kwargs)
+
+                    try:
+                        runtime.enter_context(patch.object(env, name, checked))
+                    except (AttributeError, TypeError):
+                        pass
                 return original_task(task_group, task_id, env, **options)
+        except BaseException as error:
+            if not isinstance(error, CancelledError):
+                with lock:
+                    if not failures:
+                        failures.append(error)
+            cancelled.set()
+            raise
         finally:
             task_state.remaining = 0
             task_state.label = None
