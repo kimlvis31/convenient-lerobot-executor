@@ -555,17 +555,17 @@ class NativeAdapter:
                                  {"config_path", "policy.type", "policy.path", "env.max_parallel_tasks",
                                   "env.task_ids", "env.episode_length", "eval.record_repo_id", "eval.recording_repo_id"})
         automatic = ()
-        standard_parallel_libero = kind == "libero" and parallel > 1 and not any(
-            argument.startswith("--env.hub_path=") or argument == "--env.is_libero_plus=true"
-            for argument in args
-        )
-        if (kind in SINGLE_TASK_BENCHMARKS or standard_parallel_libero) and min(batch, episodes) > 1 and not any(
+        from evaluation_efficiency import shared_environment_arguments
+
+        shared = shared_environment_arguments(args)
+        if shared:
+            args += shared
+            automatic = ("eval.use_async_envs",)
+        elif kind in SINGLE_TASK_BENCHMARKS and min(batch, episodes) > 1 and not any(
             argument.startswith("--eval.use_async_envs=") for argument in args
         ):
-            # Keep all episode slots and task threads. Standard LIBERO tasks
-            # share the policy process instead of importing a simulator runtime
-            # per episode. Explicit asynchronous requests still take priority.
-            # PushT/ALOHA also need synchronous registration in their workers.
+            # This still batches predictions; PushT/ALOHA subprocess workers
+            # do not reliably register their environments.
             args.append("--eval.use_async_envs=false")
             automatic = ("eval.use_async_envs",)
         if self.key == "native":

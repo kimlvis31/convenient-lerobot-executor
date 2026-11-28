@@ -231,7 +231,11 @@ def main(command=None):
     # the original helper entrypoints. Importing policies can load those too.
     if evaluation:
         from evaluation_cameras import prepare_evaluation_runtime
+        from evaluation_efficiency import shared_environment_arguments
 
+        for argument in shared_environment_arguments(arguments):
+            arguments.append(argument)
+            print(f"Automatic evaluation option: {argument}", flush=True)
         prepare_evaluation_runtime(arguments)
     from lerobot.policies import pretrained
 

@@ -8,6 +8,24 @@ from textwrap import dedent
 from unittest.mock import patch
 
 
+def shared_environment_arguments(arguments):
+    """Prefer shared LIBERO episode runtimes without overriding user choices."""
+    protected = {"--eval.use_async_envs", "--env.hub_path", "--config_path"}
+    if any(argument.partition("=")[0] in protected for argument in arguments):
+        return []
+    flags = {argument.partition("=")[0]: argument.partition("=")[2]
+             for argument in arguments if argument.startswith("--") and "=" in argument}
+    if flags.get("--env.type") != "libero" or flags.get("--env.is_libero_plus", "false").lower() != "false":
+        return []
+    try:
+        parallel = int(flags.get("--env.max_parallel_tasks", "1"))
+        batch = int(flags.get("--eval.batch_size", "1"))
+        episodes = int(flags.get("--eval.n_episodes", str(batch)))
+    except ValueError:
+        return []  # Let the original parser explain malformed arguments.
+    return ["--eval.use_async_envs=false"] if parallel > 1 and min(batch, episodes) > 1 else []
+
+
 _RENDER_SOURCE = '''def render(self):
     self._ensure_env()
     raw_obs = self._env.env._get_observations()

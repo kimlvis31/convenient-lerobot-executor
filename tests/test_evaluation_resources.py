@@ -13,12 +13,21 @@ from types import SimpleNamespace
 import unittest
 
 from adapters import NativeAdapter
+from evaluation_efficiency import shared_environment_arguments
 from parallel_eval import cancel_on_interrupt, track_parallel_rollouts
 from tests.test_parallel_eval import Policy
 from tests.test_parallel_eval import evaluator_fixture
 
 
 class EvaluationPlanningTests(unittest.TestCase):
+    def test_saved_commands_get_the_same_default_without_overriding_config_files(self):
+        arguments=["--env.type=libero", "--env.max_parallel_tasks=4", "--eval.batch_size=5", "--eval.n_episodes=5"]
+        self.assertEqual(shared_environment_arguments(arguments), ["--eval.use_async_envs=false"])
+        self.assertEqual(len(arguments), 4)
+        for extra in (["--eval.use_async_envs=true"], ["--eval.use_async_envs", "true"],
+                      ["--config_path=custom.json"], ["--env.hub_path=owner/custom"]):
+            self.assertEqual(shared_environment_arguments([*arguments,*extra]), [])
+
     def stage(self, extra=(), kind="libero", parallel=4):
         with TemporaryDirectory() as directory:
             root = Path(directory)
