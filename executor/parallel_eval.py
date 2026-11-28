@@ -8,6 +8,22 @@ import logging
 from threading import Lock, RLock, local
 from types import MethodType, ModuleType, FunctionType, BuiltinFunctionType
 from weakref import WeakMethod
+from unittest.mock import patch
+
+
+class TaskEnvironmentLifetime:
+    """Close inside the task, before its executor thread can start a new one."""
+
+    def __init__(self, env):
+        self.env, self.original = env, env.close
+        self.lock = Lock()
+        self.closed = False
+
+    def close(self):
+        with self.lock:
+            if not self.closed:
+                self.original()
+                self.closed = True
 
 
 def weak_method(method):
@@ -182,6 +198,7 @@ def track_parallel_rollouts(evaluator):
     original_trange = evaluator.trange
     original_all = evaluator.eval_policy_all
     call_signature = signature(original_all)
+    lifetimes = set()
 
     @wraps(original_all)
     def evaluate_all(*args, **kwargs):
@@ -202,17 +219,26 @@ def track_parallel_rollouts(evaluator):
         print(f"[Eval progress] Total episodes: {len(tasks) * episodes}", flush=True)
         print(f"Parallel evaluation tasks: {min(requested, len(tasks))} "
               f"({requested} requested, {len(tasks)} available)", flush=True)
-        try:
-            return original_all(*bound.args, **bound.kwargs)
-        except BaseException:
-            # Upstream closes consumed futures only. Also close environments
-            # whose task was waiting/running when another task failed.
+        with ExitStack() as ownership:
             for env in tasks:
+                lifetime = TaskEnvironmentLifetime(env)
                 try:
-                    env.close()
-                except Exception:
-                    logging.exception("Could not close an evaluation environment after failure")
-            raise
+                    ownership.enter_context(patch.object(env, "close", lifetime.close))
+                except (AttributeError, TypeError):
+                    continue  # Preserve an unknown environment's native lifetime.
+                lifetimes.add(id(env))
+            try:
+                return original_all(*bound.args, **bound.kwargs)
+            finally:
+                # Include waiting tasks and exceptions. close() is guarded while
+                # upstream also closes each consumed future's environment.
+                for env in tasks:
+                    if id(env) in lifetimes:
+                        try:
+                            env.close()
+                        except Exception:
+                            logging.exception("Could not close an evaluation environment")
+                lifetimes.clear()
 
     @wraps(original_task)
     def run_one(task_group, task_id, env, **options):
@@ -237,6 +263,8 @@ def track_parallel_rollouts(evaluator):
         finally:
             task_state.remaining = 0
             task_state.label = None
+            if id(env) in lifetimes:
+                env.close()
 
     @wraps(original_rollout)
     def rollout(*args, **kwargs):
